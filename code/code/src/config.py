@@ -1,6 +1,7 @@
 # 配置参数
 sequence_length = 60
 feature_num = '158+39'
+use_lazy_dataset = True
 config = {
     'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
     'd_model': 256,          # Transformer输入维度
@@ -13,6 +14,8 @@ config = {
     'dropout': 0.1,
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
+    'use_lazy_dataset': use_lazy_dataset,
+    'feature_workers': 4,
 
     'pairwise_weight': 1, # 配对损失权重
     'base_weight': 1.0, # 非top-k样本权重

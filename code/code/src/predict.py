@@ -61,7 +61,7 @@ def preprocess_predict_data(df, stockid2idx):
 	if len(groups) == 0:
 		raise ValueError('输入数据为空，无法预测')
 
-	num_processes = min(10, mp.cpu_count())
+	num_processes = min(config.get('feature_workers', 4), mp.cpu_count())
 	print('cpus!!!!!!!!!!!!!!!!!!',mp.cpu_count())
 	with mp.Pool(processes=num_processes) as pool:
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))

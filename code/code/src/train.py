@@ -10,7 +10,7 @@ from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
 from utils import engineer_features_39, engineer_features_158plus39
-from utils import create_ranking_dataset_vectorized
+from utils import create_ranking_dataset_vectorized, create_ranking_dataset_eager
 import joblib
 import os
 import json
@@ -68,7 +68,7 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
     if len(groups) == 0:
         raise ValueError(f"{desc}输入为空，无法继续")
 
-    num_processes = min(10, mp.cpu_count())
+    num_processes = min(config.get('feature_workers', 4), mp.cpu_count())
     with mp.Pool(processes=num_processes) as pool:
         processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc=desc))
 
@@ -593,26 +593,40 @@ def main():
 
     
     # 4. 创建排序数据集
-    train_sequences, train_targets, train_relevance, train_stock_indices = create_ranking_dataset_vectorized(
-        train_data,
-        features,
-        config['sequence_length'],
-        ranking_data_path=config.get('train_ranking_data_path')
-    )
-    val_sequences, val_targets, val_relevance, val_stock_indices = create_ranking_dataset_vectorized(
-        val_data,
-        features,
-        config['sequence_length'],
-        ranking_data_path=config.get('val_ranking_data_path'),
-        min_window_end_date=val_start.strftime('%Y-%m-%d')
-    )
+    use_lazy = config.get('use_lazy_dataset', True)
+    if use_lazy:
+        train_dataset = create_ranking_dataset_vectorized(
+            train_data,
+            features,
+            config['sequence_length'],
+        )
+        val_dataset = create_ranking_dataset_vectorized(
+            val_data,
+            features,
+            config['sequence_length'],
+            min_window_end_date=val_start.strftime('%Y-%m-%d'),
+        )
 
-    print(f"训练集样本数: {len(train_sequences)}")
-    print(f"验证集样本数: {len(val_sequences)}")
-    
-    # 5. 创建排序数据集和数据加载器
-    train_dataset = RankingDataset(train_sequences, train_targets, train_relevance, train_stock_indices)
-    val_dataset = RankingDataset(val_sequences, val_targets, val_relevance, val_stock_indices)
+        print(f"训练集样本数: {len(train_dataset)}")
+        print(f"验证集样本数: {len(val_dataset)}")
+    else:
+        train_sequences, train_targets, train_relevance, train_stock_indices = create_ranking_dataset_eager(
+            train_data,
+            features,
+            config['sequence_length'],
+        )
+        val_sequences, val_targets, val_relevance, val_stock_indices = create_ranking_dataset_eager(
+            val_data,
+            features,
+            config['sequence_length'],
+            min_window_end_date=val_start.strftime('%Y-%m-%d'),
+        )
+
+        print(f"训练集样本数: {len(train_sequences)}")
+        print(f"验证集样本数: {len(val_sequences)}")
+
+        train_dataset = RankingDataset(train_sequences, train_targets, train_relevance, train_stock_indices)
+        val_dataset = RankingDataset(val_sequences, val_targets, val_relevance, val_stock_indices)
     
     train_loader = DataLoader(
         train_dataset, 
