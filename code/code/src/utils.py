@@ -549,8 +549,7 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
     # 3. 为每只股票生成所有滑动窗口
     # 仅保留满足以下条件的 end_date：
     # - 历史窗口长度满足 sequence_length
-    # - end_date 之后存在 5 条未来数据
-    # - 这 5 条未来数据在自然日上连续（任意节假日/周末导致的日期跳跃都会被过滤）
+    # - end_date 之后存在 5 条未来交易日数据
     all_windows = []  # 每个元素: (end_date, stock_code, sequence, target)
 
     print("Step 1: 为每只股票生成滑动窗口...")
@@ -563,8 +562,7 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
         # 提取特征和 label
         feature_values = group[features].values.astype(np.float32)  # (T, F)
         labels = group['label'].values.astype(np.float32)           # (T,)
-        dates = group['datetime'].values                            # (T,)
-        dates_day = group['datetime'].values.astype('datetime64[D]')
+        dates = group['datetime'].values                             # (T,)
 
         # 生成滑动窗口：从第 sequence_length-1 行开始（0-indexed）
         num_windows = len(group) - sequence_length + 1
@@ -574,12 +572,6 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
 
             # 需要有未来 5 条数据
             if end_idx + 5 >= n:
-                continue
-
-            # 未来 5 条数据日期必须连续（自然日相邻）
-            future_dates = dates_day[end_idx + 1:end_idx + 6]
-            future_diffs = np.diff(future_dates).astype(np.int64)
-            if not np.all(future_diffs == 1):
                 continue
 
             seq = feature_values[i : i + sequence_length]   # (L, F)

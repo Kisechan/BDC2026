@@ -7,6 +7,8 @@
 - 保存格式: 股票代码,日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌额,换手率,涨跌幅
 """
 
+import argparse
+
 import baostock as bs
 import pandas as pd
 from datetime import datetime
@@ -216,12 +218,33 @@ def merge_stock_data(existing_df, new_df, stock_code):
     return result
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="下载或增量更新沪深 300 历史日线数据")
+    parser.add_argument(
+        "--start-date",
+        default="2023-01-01",
+        help="下载起始日期，格式 YYYY-MM-DD，默认 2023-01-01",
+    )
+    parser.add_argument(
+        "--end-date",
+        default="2026-07-20",
+        help="下载结束日期，格式 YYYY-MM-DD，默认 2026-07-20",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="./data",
+        help="数据输出目录，默认 ./data",
+    )
+    return parser.parse_args()
+
+
 def main():
-    save_dir = "./data"
+    args = parse_args()
+    save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
-    
-    start_date = "2024-01-01"
-    end_date = "2026-03-15"
+
+    start_date = args.start_date
+    end_date = args.end_date
     
     output_path = os.path.join(save_dir, "stock_data.csv")
     
