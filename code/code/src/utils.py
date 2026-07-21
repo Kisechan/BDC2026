@@ -2,9 +2,7 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
-from collections import defaultdict
 from tqdm import tqdm
-import torch
 
 # 特征工程
 def _rolling_linear_regression(x, y):
@@ -527,129 +525,65 @@ def create_dataset(data, features, sequence_length, ranking_data_path=None):
     """保持原有接口，但内部调用新的排序数据集创建函数"""
     return create_ranking_dataset_multiprocess(data, features, sequence_length, ranking_data_path)
 
-class LazyRankingDataset(torch.utils.data.Dataset):
+def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_data_path=None, min_window_end_date=None):
     """
-    惰性加载排序数据集：只存储每只股票的完整特征矩阵和日期索引，
-    在 __getitem__ 时按需切片出滑动窗口，避免预计算所有窗口的内存爆炸。
+    向量化加速版本：预计算每只股票的所有滑动窗口，再按日期聚合。
+    保持与原函数完全相同的输出格式。
     """
-    def __init__(self, data, feature_cols, sequence_length, min_window_end_date=None):
-        self.sequence_length = sequence_length
-        self.feature_cols = feature_cols
+    # if ranking_data_path and os.path.exists(ranking_data_path):
+    #     print(f"加载已有的排序数据集: {ranking_data_path}")
+    #     return joblib.load(ranking_data_path)
 
-        data = data.copy()
-        if '日期' in data.columns:
-            data.rename(columns={'日期': 'datetime'}, inplace=True)
-        data['datetime'] = pd.to_datetime(data['datetime'])
-        data = data.sort_values(['instrument', 'datetime']).reset_index(drop=True)
-        data = data.dropna(subset=['label'])
-
-        self.stock_features = {}
-        self.stock_dates = {}
-        self.stock_labels = {}
-
-        print("Indexing per-stock data...")
-        for instrument, group in tqdm(data.groupby('instrument'), desc="Indexing stocks"):
-            if len(group) < sequence_length:
-                continue
-            self.stock_features[instrument] = group[feature_cols].values.astype(np.float32)
-            self.stock_dates[instrument] = group['datetime'].values
-            self.stock_labels[instrument] = group['label'].values.astype(np.float32)
-
-        print("Building date-to-sample index...")
-        date_to_stocks = defaultdict(list)
-        for instrument in tqdm(self.stock_features, desc="Building index"):
-            dates = self.stock_dates[instrument]
-            n = len(dates)
-            for idx in range(sequence_length - 1, n):
-                if idx + 5 >= n:
-                    continue
-                date_to_stocks[dates[idx]].append((instrument, idx))
-
-        self.samples = []
-        min_dt = pd.to_datetime(min_window_end_date) if min_window_end_date is not None else None
-        for date, stocks in date_to_stocks.items():
-            if min_dt is not None and pd.to_datetime(date) < min_dt:
-                continue
-            if len(stocks) < 10:
-                continue
-            self.samples.append((date, stocks))
-
-        print(f"Lazy dataset ready: {len(self.samples)} samples")
-        if self.samples:
-            avg = np.mean([len(s) for _, s in self.samples])
-            print(f"Average {avg:.1f} stocks per sample")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        _, stock_infos = self.samples[idx]
-        N = len(stock_infos)
-        F = len(self.feature_cols)
-
-        sequences = np.zeros((N, self.sequence_length, F), dtype=np.float32)
-        targets = np.zeros(N, dtype=np.float32)
-        stock_indices = np.zeros(N, dtype=np.int64)
-
-        for i, (instrument, row_idx) in enumerate(stock_infos):
-            start = row_idx - self.sequence_length + 1
-            sequences[i] = self.stock_features[instrument][start:row_idx + 1]
-            targets[i] = self.stock_labels[instrument][row_idx]
-            stock_indices[i] = instrument
-
-        sorted_indices = np.argsort(targets)[::-1]
-        relevance = np.zeros(N, dtype=np.float32)
-        for rank, si in enumerate(sorted_indices):
-            relevance[si] = N - rank
-
-        return {
-            'sequences': torch.FloatTensor(sequences),
-            'targets': torch.FloatTensor(targets),
-            'relevance': torch.LongTensor(relevance),
-            'stock_indices': torch.LongTensor(stock_indices),
-        }
-
-
-def create_ranking_dataset_lazy(data, features, sequence_length, min_window_end_date=None):
-    return LazyRankingDataset(data, features, sequence_length, min_window_end_date)
-
-
-def create_ranking_dataset_eager(data, features, sequence_length, min_window_end_date=None):
-    """
-    预计算版本：把所有滑动窗口展开到内存中再按日期聚合。
-    内存占用大（~11GB），仅在服务器大内存环境使用。
-    返回 (sequences, targets, relevance_scores, stock_indices) 四个列表。
-    """
-    print("正在创建排序数据集（预计算版本）...")
+    print("正在创建排序数据集（向量化加速版本）...")
+    # data.rename(columns={'stock_idx': 'instrument'}, inplace=True)
     data = data.copy()
     data.rename(columns={'日期': 'datetime'}, inplace=True)
     data['datetime'] = pd.to_datetime(data['datetime'])
-    data = data.sort_values(['instrument', 'datetime']).reset_index(drop=True)
-    data = data.dropna(subset=['label'])
 
-    all_windows = []
+    # 1. 确保数据按股票和时间排序
+    data = data.sort_values(['instrument', 'datetime']).reset_index(drop=True)
+    
+    # 2. 确保每只股票都有 'label'（次日涨跌幅），否则无法作为 target
+    data = data.dropna(subset=['label'])
+    
+    # 3. 为每只股票生成所有滑动窗口
+    # 仅保留满足以下条件的 end_date：
+    # - 历史窗口长度满足 sequence_length
+    # - end_date 之后存在 5 条未来交易日数据
+    all_windows = []  # 每个元素: (end_date, stock_code, sequence, target)
 
     print("Step 1: 为每只股票生成滑动窗口...")
     grouped = data.groupby('instrument')
+    
     for stock_code, group in tqdm(grouped, desc="Processing stocks"):
         if len(group) < sequence_length:
             continue
-        feature_values = group[features].values.astype(np.float32)
-        labels = group['label'].values.astype(np.float32)
-        dates = group['datetime'].values
+        
+        # 提取特征和 label
+        feature_values = group[features].values.astype(np.float32)  # (T, F)
+        labels = group['label'].values.astype(np.float32)           # (T,)
+        dates = group['datetime'].values                             # (T,)
+
+        # 生成滑动窗口：从第 sequence_length-1 行开始（0-indexed）
+        num_windows = len(group) - sequence_length + 1
         n = len(group)
-        for i in range(n - sequence_length + 1):
+        for i in range(num_windows):
             end_idx = i + sequence_length - 1
+
+            # 需要有未来 5 条数据
             if end_idx + 5 >= n:
                 continue
-            seq = feature_values[i : i + sequence_length]
-            target = labels[end_idx]
-            end_date = dates[end_idx]
+
+            seq = feature_values[i : i + sequence_length]   # (L, F)
+            target = labels[end_idx]                        # label 对应窗口最后一天的次日涨跌幅
+            end_date = dates[end_idx]                       # 窗口结束日期（即预测日）
             all_windows.append((end_date, stock_code, seq, target))
 
+    # 4. 转为 DataFrame 便于按日期聚合
     print("Step 2: 按日期聚合窗口...")
     window_df = pd.DataFrame(all_windows, columns=['date', 'stock_code', 'seq', 'target'])
 
+    # 5. 按 date 分组，构建每日样本
     sequences = []
     targets = []
     relevance_scores = []
@@ -657,20 +591,28 @@ def create_ranking_dataset_eager(data, features, sequence_length, min_window_end
 
     print("Step 3: 构建每日样本并计算 relevance...")
     grouped_by_date = window_df.groupby('date')
-    min_dt = pd.to_datetime(min_window_end_date) if min_window_end_date is not None else None
 
+    if min_window_end_date is not None:
+        min_window_end_date = pd.to_datetime(min_window_end_date)
+    
     for date, group in tqdm(grouped_by_date, desc="Aggregating by date"):
-        if min_dt is not None and pd.to_datetime(date) < min_dt:
+        if min_window_end_date is not None and pd.to_datetime(date) < min_window_end_date:
             continue
+
         if len(group) < 10:
             continue
-        day_seqs = np.stack(group['seq'].values)
-        day_targets = group['target'].values
-        day_stocks = group['stock_code'].tolist()
+        
+        # 提取数据
+        day_seqs = np.stack(group['seq'].values)          # (N, L, F)
+        day_targets = group['target'].values              # (N,)
+        day_stocks = group['stock_code'].tolist()         # [str]
+
+        # 计算 relevance（与原逻辑一致）
         sorted_indices = np.argsort(day_targets)[::-1]
         relevance = np.zeros_like(day_targets, dtype=np.float32)
         for rank, idx in enumerate(sorted_indices):
             relevance[idx] = len(day_targets) - rank
+
         sequences.append(day_seqs)
         targets.append(day_targets)
         relevance_scores.append(relevance)
@@ -681,12 +623,9 @@ def create_ranking_dataset_eager(data, features, sequence_length, min_window_end
         avg_stocks = np.mean([len(seq) for seq in sequences])
         print(f"每个样本平均包含 {avg_stocks:.1f} 只股票")
 
+    # 6. 保存
+    # if ranking_data_path:
+    #     joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
+    #     print(f"数据集已保存到: {ranking_data_path}")
+
     return sequences, targets, relevance_scores, stock_indices
-
-
-def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_data_path=None, min_window_end_date=None):
-    """
-    根据 config.use_lazy_dataset 自动选择惰性/预计算模式。
-    注意：调用方在 train.py 中根据 config 值做路由，此函数保留向后兼容。
-    """
-    return create_ranking_dataset_lazy(data, features, sequence_length, min_window_end_date)
