@@ -102,7 +102,8 @@ class WeightedRankingLoss(nn.Module):
     组合的加权排序损失函数，着重强调top-k的样本。
     """
     def __init__(self, temperature=1.0, k=5, weight_factor=2.0, pairwise_weight=1,
-                 base_weight=1.0, regression_weight=0.2, regression_beta=0.02):
+                 base_weight=1.0, regression_weight=0.2, regression_beta=0.02,
+                 ic_weight=0.2):
         super(WeightedRankingLoss, self).__init__()
         self.temperature = temperature
         self.k = k
@@ -111,6 +112,7 @@ class WeightedRankingLoss(nn.Module):
         self.base_weight = base_weight
         self.regression_weight = regression_weight
         self.regression_beta = regression_beta
+        self.ic_weight = ic_weight
 
     def listwise_loss(self, y_pred, y_true, weights):
         """将 Top-k 权重并入目标分布后计算 Listwise Cross Entropy。"""
@@ -150,6 +152,18 @@ class WeightedRankingLoss(nn.Module):
         loss = (weighted_loss.sum(dim=[1, 2]) / weight_sum).mean()
         
         return loss
+
+    def rank_ic_loss(self, y_pred, y_true):
+        """用预测分数与真实排名的 Pearson 相关性近似优化 Spearman Rank IC。"""
+        pred_centered = y_pred - y_pred.mean(dim=1, keepdim=True)
+        target_centered = y_true - y_true.mean(dim=1, keepdim=True)
+        numerator = (pred_centered * target_centered).sum(dim=1)
+        denominator = torch.sqrt(
+            pred_centered.square().sum(dim=1)
+            * target_centered.square().sum(dim=1)
+        ).clamp(min=1e-12)
+        correlation = numerator / denominator
+        return (1.0 - correlation).mean()
         
     def forward(self, y_pred, y_true, predicted_returns, raw_returns):
         """
@@ -170,6 +184,7 @@ class WeightedRankingLoss(nn.Module):
         # 3. 计算加权损失
         listwise = self.listwise_loss(y_pred, y_true, weights)
         pairwise = self.pairwise_loss(y_pred, y_true, weights)
+        rank_ic = self.rank_ic_loss(y_pred, y_true)
         regression = F.smooth_l1_loss(
             predicted_returns,
             raw_returns,
@@ -180,6 +195,7 @@ class WeightedRankingLoss(nn.Module):
         total_loss = (
             listwise
             + self.pairwise_weight * pairwise
+            + self.ic_weight * rank_ic
             + self.regression_weight * regression
         )
         
@@ -623,6 +639,7 @@ def build_training_components(model):
         base_weight=config.get('base_weight', 1.0),
         regression_weight=config['regression_weight'],
         regression_beta=config['regression_beta'],
+        ic_weight=config.get('ic_weight', 0.2),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -630,6 +647,16 @@ def build_training_components(model):
         weight_decay=config['weight_decay'],
     )
     return criterion, optimizer
+
+
+def calculate_checkpoint_score(metrics, checkpoint_metric):
+    """计算单折 checkpoint 分数，支持 Top-5 与 Rank IC 的组合目标。"""
+    if checkpoint_metric == 'top5_return_plus_rank_ic':
+        return (
+            metrics.get('top5_return', 0.0)
+            + config.get('checkpoint_rank_ic_weight', 0.2) * metrics.get('rank_ic', 0.0)
+        )
+    return metrics.get(checkpoint_metric, 0.0)
 
 
 def train_one_fold(full_data, features, fold, num_stocks, device, output_dir):
@@ -724,14 +751,15 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir):
         )
         scheduler.step()
         writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
+        current_score = calculate_checkpoint_score(eval_metrics, checkpoint_metric)
         print(
             f"Fold {fold_number} Epoch {epoch + 1}: "
             f"train_loss={train_loss:.4f}, eval_loss={eval_loss:.4f}, "
             f"val_top5={eval_metrics.get('top5_return', 0.0):.6f}, "
-            f"val_rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}"
+            f"val_rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}, "
+            f"checkpoint_score={current_score:.6f}"
         )
 
-        current_score = eval_metrics.get(checkpoint_metric, 0.0)
         if current_score > best_score:
             best_score = current_score
             best_epoch = epoch + 1
