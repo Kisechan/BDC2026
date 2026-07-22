@@ -94,6 +94,33 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 	return np.asarray(sequences, dtype=np.float32), sequence_stock_ids, sequence_stock_indices
 
 
+def validate_result(output_df, candidate_stock_ids):
+	"""在写盘前后使用赛事约束校验预测结果。"""
+	required_columns = ['stock_id', 'weight']
+	if output_df.columns.tolist() != required_columns:
+		raise ValueError(f'结果列必须严格为 {required_columns}')
+	if not 1 <= len(output_df) <= 5:
+		raise ValueError(f'结果必须包含1至5只股票，当前为 {len(output_df)} 只')
+	if output_df['stock_id'].duplicated().any():
+		raise ValueError('结果包含重复股票代码')
+
+	stock_ids = output_df['stock_id'].astype(str).str.zfill(6)
+	unknown_ids = sorted(set(stock_ids) - set(candidate_stock_ids))
+	if unknown_ids:
+		raise ValueError(f'结果包含候选范围外股票: {unknown_ids}')
+
+	weights = pd.to_numeric(output_df['weight'], errors='coerce').to_numpy(dtype=np.float64)
+	if not np.isfinite(weights).all():
+		raise ValueError('结果权重包含 NaN 或无穷值')
+	if (weights < 0).any() or (weights > 1).any():
+		raise ValueError('每只股票的权重必须在 [0, 1] 范围内')
+	weight_sum = float(weights.sum(dtype=np.float64))
+	if weight_sum > 1.0:
+		raise ValueError(f'结果权重和不能超过1，当前为 {weight_sum:.12f}')
+
+	return weight_sum
+
+
 def main():
 	data_file = os.path.join(config['data_path'], 'train.csv')
 	model_path = os.path.join(config['output_dir'], 'best_model.pth')
@@ -155,18 +182,25 @@ def main():
 	order = np.argsort(scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
 
-	# 仅输出前5，权重固定 0.2
+	# 排序分数只用于选股；组合严格使用等权，和交叉验证口径一致。
 	if len(ranked_stock_ids) < 5:
 		raise ValueError(f'可预测股票不足5只，当前仅有 {len(ranked_stock_ids)} 只')
 	top5 = ranked_stock_ids[:5]
 	output_df = pd.DataFrame({
 		'stock_id': top5,
-		'weight': [0.2] * len(top5),
+		'weight': [0.2] * 5,
 	})
-	output_df.to_csv(output_path, index=False)
+	validate_result(output_df, stock_ids)
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+	output_df.to_csv(output_path, index=False, encoding='utf-8')
+
+	# 重新读取实际提交文件，避免序列化精度或股票代码格式破坏约束。
+	written_df = pd.read_csv(output_path, dtype={'stock_id': str})
+	weight_sum = validate_result(written_df, stock_ids)
 
 	print(f'预测日期: {latest_date.date()}')
 	print(f'参与排序股票数: {len(ranked_stock_ids)}')
+	print(f'提交权重和: {weight_sum:.12f}')
 	print(f'结果已写入: {output_path}')
 
 
