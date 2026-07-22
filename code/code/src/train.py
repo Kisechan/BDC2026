@@ -410,7 +410,7 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
         if batch_loss is not None:
             batch_loss = batch_loss / batch_size
             batch_loss.backward()
-            if not config.get('drop_clip', True):
+            if config.get('grad_clip', True):
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
                 if writer:
                     writer.add_scalar('train/grad_norm', grad_norm, global_step=epoch*len(dataloader)+local_step)

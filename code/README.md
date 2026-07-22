@@ -68,11 +68,12 @@
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
-	- 组合 `listwise_loss`、`pairwise_loss` 与原始收益 SmoothL1 辅助损失；
+	- 组合归一化 `listwise_loss`、RankNet `pairwise_loss`、Rank IC 相关性损失与原始收益 SmoothL1 辅助损失；
 	- 对真实Top-k样本施加更高权重。
 - 评估指标：`calculate_ranking_metrics()`
 	- 计算等权 Top-5 收益、Rank IC、回归 MAE 和原有归一化指标；
 	- 汇总多折均值、最差折表现及训练—验证差距。
+	- checkpoint 使用 `top5_return + checkpoint_rank_ic_weight * rank_ic` 组合指标。
 
 训练产物：
 - `fold_N/best_model.pth`、`fold_N/scaler.pkl`、`fold_N/metrics.json`：逐折产物；
