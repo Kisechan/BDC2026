@@ -177,7 +177,7 @@ class WeightedRankingLoss(nn.Module):
         correlation = numerator / denominator
         return (1.0 - correlation).mean()
         
-    def forward(self, y_pred, y_true, predicted_returns, raw_returns):
+    def forward(self, y_pred, y_true, predicted_returns, raw_returns, return_components=False):
         """
         y_pred: [batch, num_items]
         y_true: [batch, num_items] (真实涨跌幅)
@@ -204,13 +204,15 @@ class WeightedRankingLoss(nn.Module):
         )
         
         # 排序为主任务，原始收益回归为辅助任务。
-        total_loss = (
-            self.listwise_weight * listwise
-            + self.pairwise_weight * pairwise
-            + self.ic_weight * rank_ic
-            + self.regression_weight * regression
-        )
-        
+        components = {
+            'listwise_loss': self.listwise_weight * listwise,
+            'pairwise_loss': self.pairwise_weight * pairwise,
+            'ic_loss': self.ic_weight * rank_ic,
+            'regression_loss': self.regression_weight * regression,
+        }
+        total_loss = sum(components.values())
+        if return_components:
+            return total_loss, components
         return total_loss
 
 def calculate_ranking_metrics(y_pred, y_true, masks, predicted_returns=None, k=5):
@@ -369,6 +371,7 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
     model.train()
     total_loss = 0
     total_metrics = {}
+    total_loss_components = {}
     local_step = 0
     
     for batch in tqdm(dataloader, desc=f"Training Epoch {epoch+1}"):
@@ -391,6 +394,7 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
         
         # 计算损失（只对有效股票计算）
         batch_loss = None
+        batch_loss_components = {}
         batch_size = sequences.size(0)
         
         for i in range(batch_size):
@@ -411,16 +415,22 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             
             if len(valid_pred) > 1:
                 # 直接使用预处理好的相关性得分，无需重新计算
-                loss = criterion(
+                loss, loss_components = criterion(
                     valid_pred.unsqueeze(0),
                     valid_relevance.unsqueeze(0),
                     valid_return_pred.unsqueeze(0),
                     valid_raw_return.unsqueeze(0),
+                    return_components=True,
                 )
                 batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
+                for name, value in loss_components.items():
+                    batch_loss_components[name] = batch_loss_components.get(name, 0.0) + value
         
         if batch_loss is not None:
             batch_loss = batch_loss / batch_size
+            batch_loss_components = {
+                name: value / batch_size for name, value in batch_loss_components.items()
+            }
             batch_loss.backward()
             if config.get('grad_clip', True):
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
@@ -429,6 +439,8 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             optimizer.step()
             
             total_loss += batch_loss.item()
+            for name, value in batch_loss_components.items():
+                total_loss_components[name] = total_loss_components.get(name, 0.0) + value.item()
             
             # 计算评估指标
             with torch.no_grad():
@@ -447,6 +459,12 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             local_step += 1
             if writer:
                 writer.add_scalar('train/loss', batch_loss.item(), global_step=epoch*len(dataloader)+local_step)
+                for name, value in batch_loss_components.items():
+                    writer.add_scalar(
+                        f'train/{name}',
+                        value.item(),
+                        global_step=epoch*len(dataloader)+local_step,
+                    )
                 for k, v in metrics.items():
                     writer.add_scalar(f'train/{k}', v, global_step=epoch*len(dataloader)+local_step)
     
@@ -454,6 +472,8 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
     if local_step > 0:
         for k in total_metrics:
             total_metrics[k] /= local_step
+        for name, value in total_loss_components.items():
+            total_metrics[name] = value / local_step
     
     return total_loss / len(dataloader) if len(dataloader) > 0 else 0, total_metrics
 
