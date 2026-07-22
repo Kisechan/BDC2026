@@ -14,6 +14,9 @@ config = {
     'stock_embedding_dim': 16,
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
+    'num_folds': 3,
+    'validation_months': 2,
+    'purge_days': 5,
 
     'pairwise_weight': 1, # 配对损失权重
     'base_weight': 1.0, # 非top-k样本权重

@@ -525,7 +525,14 @@ def create_dataset(data, features, sequence_length, ranking_data_path=None):
     """保持原有接口，但内部调用新的排序数据集创建函数"""
     return create_ranking_dataset_multiprocess(data, features, sequence_length, ranking_data_path)
 
-def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_data_path=None, min_window_end_date=None):
+def create_ranking_dataset_vectorized(
+    data,
+    features,
+    sequence_length,
+    ranking_data_path=None,
+    min_window_end_date=None,
+    max_window_end_date=None,
+):
     """
     向量化加速版本：预计算每只股票的所有滑动窗口，再按日期聚合。
     保持与原函数完全相同的输出格式。
@@ -566,13 +573,8 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
 
         # 生成滑动窗口：从第 sequence_length-1 行开始（0-indexed）
         num_windows = len(group) - sequence_length + 1
-        n = len(group)
         for i in range(num_windows):
             end_idx = i + sequence_length - 1
-
-            # 需要有未来 5 条数据
-            if end_idx + 5 >= n:
-                continue
 
             seq = feature_values[i : i + sequence_length]   # (L, F)
             target = labels[end_idx]                        # label 对应窗口最后一天的次日涨跌幅
@@ -594,9 +596,13 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
 
     if min_window_end_date is not None:
         min_window_end_date = pd.to_datetime(min_window_end_date)
+    if max_window_end_date is not None:
+        max_window_end_date = pd.to_datetime(max_window_end_date)
     
     for date, group in tqdm(grouped_by_date, desc="Aggregating by date"):
         if min_window_end_date is not None and pd.to_datetime(date) < min_window_end_date:
+            continue
+        if max_window_end_date is not None and pd.to_datetime(date) > max_window_end_date:
             continue
 
         if len(group) < 10:

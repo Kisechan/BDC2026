@@ -523,32 +523,37 @@ def save_predictions(top_stocks, output_path):
     print(f"预测结果已保存到: {output_path}")
 
 
-def split_train_val_by_last_month(df, sequence_length):
-    """按最后一个月做验证集划分，并为验证集补充序列上下文。"""
+def build_walk_forward_folds(df, num_folds, validation_months, purge_days):
+    """基于实际交易日期构造扩展窗口验证折，并显式隔离标签未来期。"""
     df = df.copy()
     df['日期'] = pd.to_datetime(df['日期'])
-    df = df.sort_values(['日期', '股票代码']).reset_index(drop=True)
+    trading_dates = pd.DatetimeIndex(sorted(df['日期'].dropna().unique()))
+    if len(trading_dates) == 0:
+        raise ValueError('没有可用于切分的交易日期')
 
-    last_date = df['日期'].max()
-    val_start = (last_date - pd.DateOffset(months=2)).normalize()
 
-    # 验证集需要保留前 sequence_length-1 个交易日作为序列上下文，
-    # 这样第一个验证样本的窗口结束日就可以落在 val_start。
-    val_context_start = val_start - pd.tseries.offsets.BDay(sequence_length - 1)
+    folds = []
+    last_date = trading_dates[-1]
+    for reverse_offset in reversed(range(num_folds)):
+        end_target = last_date - pd.DateOffset(months=reverse_offset * validation_months)
+        start_target = last_date - pd.DateOffset(months=(reverse_offset + 1) * validation_months)
+        val_start_idx = trading_dates.searchsorted(start_target, side='right')
+        val_end_idx = trading_dates.searchsorted(end_target, side='right') - 1
+        train_end_idx = val_start_idx - purge_days - 1
 
-    train_df = df[df['日期'] < val_start].copy()
-    val_df = df[df['日期'] >= val_context_start].copy()
+        if train_end_idx < 0 or val_start_idx > val_end_idx:
+            raise ValueError('历史长度不足，无法构造请求的 walk-forward 折数')
 
-    print(f"全量数据范围: {df['日期'].min().date()} 到 {last_date.date()}")
-    print(f"训练集范围: {train_df['日期'].min().date()} 到 {train_df['日期'].max().date()}")
-    print(f"验证集目标范围(最后一个月): {val_start.date()} 到 {last_date.date()}")
-    print(f"验证集实际取数范围(含序列上下文): {val_df['日期'].min().date()} 到 {val_df['日期'].max().date()}")
+        folds.append({
+            'fold': len(folds) + 1,
+            'train_end': trading_dates[train_end_idx],
+            'purge_start': trading_dates[train_end_idx + 1],
+            'purge_end': trading_dates[val_start_idx - 1],
+            'val_start': trading_dates[val_start_idx],
+            'val_end': trading_dates[val_end_idx],
+        })
 
-    # 恢复为字符串，保持与原流程一致
-    train_df['日期'] = train_df['日期'].dt.strftime('%Y-%m-%d')
-    val_df['日期'] = val_df['日期'].dt.strftime('%Y-%m-%d')
-
-    return train_df, val_df, val_start
+    return folds
 
 # 主程序
 def main():
@@ -572,7 +577,14 @@ def main():
     data_file = os.path.join(data_path, 'train.csv')
     full_df = pd.read_csv(data_file, dtype={'股票代码': str})
     full_df['股票代码'] = full_df['股票代码'].astype(str).str.zfill(6)
-    train_df, val_df, val_start = split_train_val_by_last_month(full_df, config['sequence_length'])
+    folds = build_walk_forward_folds(
+        full_df,
+        num_folds=config['num_folds'],
+        validation_months=config['validation_months'],
+        purge_days=config['purge_days'],
+    )
+    fold = folds[-1]
+    print(f"当前折边界: {fold}")
     
     # 获取所有股票ID，建立映射
     all_stock_ids = full_df['股票代码'].unique()
@@ -582,8 +594,11 @@ def main():
         json.dump(stockid2idx, f, indent=2, ensure_ascii=False)
     
     # 2. 特征工程与预处理
-    train_data, features = preprocess_data(train_df, is_train=True, stockid2idx=stockid2idx)
-    val_data, _ = preprocess_val_data(val_df, stockid2idx=stockid2idx)
+    full_data, features = preprocess_data(full_df, is_train=True, stockid2idx=stockid2idx)
+    full_data['日期'] = pd.to_datetime(full_data['日期'])
+    train_data = full_data[full_data['日期'] <= fold['train_end']].copy()
+    # 验证序列保留全部历史上下文，窗口结束日会在数据集构造时限制。
+    val_data = full_data[full_data['日期'] <= fold['val_end']].copy()
     
     # 3. 标准化
     scaler = StandardScaler()
@@ -604,14 +619,16 @@ def main():
         train_data,
         features,
         config['sequence_length'],
-        ranking_data_path=config.get('train_ranking_data_path')
+        ranking_data_path=config.get('train_ranking_data_path'),
+        max_window_end_date=fold['train_end'],
     )
     val_sequences, val_targets, val_relevance, val_stock_indices = create_ranking_dataset_vectorized(
         val_data,
         features,
         config['sequence_length'],
         ranking_data_path=config.get('val_ranking_data_path'),
-        min_window_end_date=val_start.strftime('%Y-%m-%d')
+        min_window_end_date=fold['val_start'],
+        max_window_end_date=fold['val_end'],
     )
 
     print(f"训练集样本数: {len(train_sequences)}")
