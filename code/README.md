@@ -17,7 +17,8 @@
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
 4. 按实际交易日构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
 5. 联合优化排序损失和原始收益 SmoothL1 回归损失；
-6. 汇总平均/最差折 Top-5、Rank IC 和泛化差距，并用最新折模型生成 Top-5。
+6. 汇总平均/最差折 Top-5、Rank IC 和泛化差距；随后按各折最佳 epoch
+   的中位数，用全部标签有效样本重训最终模型。
 
 ---
 
@@ -27,9 +28,10 @@
 统一管理训练与推理参数，包括：
 - 序列长度 `sequence_length`（默认60）；
 - 模型超参数（`d_model`、`nhead`、`num_layers` 等）；
-- 训练超参数（`batch_size`、`num_epochs`、`learning_rate`）；
+- 训练超参数（`batch_size`、`max_epochs`、`patience`、`learning_rate`、`weight_decay`）；
 - 排序损失权重参数（`pairwise_weight`、`top5_weight`、`base_weight`）；
-- 多折切分与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、`regression_weight`）；
+- 多折切分、ID 正则化与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、
+  `id_dropout`、`embedding_dropout`、`regression_weight`）；
 - 数据路径和输出路径（默认输出到 `output/`）。
 
 ### [model.py](model.py)
@@ -37,7 +39,7 @@
 - `PositionalEncoding`：时序位置编码；
 - 时序编码器 `TransformerEncoder`：提取单股票历史序列表示；
 - `FeatureAttention`：对时间维特征做注意力聚合；
-- 股票 ID Embedding：在时序聚合后融合股票身份；
+- 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做 dropout；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
 - `score_head` 与 `return_head`：分别输出排序分数和原始收益预测。
 
@@ -52,12 +54,16 @@
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
+原 `RSQR5/10/20/30/60` 的滚动索引实现会使绝大部分结果变成 NaN 后填 0，
+现已从特征计算和训练/推理特征表中删除；`158+39` 名称为兼容旧配置保留。
 
 ### [train.py](train.py)
 训练主脚本，关键内容：
 - 数据预处理：
 	- `_preprocess_common()`：在完整历史上按股票计算严格因果特征和标签；
 	- `build_walk_forward_folds()`：按实际交易日构造扩展窗口验证折和 5 日 purge。
+	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
+	- 三折完成后，重新拟合全量 scaler 并训练最终推理模型。
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
@@ -69,7 +75,8 @@
 
 训练产物：
 - `fold_N/best_model.pth`、`fold_N/scaler.pkl`、`fold_N/metrics.json`：逐折产物；
-- `best_model.pth`、`scaler.pkl`：供推理使用的最新折最佳产物；
+- `best_model.pth`、`scaler.pkl`：全量重训后供推理使用的最终产物；
+- `final_training.json`、`full_train/log/`：全量重训轮数、样本范围和日志；
 - `stockid2idx.json`：训练与推理共用的股票 ID 映射；
 - `cross_validation_summary.json`：多折汇总；
 - `config.json`：训练时配置快照；
@@ -83,7 +90,10 @@
 4. 用 `best_model.pth` 对全部可预测股票打分；
 5. 按分数降序取前5只，输出到 `output.csv`：
 	 - `stock_id`
-	 - `weight`（由预测阶段的组合分配策略生成）
+	 - `weight`（固定等权 `0.2`）
+
+写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
+避免浮点序列化导致提交权重超过 1。
 
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：

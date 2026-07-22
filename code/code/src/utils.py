@@ -197,18 +197,11 @@ def engineer_features(df):
         features.append(talib.STDDEV(close, timeperiod=w) / (close + 1e-12))
         feature_names.append(f'STD{w}')
 
-    # 6. Regression-based features (15 features) - 使用 talib 加速
+    # 6. Regression-based features (10 features) - 使用 talib 加速
     for w in windows:
         slope = talib.LINEARREG_SLOPE(close, timeperiod=w)
         features.append(slope / (close + 1e-12))
         feature_names.append(f'BETA{w}')
-        
-        # R-squared can be calculated as CORREL^2
-        time_period_series = pd.Series(range(w), index=close.index[:w])
-        rolling_corr = close.rolling(w).corr(time_period_series)
-        rsquare = rolling_corr**2
-        features.append(rsquare)
-        feature_names.append(f'RSQR{w}')
 
         # Residuals
         intercept = talib.LINEARREG_INTERCEPT(close, timeperiod=w)
