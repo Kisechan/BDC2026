@@ -9,11 +9,11 @@ config = {
     'dim_feedforward': 256, # 前馈网络维度
     'batch_size': 4,        # 排序任务batch_size可以小一些，因为每个batch包含更多股票
     'max_epochs': 50,
-    'patience': 8,
-    'learning_rate': 1e-5,  # 稍微降低学习率
+    'patience': 12,
+    'learning_rate': 3e-5,
     'dropout': 0.1,
     'stock_embedding_dim': 4,
-    'id_dropout': 0.2,
+    'id_dropout': 0.1,
     'embedding_dropout': 0.1,
     'feature_num': feature_num,
     'max_grad_norm': 5.0,

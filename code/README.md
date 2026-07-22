@@ -63,7 +63,8 @@
 	- `_preprocess_common()`：在完整历史上按股票计算严格因果特征和标签；
 	- `build_walk_forward_folds()`：按实际交易日构造扩展窗口验证折和 5 日 purge。
 	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
-	- 三折完成后，重新拟合全量 scaler 并训练最终推理模型。
+	- 三折完成后，取各折最佳 epoch 的中位数，重新拟合全量 scaler 并训练最终推理模型；
+	- 当前使用 `learning_rate=3e-5`、`patience=12` 和 `id_dropout=0.1`，让验证折有更充分的改善机会，同时减弱股票 ID 正则化。
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
