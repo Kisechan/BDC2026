@@ -612,7 +612,25 @@ def build_walk_forward_folds(df, num_folds, validation_months, purge_days):
 
     return folds
 
-def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is_last_fold):
+def build_training_components(model):
+    criterion = WeightedRankingLoss(
+        k=5,
+        temperature=1.0,
+        weight_factor=config['top5_weight'],
+        pairwise_weight=config['pairwise_weight'],
+        base_weight=config.get('base_weight', 1.0),
+        regression_weight=config['regression_weight'],
+        regression_beta=config['regression_beta'],
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay'],
+    )
+    return criterion, optimizer
+
+
+def train_one_fold(full_data, features, fold, num_stocks, device, output_dir):
     """训练单个 walk-forward 折，并用最佳 checkpoint 统一评估训练/验证集。"""
     fold_number = fold['fold']
     set_seed(config.get('seed', 42) + fold_number)
@@ -631,8 +649,6 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
     train_data[features] = scaler.fit_transform(train_data[features])
     validation_context[features] = scaler.transform(validation_context[features])
     joblib.dump(scaler, os.path.join(fold_dir, 'scaler.pkl'))
-    if is_last_fold:
-        joblib.dump(scaler, os.path.join(output_dir, 'scaler.pkl'))
 
     train_parts = create_ranking_dataset_vectorized(
         train_data,
@@ -678,31 +694,26 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
     )
 
     model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
-    criterion = WeightedRankingLoss(
-        k=5,
-        temperature=1.0,
-        weight_factor=config['top5_weight'],
-        pairwise_weight=config['pairwise_weight'],
-        base_weight=config.get('base_weight', 1.0),
-        regression_weight=config['regression_weight'],
-        regression_beta=config['regression_beta'],
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+    criterion, optimizer = build_training_components(model)
+    max_epochs = config['max_epochs']
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
         end_factor=0.2,
-        total_iters=config['num_epochs'],
+        total_iters=max_epochs,
     )
 
     checkpoint_metric = config.get('checkpoint_metric', 'top5_return')
     best_score = -float('inf')
     best_epoch = -1
+    epochs_without_improvement = 0
+    epochs_ran = 0
     checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
     print(f"\n========== Fold {fold_number}/{config['num_folds']} ==========")
     print(f"边界: {fold}; 训练样本: {len(train_dataset)}; 验证样本: {len(val_dataset)}")
 
-    for epoch in range(config['num_epochs']):
+    for epoch in range(max_epochs):
+        epochs_ran = epoch + 1
         train_loss, train_metrics = train_ranking_model(
             model, train_loader, criterion, optimizer, device, epoch, writer
         )
@@ -722,7 +733,16 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
         if current_score > best_score:
             best_score = current_score
             best_epoch = epoch + 1
+            epochs_without_improvement = 0
             torch.save(model.state_dict(), checkpoint_path)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= config['patience']:
+                print(
+                    f"Fold {fold_number} early stopping: "
+                    f"{config['patience']} epochs without {checkpoint_metric} improvement"
+                )
+                break
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     _, train_eval_metrics = evaluate_ranking_model(
@@ -731,9 +751,6 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
     _, val_eval_metrics = evaluate_ranking_model(
         model, val_loader, criterion, device, None, best_epoch - 1
     )
-    if is_last_fold:
-        torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
-
     train_eval_metrics = {key: float(value) for key, value in train_eval_metrics.items()}
     val_eval_metrics = {key: float(value) for key, value in val_eval_metrics.items()}
     result = {
@@ -744,6 +761,7 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
         'val_start': fold['val_start'].strftime('%Y-%m-%d'),
         'val_end': fold['val_end'].strftime('%Y-%m-%d'),
         'best_epoch': best_epoch,
+        'epochs_ran': epochs_ran,
         'checkpoint_metric': checkpoint_metric,
         'checkpoint_score': float(best_score),
         'train_metrics': train_eval_metrics,
@@ -755,6 +773,77 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
         json.dump(result, file, indent=2, ensure_ascii=False)
     writer.close()
     return result
+
+
+def train_final_model(full_data, features, num_stocks, device, output_dir, num_epochs):
+    """用全部标签有效样本重拟合 scaler，并按 CV 选出的轮数训练最终模型。"""
+    set_seed(config.get('seed', 42) + 1000)
+    final_dir = os.path.join(output_dir, 'full_train')
+    os.makedirs(final_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join(final_dir, 'log'))
+
+    train_data = full_data.copy()
+    train_data[features] = train_data[features].replace([np.inf, -np.inf], np.nan)
+    train_data = train_data.dropna(subset=features)
+    if train_data.empty:
+        raise ValueError('全量重训没有可用样本')
+
+    scaler = StandardScaler()
+    train_data[features] = scaler.fit_transform(train_data[features])
+    joblib.dump(scaler, os.path.join(output_dir, 'scaler.pkl'))
+
+    train_parts = create_ranking_dataset_vectorized(
+        train_data,
+        features,
+        config['sequence_length'],
+        max_window_end_date=train_data['日期'].max(),
+    )
+    train_dataset = RankingDataset(*train_parts)
+    if len(train_dataset) == 0:
+        raise ValueError('全量重训无法构造排序样本')
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False,
+    )
+    model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
+    criterion, optimizer = build_training_components(model)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0,
+        end_factor=0.2,
+        total_iters=num_epochs,
+    )
+
+    print(f"\n========== Full-data retraining: {num_epochs} epochs ==========")
+    for epoch in range(num_epochs):
+        train_loss, train_metrics = train_ranking_model(
+            model, train_loader, criterion, optimizer, device, epoch, writer
+        )
+        scheduler.step()
+        writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
+        print(
+            f"Full train Epoch {epoch + 1}/{num_epochs}: "
+            f"loss={train_loss:.4f}, "
+            f"top5={train_metrics.get('top5_return', 0.0):.6f}, "
+            f"rank_ic={train_metrics.get('rank_ic', 0.0):.4f}"
+        )
+
+    torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
+    metadata = {
+        'epochs': num_epochs,
+        'epoch_selection': 'median_best_epoch_across_folds',
+        'train_end': train_data['日期'].max().strftime('%Y-%m-%d'),
+        'ranking_samples': len(train_dataset),
+    }
+    with open(os.path.join(output_dir, 'final_training.json'), 'w', encoding='utf-8') as file:
+        json.dump(metadata, file, indent=2, ensure_ascii=False)
+    writer.close()
+    return metadata
 
 
 def main():
@@ -790,7 +879,7 @@ def main():
     full_data['日期'] = pd.to_datetime(full_data['日期'])
 
     fold_results = []
-    for index, fold in enumerate(folds):
+    for fold in folds:
         fold_results.append(
             train_one_fold(
                 full_data=full_data,
@@ -799,7 +888,6 @@ def main():
                 num_stocks=len(stockid2idx),
                 device=device,
                 output_dir=output_dir,
-                is_last_fold=index == len(folds) - 1,
             )
         )
 
@@ -816,6 +904,18 @@ def main():
         'mean_rank_ic_gap': float(np.mean(rank_ic_gaps)),
         'folds': fold_results,
     }
+
+    # 外层验证完成后，不再保留最后一折的旧训练边界；用全部标签有效数据重训。
+    final_epochs = int(np.median([result['best_epoch'] for result in fold_results]))
+    final_epochs = max(1, min(final_epochs, config['max_epochs']))
+    summary['full_training'] = train_final_model(
+        full_data=full_data,
+        features=features,
+        num_stocks=len(stockid2idx),
+        device=device,
+        output_dir=output_dir,
+        num_epochs=final_epochs,
+    )
     with open(os.path.join(output_dir, 'cross_validation_summary.json'), 'w', encoding='utf-8') as file:
         json.dump(summary, file, indent=2, ensure_ascii=False)
 
@@ -827,4 +927,4 @@ if __name__ == "__main__":
     # 多进程保护
     mp.set_start_method('spawn', force=True)
     best_score = main()
-    print(f"\n########## 训练完成！最佳 final score: {best_score:.4f} ##########")
+    print(f"\n########## 训练完成！多折平均 Top-5 收益: {best_score:.6f} ##########")

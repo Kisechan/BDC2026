@@ -67,9 +67,11 @@ class StockTransformer(nn.Module):
         self.config = config
         self.num_stocks = num_stocks
         emb_dim = emb_dim or config.get('stock_embedding_dim', 16)
+        self.id_dropout = config.get('id_dropout', 0.0)
 
         # 0: padding，1: 未登录股票，已知股票从 2 开始编号。
         self.stock_embedding = nn.Embedding(num_stocks + 2, emb_dim, padding_idx=0)
+        self.embedding_dropout = nn.Dropout(config.get('embedding_dropout', 0.0))
         self.stock_embedding_proj = nn.Linear(emb_dim, config['d_model'])
         
         # 输入投影层
@@ -150,7 +152,16 @@ class StockTransformer(nn.Module):
         
         # 重塑回股票维度用于股票间交互
         stock_features = aggregated_features.view(batch_size, num_stocks, -1)  # [batch, num_stocks, d_model]
-        identity_features = self.stock_embedding_proj(self.stock_embedding(stock_indices))
+        embedding_indices = stock_indices
+        if self.training and self.id_dropout > 0:
+            # 随机将一部分已知股票替换为 UNK，抑制对单只股票身份的记忆。
+            id_drop_mask = (
+                (stock_indices > 1)
+                & (torch.rand(stock_indices.shape, device=stock_indices.device) < self.id_dropout)
+            )
+            embedding_indices = stock_indices.masked_fill(id_drop_mask, 1)
+        stock_embeddings = self.embedding_dropout(self.stock_embedding(embedding_indices))
+        identity_features = self.stock_embedding_proj(stock_embeddings)
         stock_features = stock_features + identity_features
         
         # 股票间交互注意力
@@ -174,4 +185,3 @@ class StockTransformer(nn.Module):
         return_output = predicted_returns.view(batch_size, num_stocks)
         
         return output, return_output
-
