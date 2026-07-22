@@ -101,11 +101,15 @@ class WeightedRankingLoss(nn.Module):
     """
     组合的加权排序损失函数，着重强调top-k的样本。
     """
-    def __init__(self, temperature=1.0, k=5, weight_factor=2.0, pairwise_weight=1,
+    def __init__(self, listwise_temperature=0.2, listwise_weight=0.2, k=5,
+                 weight_factor=2.0, pairwise_weight=1,
                  base_weight=1.0, regression_weight=0.2, regression_beta=0.02,
                  ic_weight=0.2):
         super(WeightedRankingLoss, self).__init__()
-        self.temperature = temperature
+        if listwise_temperature <= 0:
+            raise ValueError('listwise_temperature 必须大于 0')
+        self.listwise_temperature = listwise_temperature
+        self.listwise_weight = listwise_weight
         self.k = k
         self.weight_factor = weight_factor
         self.pairwise_weight = pairwise_weight
@@ -115,9 +119,17 @@ class WeightedRankingLoss(nn.Module):
         self.ic_weight = ic_weight
 
     def listwise_loss(self, y_pred, y_true, weights):
-        """将 Top-k 权重并入目标分布后计算 Listwise Cross Entropy。"""
-        log_pred_probs = F.log_softmax(y_pred / self.temperature, dim=1)
-        target_probs = F.softmax(y_true / self.temperature, dim=1)
+        """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
+        log_pred_probs = F.log_softmax(y_pred, dim=1)
+        rank_min = y_true.min(dim=1, keepdim=True).values
+        rank_range = (
+            y_true.max(dim=1, keepdim=True).values - rank_min
+        ).clamp(min=1e-12)
+        rank_percentiles = (y_true - rank_min) / rank_range
+        target_probs = F.softmax(
+            rank_percentiles / self.listwise_temperature,
+            dim=1,
+        )
 
         # 权重作用于目标概率后重新归一化，避免用约 N 个股票的权重和
         # 去除以总概率为 1 的交叉熵，导致 Listwise 项随股票数缩小。
@@ -193,7 +205,7 @@ class WeightedRankingLoss(nn.Module):
         
         # 排序为主任务，原始收益回归为辅助任务。
         total_loss = (
-            listwise
+            self.listwise_weight * listwise
             + self.pairwise_weight * pairwise
             + self.ic_weight * rank_ic
             + self.regression_weight * regression
@@ -633,7 +645,8 @@ def build_walk_forward_folds(df, num_folds, validation_months, purge_days):
 def build_training_components(model):
     criterion = WeightedRankingLoss(
         k=5,
-        temperature=1.0,
+        listwise_temperature=config.get('listwise_temperature', 0.2),
+        listwise_weight=config.get('listwise_weight', 0.2),
         weight_factor=config['top5_weight'],
         pairwise_weight=config['pairwise_weight'],
         base_weight=config.get('base_weight', 1.0),

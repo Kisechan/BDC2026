@@ -27,6 +27,8 @@ config = {
 
     'regression_weight': 0.05,
     'regression_beta': 0.02,
+    'listwise_temperature': 0.2,
+    'listwise_weight': 0.2,
     'ic_weight': 0.2,
     'pairwise_weight': 1, # 配对损失权重
     'base_weight': 1.0, # 非top-k样本权重
