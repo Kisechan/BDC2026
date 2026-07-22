@@ -111,6 +111,14 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1)
         )
+
+        # 收益回归辅助头直接预测未来 5 日原始收益率。
+        self.return_head = nn.Sequential(
+            nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
+            nn.ReLU(),
+            nn.Dropout(config['dropout'] * 0.5),
+            nn.Linear(config['d_model'] // 4, 1),
+        )
         
         # 初始化权重
         self._init_weights()
@@ -159,9 +167,11 @@ class StockTransformer(nn.Module):
         
         # 生成排序分数
         scores = self.score_head(ranking_features)  # [batch*num_stocks, 1]
+        predicted_returns = self.return_head(ranking_features)  # [batch*num_stocks, 1]
         
         # 重塑为最终输出格式
         output = scores.view(batch_size, num_stocks)  # [batch, num_stocks]
+        return_output = predicted_returns.view(batch_size, num_stocks)
         
-        return output
+        return output, return_output
 

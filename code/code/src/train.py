@@ -101,13 +101,16 @@ class WeightedRankingLoss(nn.Module):
     """
     组合的加权排序损失函数，着重强调top-k的样本。
     """
-    def __init__(self, temperature=1.0, k=5, weight_factor=2.0, pairwise_weight=1, base_weight=1.0):
+    def __init__(self, temperature=1.0, k=5, weight_factor=2.0, pairwise_weight=1,
+                 base_weight=1.0, regression_weight=0.2, regression_beta=0.02):
         super(WeightedRankingLoss, self).__init__()
         self.temperature = temperature
         self.k = k
         self.weight_factor = weight_factor
         self.pairwise_weight = pairwise_weight
         self.base_weight = base_weight
+        self.regression_weight = regression_weight
+        self.regression_beta = regression_beta
 
     def listwise_loss(self, y_pred, y_true, weights):
         """加权的Listwise损失 (KL散度 + Cross Entropy)"""
@@ -146,7 +149,7 @@ class WeightedRankingLoss(nn.Module):
         
         return loss
         
-    def forward(self, y_pred, y_true):
+    def forward(self, y_pred, y_true, predicted_returns, raw_returns):
         """
         y_pred: [batch, num_items]
         y_true: [batch, num_items] (真实涨跌幅)
@@ -165,13 +168,22 @@ class WeightedRankingLoss(nn.Module):
         # 3. 计算加权损失
         listwise = self.listwise_loss(y_pred, y_true, weights)
         pairwise = self.pairwise_loss(y_pred, y_true, weights)
+        regression = F.smooth_l1_loss(
+            predicted_returns,
+            raw_returns,
+            beta=self.regression_beta,
+        )
         
-        # 组合两种损失
-        total_loss = listwise + self.pairwise_weight * pairwise
+        # 排序为主任务，原始收益回归为辅助任务。
+        total_loss = (
+            listwise
+            + self.pairwise_weight * pairwise
+            + self.regression_weight * regression
+        )
         
         return total_loss
 
-def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
+def calculate_ranking_metrics(y_pred, y_true, masks, predicted_returns=None, k=5):
     """计算新的评估指标：Top 5 收益之和，以及与理论最高值和随机值的比值"""
     batch_size = y_pred.size(0)
     
@@ -184,6 +196,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
     rank_ic_list = []
     final_score_list = []
     
+    return_mae_list = []
     for i in range(batch_size):
         mask = masks[i]
         valid_indices = mask.nonzero().squeeze()
@@ -195,6 +208,11 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         valid_true = y_true[i][valid_indices] # This is the 5-day return
         
         # 1. Predicted Top 5
+        if predicted_returns is not None:
+            valid_return_pred = predicted_returns[i][valid_indices]
+            return_mae_list.append(
+                torch.mean(torch.abs(valid_return_pred - valid_true)).item()
+            )
         _, pred_indices = torch.topk(valid_pred, k)
         pred_top_returns = valid_true[pred_indices]
         pred_return_sum = pred_top_returns.sum().item()
@@ -232,6 +250,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         'pred_return_sum': np.mean(pred_return_sum_list) if pred_return_sum_list else 0.0,
         'top5_return': np.mean(pred_return_sum_list) / k if pred_return_sum_list else 0.0,
         'rank_ic': np.mean(rank_ic_list) if rank_ic_list else 0.0,
+        'return_mae': np.mean(return_mae_list) if return_mae_list else 0.0,
         'max_return_sum': np.mean(max_return_sum_list) if max_return_sum_list else 0.0,
         'random_return_sum': np.mean(random_return_sum_list) if random_return_sum_list else 0.0,
     }
@@ -332,11 +351,12 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
         optimizer.zero_grad()
         
         # 模型预测
-        outputs = model(sequences, stock_indices, masks)  # [batch, max_stocks] 预测分数
+        outputs, return_outputs = model(sequences, stock_indices, masks)
         
         # 应用mask，只考虑有效股票
         masked_outputs = outputs * masks + (1 - masks) * (-1e9)  # 无效位置设为很小的值
         masked_targets = targets * masks
+        masked_return_outputs = return_outputs * masks
         masked_relevance = relevance.float() * masks  # 使用预处理好的相关性得分
         
         # 计算损失（只对有效股票计算）
@@ -356,10 +376,17 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             # 获取有效股票的预测值和预处理好的相关性得分
             valid_pred = masked_outputs[i][valid_indices]
             valid_relevance = masked_relevance[i][valid_indices]
+            valid_return_pred = masked_return_outputs[i][valid_indices]
+            valid_raw_return = masked_targets[i][valid_indices]
             
             if len(valid_pred) > 1:
                 # 直接使用预处理好的相关性得分，无需重新计算
-                loss = criterion(valid_pred.unsqueeze(0), valid_relevance.unsqueeze(0))
+                loss = criterion(
+                    valid_pred.unsqueeze(0),
+                    valid_relevance.unsqueeze(0),
+                    valid_return_pred.unsqueeze(0),
+                    valid_raw_return.unsqueeze(0),
+                )
                 batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
         
         if batch_loss is not None:
@@ -375,7 +402,13 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             
             # 计算评估指标
             with torch.no_grad():
-                metrics = calculate_ranking_metrics(masked_outputs, masked_targets, masks, k=5)
+                metrics = calculate_ranking_metrics(
+                    masked_outputs,
+                    masked_targets,
+                    masks,
+                    predicted_returns=masked_return_outputs,
+                    k=5,
+                )
                 for k, v in metrics.items():
                     if k not in total_metrics:
                         total_metrics[k] = 0
@@ -408,11 +441,12 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
             masks = batch['masks'].to(device)
             
             # 模型预测
-            outputs = model(sequences, stock_indices, masks)
+            outputs, return_outputs = model(sequences, stock_indices, masks)
             
             # 应用mask
             masked_outputs = outputs * masks + (1 - masks) * (-1e9)
             masked_targets = targets * masks
+            masked_return_outputs = return_outputs * masks
             
             # 计算损失
             batch_loss = None
@@ -430,6 +464,7 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                 
                 valid_pred = masked_outputs[i][valid_indices]
                 valid_true = masked_targets[i][valid_indices]
+                valid_return_pred = masked_return_outputs[i][valid_indices]
                 
                 if len(valid_pred) > 1:
                     _, sorted_indices = torch.sort(valid_true, descending=True)
@@ -437,7 +472,12 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                     relevance_scores[sorted_indices] = torch.arange(len(valid_true), 0, -1, device=device, dtype=torch.float32)
                     relevance_scores = relevance_scores.detach()
                     
-                    loss = criterion(valid_pred.unsqueeze(0), relevance_scores.unsqueeze(0))
+                    loss = criterion(
+                        valid_pred.unsqueeze(0),
+                        relevance_scores.unsqueeze(0),
+                        valid_return_pred.unsqueeze(0),
+                        valid_true.unsqueeze(0),
+                    )
                     batch_loss = batch_loss + loss if batch_loss is not None else loss
             
             if batch_loss is not None:
@@ -445,7 +485,13 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                 total_loss += batch_loss.item()
             
             # 计算评估指标
-            metrics = calculate_ranking_metrics(masked_outputs, masked_targets, masks, k=5)
+            metrics = calculate_ranking_metrics(
+                masked_outputs,
+                masked_targets,
+                masks,
+                predicted_returns=masked_return_outputs,
+                k=5,
+            )
             for k, v in metrics.items():
                 if k not in total_metrics:
                     total_metrics[k] = 0
@@ -503,7 +549,7 @@ def predict_top_stocks(model, data, features, sequence_length, scaler, stockid2i
     
     with torch.no_grad():
         # 模型预测
-        outputs = model(sequences, stock_indices, stock_mask)  # [1, num_stocks]
+        outputs, _ = model(sequences, stock_indices, stock_mask)  # [1, num_stocks]
         scores = outputs.squeeze().cpu().numpy()  # [num_stocks]
         
         # 获取排名前top_k的股票
@@ -638,6 +684,8 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is
         weight_factor=config['top5_weight'],
         pairwise_weight=config['pairwise_weight'],
         base_weight=config.get('base_weight', 1.0),
+        regression_weight=config['regression_weight'],
+        regression_beta=config['regression_beta'],
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.LinearLR(

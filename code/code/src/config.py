@@ -19,6 +19,8 @@ config = {
     'checkpoint_metric': 'top5_return',
     'purge_days': 5,
 
+    'regression_weight': 0.2,
+    'regression_beta': 0.02,
     'pairwise_weight': 1, # 配对损失权重
     'base_weight': 1.0, # 非top-k样本权重
     'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
