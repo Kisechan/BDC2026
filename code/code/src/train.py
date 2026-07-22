@@ -113,16 +113,17 @@ class WeightedRankingLoss(nn.Module):
         self.regression_beta = regression_beta
 
     def listwise_loss(self, y_pred, y_true, weights):
-        """加权的Listwise损失 (KL散度 + Cross Entropy)"""
-        
-        pred_probs = F.softmax(y_pred / self.temperature, dim=1)
+        """将 Top-k 权重并入目标分布后计算 Listwise Cross Entropy。"""
+        log_pred_probs = F.log_softmax(y_pred / self.temperature, dim=1)
         target_probs = F.softmax(y_true / self.temperature, dim=1)
 
-        # 加权 Cross Entropy（原实现未使用 weights）
-        weighted_ce = -(target_probs * torch.log(pred_probs + 1e-12) * weights)
-        ce_loss = (weighted_ce.sum(dim=1) / (weights.sum(dim=1) + 1e-12)).mean()
-        
-        return ce_loss
+        # 权重作用于目标概率后重新归一化，避免用约 N 个股票的权重和
+        # 去除以总概率为 1 的交叉熵，导致 Listwise 项随股票数缩小。
+        weighted_target_probs = target_probs * weights
+        weighted_target_probs = weighted_target_probs / (
+            weighted_target_probs.sum(dim=1, keepdim=True) + 1e-12
+        )
+        return -(weighted_target_probs * log_pred_probs).sum(dim=1).mean()
 
     def pairwise_loss(self, y_pred, y_true, weights):
         """加权的Pairwise损失"""
@@ -139,13 +140,14 @@ class WeightedRankingLoss(nn.Module):
         weight_matrix = weights.unsqueeze(2) + weights.unsqueeze(1)
         # weight_matrix = torch.where(weight_matrix > 2.0, self.weight_factor, 1.0)
         
-        pairwise_loss = torch.sigmoid(-pred_diff * torch.sign(true_diff))
+        pairwise_loss = F.softplus(-pred_diff * torch.sign(true_diff))
         
         # 应用mask和权重
         weighted_loss = pairwise_loss * mask * weight_matrix
         
-        num_pairs = mask.sum(dim=[1, 2]).clamp(min=1)
-        loss = (weighted_loss.sum(dim=[1, 2]) / num_pairs).mean()
+        # 按有效权重和归一化，使 Top-k 权重只改变相对重要性而不改变整体尺度。
+        weight_sum = (mask * weight_matrix).sum(dim=[1, 2]).clamp(min=1e-12)
+        loss = (weighted_loss.sum(dim=[1, 2]) / weight_sum).mean()
         
         return loss
         
