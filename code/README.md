@@ -16,9 +16,9 @@
 2. 做特征工程（39特征或`158+39`特征）；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
 4. 按实际交易日构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
-5. 联合优化排序损失和原始收益 SmoothL1 回归损失；
-6. 汇总平均/最差折 Top-5、Rank IC 和泛化差距；随后按各折最佳 epoch
-   的中位数，用全部标签有效样本重训最终模型。
+5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC 和原始收益 SmoothL1 回归损失；
+6. 汇总平均/最差折 Top-5、Rank IC 和泛化差距；随后取各折最佳 epoch
+   中位数与最小全量轮数的较大值，用全部标签有效样本重训最终模型。
 
 ---
 
@@ -63,13 +63,15 @@
 	- `_preprocess_common()`：在完整历史上按股票计算严格因果特征和标签；
 	- `build_walk_forward_folds()`：按实际交易日构造扩展窗口验证折和 5 日 purge。
 	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
-	- 三折完成后，取各折最佳 epoch 的中位数，重新拟合全量 scaler 并训练最终推理模型；
+	- 三折完成后，取各折最佳 epoch 的中位数，并应用 `min_final_epochs` 下限，重新拟合全量 scaler 后训练最终推理模型；
 	- 当前使用 `learning_rate=3e-5`、`patience=12` 和 `id_dropout=0.1`，让验证折有更充分的改善机会，同时减弱股票 ID 正则化。
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
+	- 将整数排名转成排名百分位，用 `listwise_temperature` 平滑目标分布，并通过 `listwise_weight` 控制 Listwise 尺度；
 	- 组合归一化 `listwise_loss`、RankNet `pairwise_loss`、Rank IC 相关性损失与原始收益 SmoothL1 辅助损失；
 	- 对真实Top-k样本施加更高权重。
+	- TensorBoard 分别记录四个加权损失分量，便于检查目标是否失衡。
 - 评估指标：`calculate_ranking_metrics()`
 	- 计算等权 Top-5 收益、Rank IC、回归 MAE 和原有归一化指标；
 	- 汇总多折均值、最差折表现及训练—验证差距。

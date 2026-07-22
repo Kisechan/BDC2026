@@ -2,6 +2,7 @@
 sequence_length = 60
 feature_num = '158+39'
 patience_num = 12
+experiment_name = 'balanced_rank_loss'
 config = {
     'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
     'd_model': 128,          # Transformer输入维度
@@ -10,6 +11,7 @@ config = {
     'dim_feedforward': 256, # 前馈网络维度
     'batch_size': 4,        # 排序任务batch_size可以小一些，因为每个batch包含更多股票
     'max_epochs': 50,
+    'min_final_epochs': 8,
     'patience': patience_num,
     'learning_rate': 3e-5,
     'dropout': 0.1,
@@ -35,6 +37,6 @@ config = {
     'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
     'weight_decay': 1e-4,
 
-    'output_dir': f'./model/{sequence_length}_{feature_num}_{patience_num}',
+    'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
     'data_path': './data',
 }

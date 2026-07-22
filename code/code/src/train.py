@@ -838,7 +838,15 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir):
     return result
 
 
-def train_final_model(full_data, features, num_stocks, device, output_dir, num_epochs):
+def train_final_model(
+    full_data,
+    features,
+    num_stocks,
+    device,
+    output_dir,
+    num_epochs,
+    median_best_epoch,
+):
     """用全部标签有效样本重拟合 scaler，并按 CV 选出的轮数训练最终模型。"""
     set_seed(config.get('seed', 42) + 1000)
     final_dir = os.path.join(output_dir, 'full_train')
@@ -892,6 +900,10 @@ def train_final_model(full_data, features, num_stocks, device, output_dir, num_e
         print(
             f"Full train Epoch {epoch + 1}/{num_epochs}: "
             f"loss={train_loss:.4f}, "
+            f"listwise={train_metrics.get('listwise_loss', 0.0):.4f}, "
+            f"pairwise={train_metrics.get('pairwise_loss', 0.0):.4f}, "
+            f"ic_loss={train_metrics.get('ic_loss', 0.0):.4f}, "
+            f"regression={train_metrics.get('regression_loss', 0.0):.4f}, "
             f"top5={train_metrics.get('top5_return', 0.0):.6f}, "
             f"rank_ic={train_metrics.get('rank_ic', 0.0):.4f}"
         )
@@ -899,7 +911,9 @@ def train_final_model(full_data, features, num_stocks, device, output_dir, num_e
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
     metadata = {
         'epochs': num_epochs,
-        'epoch_selection': 'median_best_epoch_across_folds',
+        'epoch_selection': 'max_minimum_and_median_best_epoch',
+        'median_best_epoch': median_best_epoch,
+        'min_final_epochs': config['min_final_epochs'],
         'train_end': train_data['日期'].max().strftime('%Y-%m-%d'),
         'ranking_samples': len(train_dataset),
     }
@@ -969,8 +983,14 @@ def main():
     }
 
     # 外层验证完成后，不再保留最后一折的旧训练边界；用全部标签有效数据重训。
-    final_epochs = int(np.median([result['best_epoch'] for result in fold_results]))
-    final_epochs = max(1, min(final_epochs, config['max_epochs']))
+    median_best_epoch = int(np.median([result['best_epoch'] for result in fold_results]))
+    min_final_epochs = config.get('min_final_epochs', 1)
+    if not 1 <= min_final_epochs <= config['max_epochs']:
+        raise ValueError('min_final_epochs 必须位于 [1, max_epochs] 范围内')
+    final_epochs = min(
+        config['max_epochs'],
+        max(min_final_epochs, median_best_epoch),
+    )
     summary['full_training'] = train_final_model(
         full_data=full_data,
         features=features,
@@ -978,6 +998,7 @@ def main():
         device=device,
         output_dir=output_dir,
         num_epochs=final_epochs,
+        median_best_epoch=median_best_epoch,
     )
     with open(os.path.join(output_dir, 'cross_validation_summary.json'), 'w', encoding='utf-8') as file:
         json.dump(summary, file, indent=2, ensure_ascii=False)
