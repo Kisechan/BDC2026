@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+from scipy.stats import spearmanr
 from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
@@ -180,6 +181,7 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
     random_return_sum_list = []
     ratio_pred_list = []
     ratio_random_list = []
+    rank_ic_list = []
     final_score_list = []
     
     for i in range(batch_size):
@@ -196,6 +198,11 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         _, pred_indices = torch.topk(valid_pred, k)
         pred_top_returns = valid_true[pred_indices]
         pred_return_sum = pred_top_returns.sum().item()
+
+        rank_ic = spearmanr(
+            valid_pred.detach().cpu().numpy(),
+            valid_true.detach().cpu().numpy(),
+        ).statistic
         
         # 2. True Top 5 (Theoretical Max)
         _, true_indices = torch.topk(valid_true, k)
@@ -217,10 +224,14 @@ def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
         random_return_sum_list.append(random_return_sum)
         ratio_pred_list.append(ratio_pred)
         ratio_random_list.append(ratio_random)
+        if np.isfinite(rank_ic):
+            rank_ic_list.append(float(rank_ic))
         final_score_list.append(final_score)
         
     metrics = {
         'pred_return_sum': np.mean(pred_return_sum_list) if pred_return_sum_list else 0.0,
+        'top5_return': np.mean(pred_return_sum_list) / k if pred_return_sum_list else 0.0,
+        'rank_ic': np.mean(rank_ic_list) if rank_ic_list else 0.0,
         'max_return_sum': np.mean(max_return_sum_list) if max_return_sum_list else 0.0,
         'random_return_sum': np.mean(random_return_sum_list) if random_return_sum_list else 0.0,
     }
@@ -555,26 +566,164 @@ def build_walk_forward_folds(df, num_folds, validation_months, purge_days):
 
     return folds
 
-# 主程序
+def train_one_fold(full_data, features, fold, num_stocks, device, output_dir, is_last_fold):
+    """训练单个 walk-forward 折，并用最佳 checkpoint 统一评估训练/验证集。"""
+    fold_number = fold['fold']
+    set_seed(config.get('seed', 42) + fold_number)
+    fold_dir = os.path.join(output_dir, f'fold_{fold_number}')
+    os.makedirs(fold_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join(fold_dir, 'log'))
+
+    train_data = full_data[full_data['日期'] <= fold['train_end']].copy()
+    validation_context = full_data[full_data['日期'] <= fold['val_end']].copy()
+    train_data[features] = train_data[features].replace([np.inf, -np.inf], np.nan)
+    validation_context[features] = validation_context[features].replace([np.inf, -np.inf], np.nan)
+    train_data = train_data.dropna(subset=features)
+    validation_context = validation_context.dropna(subset=features)
+
+    scaler = StandardScaler()
+    train_data[features] = scaler.fit_transform(train_data[features])
+    validation_context[features] = scaler.transform(validation_context[features])
+    joblib.dump(scaler, os.path.join(fold_dir, 'scaler.pkl'))
+    if is_last_fold:
+        joblib.dump(scaler, os.path.join(output_dir, 'scaler.pkl'))
+
+    train_parts = create_ranking_dataset_vectorized(
+        train_data,
+        features,
+        config['sequence_length'],
+        max_window_end_date=fold['train_end'],
+    )
+    val_parts = create_ranking_dataset_vectorized(
+        validation_context,
+        features,
+        config['sequence_length'],
+        min_window_end_date=fold['val_start'],
+        max_window_end_date=fold['val_end'],
+    )
+    train_dataset = RankingDataset(*train_parts)
+    val_dataset = RankingDataset(*val_parts)
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        raise ValueError(f"第 {fold_number} 折没有可用的训练或验证样本")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False,
+    )
+    train_eval_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
+    criterion = WeightedRankingLoss(
+        k=5,
+        temperature=1.0,
+        weight_factor=config['top5_weight'],
+        pairwise_weight=config['pairwise_weight'],
+        base_weight=config.get('base_weight', 1.0),
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0,
+        end_factor=0.2,
+        total_iters=config['num_epochs'],
+    )
+
+    checkpoint_metric = config.get('checkpoint_metric', 'top5_return')
+    best_score = -float('inf')
+    best_epoch = -1
+    checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
+    print(f"\n========== Fold {fold_number}/{config['num_folds']} ==========")
+    print(f"边界: {fold}; 训练样本: {len(train_dataset)}; 验证样本: {len(val_dataset)}")
+
+    for epoch in range(config['num_epochs']):
+        train_loss, train_metrics = train_ranking_model(
+            model, train_loader, criterion, optimizer, device, epoch, writer
+        )
+        eval_loss, eval_metrics = evaluate_ranking_model(
+            model, val_loader, criterion, device, writer, epoch
+        )
+        scheduler.step()
+        writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
+        print(
+            f"Fold {fold_number} Epoch {epoch + 1}: "
+            f"train_loss={train_loss:.4f}, eval_loss={eval_loss:.4f}, "
+            f"val_top5={eval_metrics.get('top5_return', 0.0):.6f}, "
+            f"val_rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}"
+        )
+
+        current_score = eval_metrics.get(checkpoint_metric, 0.0)
+        if current_score > best_score:
+            best_score = current_score
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), checkpoint_path)
+
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    _, train_eval_metrics = evaluate_ranking_model(
+        model, train_eval_loader, criterion, device, None, best_epoch - 1
+    )
+    _, val_eval_metrics = evaluate_ranking_model(
+        model, val_loader, criterion, device, None, best_epoch - 1
+    )
+    if is_last_fold:
+        torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
+
+    train_eval_metrics = {key: float(value) for key, value in train_eval_metrics.items()}
+    val_eval_metrics = {key: float(value) for key, value in val_eval_metrics.items()}
+    result = {
+        'fold': fold_number,
+        'train_end': fold['train_end'].strftime('%Y-%m-%d'),
+        'purge_start': fold['purge_start'].strftime('%Y-%m-%d'),
+        'purge_end': fold['purge_end'].strftime('%Y-%m-%d'),
+        'val_start': fold['val_start'].strftime('%Y-%m-%d'),
+        'val_end': fold['val_end'].strftime('%Y-%m-%d'),
+        'best_epoch': best_epoch,
+        'checkpoint_metric': checkpoint_metric,
+        'checkpoint_score': float(best_score),
+        'train_metrics': train_eval_metrics,
+        'val_metrics': val_eval_metrics,
+        'top5_gap': train_eval_metrics.get('top5_return', 0.0) - val_eval_metrics.get('top5_return', 0.0),
+        'rank_ic_gap': train_eval_metrics.get('rank_ic', 0.0) - val_eval_metrics.get('rank_ic', 0.0),
+    }
+    with open(os.path.join(fold_dir, 'metrics.json'), 'w', encoding='utf-8') as file:
+        json.dump(result, file, indent=2, ensure_ascii=False)
+    writer.close()
+    return result
+
+
 def main():
     set_seed(config.get('seed', 42))
     output_dir = config['output_dir']
-    os.makedirs(output_dir,exist_ok=True)
-    # 保存在output_dir中保存当前的配置文件，以便复现
-    data_path = config['data_path']
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
-    is_train = True
-    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'log')) if is_train else None
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as file:
+        json.dump(config, file, indent=4, ensure_ascii=False)
+
     if torch.cuda.is_available():
         device = torch.device('cuda')
     elif torch.backends.mps.is_available():
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
-    
-    # 1. 数据加载
-    data_file = os.path.join(data_path, 'train.csv')
+
+    data_file = os.path.join(config['data_path'], 'train.csv')
     full_df = pd.read_csv(data_file, dtype={'股票代码': str})
     full_df['股票代码'] = full_df['股票代码'].astype(str).str.zfill(6)
     folds = build_walk_forward_folds(
@@ -583,142 +732,48 @@ def main():
         validation_months=config['validation_months'],
         purge_days=config['purge_days'],
     )
-    fold = folds[-1]
-    print(f"当前折边界: {fold}")
-    
-    # 获取所有股票ID，建立映射
+
     all_stock_ids = full_df['股票代码'].unique()
     stockid2idx = {sid: idx + 2 for idx, sid in enumerate(sorted(all_stock_ids))}
-    num_stocks = len(stockid2idx)
-    with open(os.path.join(output_dir, 'stockid2idx.json'), 'w', encoding='utf-8') as f:
-        json.dump(stockid2idx, f, indent=2, ensure_ascii=False)
-    
-    # 2. 特征工程与预处理
+    with open(os.path.join(output_dir, 'stockid2idx.json'), 'w', encoding='utf-8') as file:
+        json.dump(stockid2idx, file, indent=2, ensure_ascii=False)
+
     full_data, features = preprocess_data(full_df, is_train=True, stockid2idx=stockid2idx)
     full_data['日期'] = pd.to_datetime(full_data['日期'])
-    train_data = full_data[full_data['日期'] <= fold['train_end']].copy()
-    # 验证序列保留全部历史上下文，窗口结束日会在数据集构造时限制。
-    val_data = full_data[full_data['日期'] <= fold['val_end']].copy()
-    
-    # 3. 标准化
-    scaler = StandardScaler()
 
-    train_data[features] = train_data[features].replace([np.inf, -np.inf], np.nan)
-    val_data[features] = val_data[features].replace([np.inf, -np.inf], np.nan)
-    # 丢弃nan数据
-    train_data = train_data.dropna(subset=features)
-    val_data = val_data.dropna(subset=features)
-    # 然后再缩放
-    train_data[features] = scaler.fit_transform(train_data[features])
-    val_data[features] = scaler.transform(val_data[features])
-    joblib.dump(scaler, os.path.join(output_dir, 'scaler.pkl'))
-
-    
-    # 4. 创建排序数据集
-    train_sequences, train_targets, train_relevance, train_stock_indices = create_ranking_dataset_vectorized(
-        train_data,
-        features,
-        config['sequence_length'],
-        ranking_data_path=config.get('train_ranking_data_path'),
-        max_window_end_date=fold['train_end'],
-    )
-    val_sequences, val_targets, val_relevance, val_stock_indices = create_ranking_dataset_vectorized(
-        val_data,
-        features,
-        config['sequence_length'],
-        ranking_data_path=config.get('val_ranking_data_path'),
-        min_window_end_date=fold['val_start'],
-        max_window_end_date=fold['val_end'],
-    )
-
-    print(f"训练集样本数: {len(train_sequences)}")
-    print(f"验证集样本数: {len(val_sequences)}")
-    
-    # 5. 创建排序数据集和数据加载器
-    train_dataset = RankingDataset(train_sequences, train_targets, train_relevance, train_stock_indices)
-    val_dataset = RankingDataset(val_sequences, val_targets, val_relevance, val_stock_indices)
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=True, 
-        collate_fn=collate_fn,
-        num_workers=0,  # 减少worker数量避免内存问题
-        pin_memory=False
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=False, 
-        collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=False
-    )
-    
-    # 6. 模型初始化
-    model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks)
-    model.to(device)
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    # 7. 损失函数和优化器
-    criterion = WeightedRankingLoss(
-        k=5,
-        temperature=1.0,
-        weight_factor=config['top5_weight'],
-        pairwise_weight=config['pairwise_weight'],
-        base_weight=config.get('base_weight', 1.0)
-    )  # 使用加权排序损失
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.2, total_iters=config['num_epochs'])
-    
-    # 8. 排序模型训练
-    if is_train:
-        best_score = -float('inf')
-        best_epoch = -1
-        
-        for epoch in range(config['num_epochs']):
-            print(f"\n=== Epoch {epoch+1}/{config['num_epochs']} ===")
-            
-            # 训练
-            train_loss, train_metrics = train_ranking_model(
-                model, train_loader, criterion, optimizer, device, epoch, writer
+    fold_results = []
+    for index, fold in enumerate(folds):
+        fold_results.append(
+            train_one_fold(
+                full_data=full_data,
+                features=features,
+                fold=fold,
+                num_stocks=len(stockid2idx),
+                device=device,
+                output_dir=output_dir,
+                is_last_fold=index == len(folds) - 1,
             )
-            
-            print(f"Train Loss: {train_loss:.4f}")
-            for k, v in train_metrics.items():
-                print(f"Train {k}: {v:.4f}")
-            
-            # 验证
-            eval_loss, eval_metrics = evaluate_ranking_model(
-                model, val_loader, criterion, device, writer, epoch
-            )
-            
-            print(f"Eval Loss: {eval_loss:.4f}")
-            for k, v in eval_metrics.items():
-                print(f"Eval {k}: {v:.4f}")
-            
-            # 学习率调度
-            scheduler.step()
-            if writer:
-                writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
-            
+        )
 
-            # 保存最佳模型（基于final score）
-            current_final_score = eval_metrics.get('final_score', 0.0)
-            if current_final_score > best_score:
-                best_score = current_final_score
-                best_epoch = epoch + 1
-                torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
-                print(f"保存最佳模型 - final score: {best_score:.4f}")
-        print(f"\n训练完成！最佳 epoch: {best_epoch}, 最佳 final score: {best_score:.4f}")
-        with open(os.path.join(output_dir, 'final_score.txt'), 'w') as f:
-            f.write(f"Best epoch: {best_epoch}\\nBest final_score: {best_score:.6f}\\n")
+    val_top5 = [result['val_metrics']['top5_return'] for result in fold_results]
+    val_rank_ic = [result['val_metrics']['rank_ic'] for result in fold_results]
+    top5_gaps = [result['top5_gap'] for result in fold_results]
+    rank_ic_gaps = [result['rank_ic_gap'] for result in fold_results]
+    summary = {
+        'mean_top5_return': float(np.mean(val_top5)),
+        'worst_fold_top5_return': float(np.min(val_top5)),
+        'mean_rank_ic': float(np.mean(val_rank_ic)),
+        'mean_top5_gap': float(np.mean(top5_gaps)),
+        'worst_top5_gap': float(np.max(top5_gaps)),
+        'mean_rank_ic_gap': float(np.mean(rank_ic_gaps)),
+        'folds': fold_results,
+    }
+    with open(os.path.join(output_dir, 'cross_validation_summary.json'), 'w', encoding='utf-8') as file:
+        json.dump(summary, file, indent=2, ensure_ascii=False)
 
-        if writer:
-            writer.close()
-
-        return best_score
+    print("\n========== Cross-validation summary ==========")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary['mean_top5_return']
 
 if __name__ == "__main__":
     # 多进程保护

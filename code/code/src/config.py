@@ -16,6 +16,7 @@ config = {
     'max_grad_norm': 5.0,
     'num_folds': 3,
     'validation_months': 2,
+    'checkpoint_metric': 'top5_return',
     'purge_days': 5,
 
     'pairwise_weight': 1, # 配对损失权重
