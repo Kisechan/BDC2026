@@ -11,6 +11,7 @@ config = {
     'num_epochs': 50,       # 排序任务可能需要更多epochs
     'learning_rate': 1e-5,  # 稍微降低学习率
     'dropout': 0.1,
+    'stock_embedding_dim': 16,
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
 

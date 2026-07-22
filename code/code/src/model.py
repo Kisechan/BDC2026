@@ -29,10 +29,16 @@ class CrossStockAttention(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, stock_features):
+    def forward(self, stock_features, stock_mask=None):
         # stock_features: [batch, num_stocks, d_model]
         # 股票间交互：每只股票都关注其他股票的特征
-        attended, _ = self.cross_attention(stock_features, stock_features, stock_features)
+        key_padding_mask = None if stock_mask is None else ~stock_mask.bool()
+        attended, _ = self.cross_attention(
+            stock_features,
+            stock_features,
+            stock_features,
+            key_padding_mask=key_padding_mask,
+        )
         output = self.norm(stock_features + self.dropout(attended))
         return output
 
@@ -55,11 +61,16 @@ class FeatureAttention(nn.Module):
         return self.dropout(attended)
 
 class StockTransformer(nn.Module):
-    def __init__(self, input_dim, config, num_stocks, emb_dim=16):
+    def __init__(self, input_dim, config, num_stocks, emb_dim=None):
         super(StockTransformer, self).__init__()
         self.model_type = 'RankingTransformer'
         self.config = config
         self.num_stocks = num_stocks
+        emb_dim = emb_dim or config.get('stock_embedding_dim', 16)
+
+        # 0: padding，1: 未登录股票，已知股票从 2 开始编号。
+        self.stock_embedding = nn.Embedding(num_stocks + 2, emb_dim, padding_idx=0)
+        self.stock_embedding_proj = nn.Linear(emb_dim, config['d_model'])
         
         # 输入投影层
         self.input_proj = nn.Linear(input_dim, config['d_model'])
@@ -112,7 +123,7 @@ class StockTransformer(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def forward(self, src):
+    def forward(self, src, stock_indices, stock_mask=None):
         # src: [batch, num_stocks, seq_len, feature_dim]
         batch_size, num_stocks, seq_len, feature_dim = src.size()
         
@@ -131,9 +142,14 @@ class StockTransformer(nn.Module):
         
         # 重塑回股票维度用于股票间交互
         stock_features = aggregated_features.view(batch_size, num_stocks, -1)  # [batch, num_stocks, d_model]
+        identity_features = self.stock_embedding_proj(self.stock_embedding(stock_indices))
+        stock_features = stock_features + identity_features
         
         # 股票间交互注意力
-        interactive_features = self.cross_stock_attention(stock_features)  # [batch, num_stocks, d_model]
+        interactive_features = self.cross_stock_attention(
+            stock_features,
+            stock_mask=stock_mask,
+        )  # [batch, num_stocks, d_model]
         
         # 重塑回原形状
         interactive_features = interactive_features.view(batch_size * num_stocks, -1)

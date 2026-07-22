@@ -1,3 +1,4 @@
+import json
 import os
 import multiprocessing as mp
 
@@ -14,14 +15,14 @@ from utils import engineer_features_39, engineer_features_158plus39
 
 feature_cloums_map = {
 	'39': [
-		'instrument', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
+		'开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
 		'sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv',
 		'volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std',
 		'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',
 		'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'
 	],
 	'158+39': [
-		'instrument', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
+		'开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
 		'KMID', 'KLEN', 'KMID2', 'KUP', 'KUP2', 'KLOW', 'KLOW2', 'KSFT', 'KSFT2', 'OPEN0', 'HIGH0', 'LOW0',
 		'VWAP0', 'ROC5', 'ROC10', 'ROC20', 'ROC30', 'ROC60', 'MA5', 'MA10', 'MA20', 'MA30', 'MA60', 'STD5',
 		'STD10', 'STD20', 'STD30', 'STD60', 'BETA5', 'BETA10', 'BETA20', 'BETA30', 'BETA60', 'RSQR5', 'RSQR10',
@@ -67,16 +68,15 @@ def preprocess_predict_data(df, stockid2idx):
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))
 
 	processed = pd.concat(processed_list).reset_index(drop=True)
-	processed['instrument'] = processed['股票代码'].map(stockid2idx)
-	processed = processed.dropna(subset=['instrument']).copy()
+	processed['instrument'] = processed['股票代码'].map(stockid2idx).fillna(1)
 	processed['instrument'] = processed['instrument'].astype(np.int64)
 	processed['日期'] = pd.to_datetime(processed['日期'])
 
 	return processed, feature_columns
 
 
-def build_inference_sequences(data, features, sequence_length, stock_ids, latest_date):
-	sequences, sequence_stock_ids = [], []
+def build_inference_sequences(data, features, sequence_length, stock_ids, latest_date, stockid2idx):
+	sequences, sequence_stock_ids, sequence_stock_indices = [], [], []
 	for stock_id in stock_ids:
 		stock_history = data[
 			(data['股票代码'] == stock_id) &
@@ -85,17 +85,19 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 
 		if len(stock_history) == sequence_length:
 			sequences.append(stock_history[features].values.astype(np.float32))
+			sequence_stock_indices.append(stockid2idx.get(stock_id, 1))
 			sequence_stock_ids.append(stock_id)
 
 	if len(sequences) == 0:
 		raise ValueError('没有可用于预测的股票序列，请检查数据与 sequence_length')
 
-	return np.asarray(sequences, dtype=np.float32), sequence_stock_ids
+	return np.asarray(sequences, dtype=np.float32), sequence_stock_ids, sequence_stock_indices
 
 
 def main():
 	data_file = os.path.join(config['data_path'], 'train.csv')
 	model_path = os.path.join(config['output_dir'], 'best_model.pth')
+	stock_mapping_path = os.path.join(config['output_dir'], 'stockid2idx.json')
 	scaler_path = os.path.join(config['output_dir'], 'scaler.pkl')
 	output_path = os.path.join('./output/', 'result.csv')
 
@@ -103,6 +105,8 @@ def main():
 		raise FileNotFoundError(f'未找到模型文件: {model_path}')
 	if not os.path.exists(scaler_path):
 		raise FileNotFoundError(f'未找到Scaler文件: {scaler_path}')
+	if not os.path.exists(stock_mapping_path):
+		raise FileNotFoundError(f'未找到股票ID映射: {stock_mapping_path}')
 
 	raw_df = pd.read_csv(data_file, dtype={'股票代码': str})
 	raw_df['股票代码'] = raw_df['股票代码'].astype(str).str.zfill(6)
@@ -110,7 +114,8 @@ def main():
 	latest_date = raw_df['日期'].max()
 
 	stock_ids = sorted(raw_df['股票代码'].unique())
-	stockid2idx = {sid: idx for idx, sid in enumerate(stock_ids)}
+	with open(stock_mapping_path, 'r', encoding='utf-8') as f:
+		stockid2idx = json.load(f)
 
 	processed, features = preprocess_predict_data(raw_df, stockid2idx)
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -119,12 +124,13 @@ def main():
 	processed[features] = scaler.transform(processed[features])
 
 	sequence_length = config['sequence_length']
-	sequences_np, sequence_stock_ids = build_inference_sequences(
+	sequences_np, sequence_stock_ids, sequence_stock_indices = build_inference_sequences(
 		processed,
 		features,
 		sequence_length,
 		stock_ids,
 		latest_date,
+		stockid2idx,
 	)
 
 	if torch.cuda.is_available():
@@ -134,14 +140,16 @@ def main():
 	else:
 		device = torch.device('cpu')
 
-	model = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stock_ids))
+	model = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stockid2idx))
 	model.load_state_dict(torch.load(model_path, map_location=device))
 	model.to(device)
 	model.eval()
 
 	with torch.no_grad():
 		x = torch.from_numpy(sequences_np).unsqueeze(0).to(device)  # [1, N, L, F]
-		scores = model(x).squeeze(0).detach().cpu().numpy()         # [N]
+		stock_index_tensor = torch.LongTensor(sequence_stock_indices).unsqueeze(0).to(device)
+		stock_mask = torch.ones_like(stock_index_tensor, dtype=torch.float32)
+		scores = model(x, stock_index_tensor, stock_mask).squeeze(0).detach().cpu().numpy()
 
 	order = np.argsort(scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
