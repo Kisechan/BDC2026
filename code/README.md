@@ -1,9 +1,9 @@
 # THU-BigDataCompetition-2026-baseline
 
 本项目是一个面向沪深300成分股的**排序学习选股**方案：
-- 输入：每只股票过去一段时间（默认60个交易日）的量价与技术特征序列；
-- 模型：`StockTransformer`，同时建模单股票时序模式与股票间交互；
-- 输出：对同一天全部候选股票打分并排序，最终输出前5只股票（等权重0.2）。
+- 输入：每只股票过去60个交易日的量价特征序列，以及独立的股票 ID；
+- 模型：`StockTransformer`，使用股票 ID Embedding、时序编码和股票间注意力；
+- 输出：每只股票的 ranking score 和辅助收益预测，最终选择 Top-5 组合。
 
 ---
 
@@ -15,9 +15,9 @@
 1. 读取历史行情数据（`data/stock_data.csv`）；
 2. 做特征工程（39特征或`158+39`特征）；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
-4. 按“日期”组织排序样本：每个样本是一日内多只股票的序列与目标；
-5. 训练排序模型，监控 `final_score` 并保存最优权重；
-6. 使用训练好的 `best_model.pth` + `scaler.pkl` 在最新日期上生成Top5选股结果。
+4. 按实际交易日构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
+5. 联合优化排序损失和原始收益 SmoothL1 回归损失；
+6. 汇总平均/最差折 Top-5、Rank IC 和泛化差距，并用最新折模型生成 Top-5。
 
 ---
 
@@ -29,6 +29,7 @@
 - 模型超参数（`d_model`、`nhead`、`num_layers` 等）；
 - 训练超参数（`batch_size`、`num_epochs`、`learning_rate`）；
 - 排序损失权重参数（`pairwise_weight`、`top5_weight`、`base_weight`）；
+- 多折切分与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、`regression_weight`）；
 - 数据路径和输出路径（默认输出到 `output/`）。
 
 ### [model.py](model.py)
@@ -36,11 +37,12 @@
 - `PositionalEncoding`：时序位置编码；
 - 时序编码器 `TransformerEncoder`：提取单股票历史序列表示；
 - `FeatureAttention`：对时间维特征做注意力聚合；
-- `CrossStockAttention`：在同一交易日内建模股票间关系；
-- `ranking_layers` + `score_head`：输出每只股票的排序分数。
+- 股票 ID Embedding：在时序聚合后融合股票身份；
+- `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
+- `score_head` 与 `return_head`：分别输出排序分数和原始收益预测。
 
-输入形状：`[batch, num_stocks, seq_len, feature_dim]`  
-输出形状：`[batch, num_stocks]`。
+输入包含特征张量、股票索引和有效股票 mask；模型返回两个
+`[batch, num_stocks]` 张量，分别对应排序分数和预测收益。
 
 ### [utils.py](utils.py)
 包含特征工程与数据集构建逻辑：
@@ -54,23 +56,24 @@
 ### [train.py](train.py)
 训练主脚本，关键内容：
 - 数据预处理：
-	- `_preprocess_common()`：按股票分组并行特征工程、股票ID映射、标签构建；
-	- `split_train_val_by_last_month()`：按最后阶段数据切分训练/验证集，并保留序列上下文。
+	- `_preprocess_common()`：在完整历史上按股票计算严格因果特征和标签；
+	- `build_walk_forward_folds()`：按实际交易日构造扩展窗口验证折和 5 日 purge。
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
-	- 组合了 `listwise_loss` 与 `pairwise_loss`；
+	- 组合 `listwise_loss`、`pairwise_loss` 与原始收益 SmoothL1 辅助损失；
 	- 对真实Top-k样本施加更高权重。
 - 评估指标：`calculate_ranking_metrics()`
-	- 计算 `pred_return_sum`、`max_return_sum`、`ratio_pred`、`final_score` 等；
-	- 训练过程中以验证集 `final_score` 选择最优模型。
+	- 计算等权 Top-5 收益、Rank IC、回归 MAE 和原有归一化指标；
+	- 汇总多折均值、最差折表现及训练—验证差距。
 
 训练产物：
-- `best_model.pth`：最佳模型参数；
-- `scaler.pkl`：标准化器；
+- `fold_N/best_model.pth`、`fold_N/scaler.pkl`、`fold_N/metrics.json`：逐折产物；
+- `best_model.pth`、`scaler.pkl`：供推理使用的最新折最佳产物；
+- `stockid2idx.json`：训练与推理共用的股票 ID 映射；
+- `cross_validation_summary.json`：多折汇总；
 - `config.json`：训练时配置快照；
-- `final_score.txt`：最佳分数记录；
-- `log/`：TensorBoard日志。
+- `fold_N/log/`：逐折 TensorBoard 日志。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
@@ -80,7 +83,7 @@
 4. 用 `best_model.pth` 对全部可预测股票打分；
 5. 按分数降序取前5只，输出到 `output.csv`：
 	 - `stock_id`
-	 - `weight`（固定 `0.2`）
+	 - `weight`（由预测阶段的组合分配策略生成）
 
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：
