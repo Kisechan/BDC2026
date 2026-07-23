@@ -48,14 +48,16 @@
 
 ### [utils.py](utils.py)
 包含特征工程与数据集构建逻辑：
-- `engineer_features_39()`：39个技术指标特征；
-- `engineer_features()`：158个Alpha类特征；
-- `engineer_features_158plus39()`：合并 `158 + 39` 特征；
+- `engineer_features_39()`：精简技术指标特征（兼容名称 `39`）；
+- `engineer_features()`：Alpha 类特征；
+- `engineer_features_158plus39()`：合并后的 171 列时序特征（兼容名称 `158+39`）；
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
 原 `RSQR5/10/20/30/60` 的滚动索引实现会使绝大部分结果变成 NaN 后填 0，
-现已从特征计算和训练/推理特征表中删除；`158+39` 名称为兼容旧配置保留。
+现已从特征计算和训练/推理特征表中删除。另删除 20 个可由保留列精确恢复的特征：
+`IMXD=IMAX-IMIN`、`CNTD=CNTP-CNTN`、`SUMD=SUMP-SUMN`、
+`VSUMD=VSUMP-VSUMN`（每组各 5 个窗口）。`158+39` 名称仅为兼容旧配置保留。
 
 ### [train.py](train.py)
 训练主脚本，关键内容：

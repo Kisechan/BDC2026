@@ -11,7 +11,7 @@ def _rolling_linear_regression(x, y):
     return beta[1], res[0] if len(res) > 0 else 0.0, np.sum((y - (x @ beta))**2)
 def engineer_features_158plus39(df):
     """
-    计算39个技术指标特征和158个Alpha特征，并合并它们。
+    计算技术指标和 Alpha 特征并合并；函数名为兼容旧配置保留。
     """
     # 为了避免修改原始DataFrame，创建一个副本
     df_copy = df.copy()
@@ -238,18 +238,13 @@ def engineer_features(df):
         features.append((close - min_low) / (max_high - min_low + 1e-12))
         feature_names.append(f'RSV{w}')
 
-    # 11. Index of Max/Min features (15 features) - talib 不支持，保留原实现
+    # 11. Index of Max/Min features (10 features) - IMXD 可由 IMAX-IMIN 精确恢复，删除冗余列
     for w in windows:
         features.append(high.rolling(w).apply(np.argmax, raw=True) / w)
         feature_names.append(f'IMAX{w}')
     for w in windows:
         features.append(low.rolling(w).apply(np.argmin, raw=True) / w)
         feature_names.append(f'IMIN{w}')
-    for w in windows:
-        imax = high.rolling(w).apply(np.argmax, raw=True)
-        imin = low.rolling(w).apply(np.argmin, raw=True)
-        features.append((imax - imin) / w)
-        feature_names.append(f'IMXD{w}')
 
     # 12. Correlation features (10 features) - 使用 talib 加速
     log_volume = np.log(volume + 1)
@@ -266,7 +261,7 @@ def engineer_features(df):
         features.append(talib.CORREL(corr_df.iloc[:, 0], corr_df.iloc[:, 1], timeperiod=w))
         feature_names.append(f'CORD{w}')
 
-    # 13. Count features (15 features) - 向量化操作，无需更改
+    # 13. Count features (10 features) - CNTD=CNTP-CNTN，删除冗余列
     close_diff_pos = (close > close.shift(1))
     close_diff_neg = (close < close.shift(1))
     for w in windows:
@@ -275,13 +270,8 @@ def engineer_features(df):
     for w in windows:
         features.append(close_diff_neg.rolling(w).mean())
         feature_names.append(f'CNTN{w}')
-    for w in windows:
-        cntp = close_diff_pos.rolling(w).mean()
-        cntn = close_diff_neg.rolling(w).mean()
-        features.append(cntp - cntn)
-        feature_names.append(f'CNTD{w}')
 
-    # 14. Sum of price change features (15 features) - 向量化操作，无需更改
+    # 14. Sum of price change features (10 features) - SUMD=SUMP-SUMN，删除冗余列
     close_diff_abs = (close - close.shift(1)).abs()
     close_diff_up = (close - close.shift(1)).clip(lower=0)
     close_diff_down = -(close - close.shift(1)).clip(upper=0)
@@ -295,12 +285,6 @@ def engineer_features(df):
         sum_down = close_diff_down.rolling(w).sum()
         features.append(sum_down / (sum_abs + 1e-12))
         feature_names.append(f'SUMN{w}')
-    for w in windows:
-        sum_abs = close_diff_abs.rolling(w).sum()
-        sum_up = close_diff_up.rolling(w).sum()
-        sum_down = close_diff_down.rolling(w).sum()
-        features.append((sum_up - sum_down) / (sum_abs + 1e-12))
-        feature_names.append(f'SUMD{w}')
 
     # 15. Volume-related features (10 features) - 使用 talib 加速
     for w in windows:
@@ -318,7 +302,7 @@ def engineer_features(df):
         features.append(std_vol_w_ret / (mean_vol_w_ret + 1e-12))
         feature_names.append(f'WVMA{w}')
 
-    # 17. Volume change sum features (15 features) - 向量化操作，无需更改
+    # 17. Volume change sum features (10 features) - VSUMD=VSUMP-VSUMN，删除冗余列
     volume_diff_abs = (volume - volume.shift(1)).abs()
     volume_diff_up = (volume - volume.shift(1)).clip(lower=0)
     volume_diff_down = -(volume - volume.shift(1)).clip(upper=0)
@@ -332,12 +316,6 @@ def engineer_features(df):
         sum_down = volume_diff_down.rolling(w).sum()
         features.append(sum_down / (sum_abs + 1e-12))
         feature_names.append(f'VSUMN{w}')
-    for w in windows:
-        sum_abs = volume_diff_abs.rolling(w).sum()
-        sum_up = volume_diff_up.rolling(w).sum()
-        sum_down = volume_diff_down.rolling(w).sum()
-        features.append((sum_up - sum_down) / (sum_abs + 1e-12))
-        feature_names.append(f'VSUMD{w}')
 
     # Combine all features into a new DataFrame
     feature_df = pd.concat(features, axis=1)
