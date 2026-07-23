@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39'
 patience_num = 12
-experiment_name = 'balanced_rank_loss'
+experiment_name = 'reduced_features_171'
 config = {
     'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
     'd_model': 128,          # Transformer输入维度
@@ -24,14 +24,14 @@ config = {
     'num_folds': 3,
     'validation_months': 2,
     'checkpoint_metric': 'top5_return_plus_rank_ic',
-    'checkpoint_rank_ic_weight': 0.2,
+    'checkpoint_rank_ic_weight': 0.1,
     'purge_days': 5,
 
     'regression_weight': 0.05,
     'regression_beta': 0.02,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
-    'ic_weight': 0.2,
+    'ic_weight': 0.15,
     'pairwise_weight': 1, # 配对损失权重
     'base_weight': 1.0, # 非top-k样本权重
     'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
