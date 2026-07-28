@@ -28,7 +28,14 @@ def print_cross_validation() -> None:
     with open(summary_path, "r", encoding="utf-8") as handle:
         summary = json.load(handle)
 
-    print("\n[模型验证：三折 walk-forward]")
+    seeds = summary.get("ensemble_seeds")
+    if seeds:
+        print(
+            "\n[模型验证：三随机种子 × 三折 walk-forward，"
+            f"每 {summary.get('evaluation_stride', 1)} 个交易日评估]"
+        )
+    else:
+        print("\n[模型验证：三折 walk-forward]")
     print(f"平均 Top-5 收益: {_pct(float(summary['mean_top5_return']))}")
     print(f"最差折 Top-5 收益: {_pct(float(summary['worst_fold_top5_return']))}")
     if "mean_weighted_portfolio_return" in summary:
@@ -44,6 +51,22 @@ def print_cross_validation() -> None:
             f"平均股票仓位/现金: {float(summary['mean_gross_exposure']):.2%} / "
             f"{float(summary['mean_cash_weight']):.2%}"
         )
+        if "p10_weighted_portfolio_return" in summary:
+            print(
+                "动态组合收益 P10/标准差/正收益率: "
+                f"{_pct(float(summary['p10_weighted_portfolio_return']))} / "
+                f"{float(summary['std_weighted_portfolio_return']):.4%} / "
+                f"{float(summary['weighted_portfolio_positive_rate']):.2%}"
+            )
+            print(
+                "平均 Allocation/Exposure 贡献: "
+                f"{_pct(float(summary['mean_allocation_contribution']))} / "
+                f"{_pct(float(summary['mean_exposure_contribution']))}"
+            )
+            print(
+                f"平均模型排名分歧: "
+                f"{float(summary['mean_model_disagreement']):.4f}"
+            )
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
     random_baselines = []
     for fold in summary.get("folds", []):
@@ -54,7 +77,8 @@ def print_cross_validation() -> None:
         top5_return = float(metrics["top5_return"])
         random_baselines.append(random_top5)
         print(
-            f"  Fold {fold['fold']} ({fold['val_start']} ~ {fold['val_end']}): "
+            f"  Seed {fold.get('base_seed', '-')} Fold {fold['fold']} "
+            f"({fold['val_start']} ~ {fold['val_end']}): "
             f"Top-5 {_pct(top5_return)}, "
             f"随机/全池等权 {_pct(random_top5)}, "
             f"超额 {_pct(top5_return - random_top5)}, "
@@ -64,6 +88,11 @@ def print_cross_validation() -> None:
         mean_random = float(np.mean(random_baselines))
         print(f"平均随机/全池等权: {_pct(mean_random)}")
         print(f"平均相对随机超额: {_pct(float(summary['mean_top5_return']) - mean_random)}")
+    if "promotion_criteria" in summary:
+        print(
+            "Ensemble promotion criteria: "
+            f"{'PASS' if summary['promotion_criteria'].get('passed') else 'FAIL'}"
+        )
 
 
 def _normalize_ids(series: pd.Series) -> pd.Series:

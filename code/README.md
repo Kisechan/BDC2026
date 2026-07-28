@@ -15,10 +15,12 @@
 1. 读取历史行情数据（`data/stock_data.csv`）；
 2. 做特征工程（39特征或`158+39`特征）；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
-4. 按实际交易日构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
+4. 对三个随机种子分别构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
 5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、相对仓位和总仓位损失；
-6. 汇总平均/最差折 Top-5、动态权重组合收益、Rank IC 和泛化差距；随后取各折最佳 epoch
-   中位数与最小全量轮数的较大值，用全部标签有效样本重训最终模型。
+6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存九组 OOF 输出并标定
+   Allocation 混合和模型分歧降仓策略；
+7. 取九个最佳 epoch 的中位数与最小全量轮数的较大值，用全部标签有效样本
+   重训三个最终模型。
 
 ---
 
@@ -33,6 +35,9 @@
   `allocation_weight`、`exposure_weight` 及相应 temperature）；
 - 多折切分、ID 正则化与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、
   `id_dropout`、`embedding_dropout`、`regression_weight`）；
+- 三种子集成、周频验证与 OOF 策略网格（`ensemble_seeds`、`evaluation_stride`、
+  `allocation_blend_grid`、`disagreement_gamma_grid`）；
+- CUDA AMP、TF32、fused AdamW、pinned memory 和 non-blocking 传输开关；
 - 数据路径和输出路径（默认输出到 `output/`）。
 
 ### [model.py](model.py)
@@ -44,7 +49,7 @@
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
 - `score_head` 与 `return_head`：分别输出排序分数和原始收益预测；
 - `allocation_head`：输出 Top-5 内的相对仓位 logits；
-- `exposure_head`：输出 `[0.80, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
+- `exposure_head`：输出 `[0.20, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
 
 输入包含特征张量、股票索引和有效股票 mask；模型返回排序分数、预测收益、
 相对仓位 logits 三个 `[batch, num_stocks]` 张量，以及一个 `[batch]` 总仓位张量。
@@ -55,6 +60,7 @@
 - `engineer_features()`：Alpha 类特征；
 - `engineer_features_158plus39()`：合并后的 171 列时序特征（兼容名称 `158+39`）；
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
+- rank ensemble、OOF 对齐、收益分解和策略网格标定函数。
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
 原 `RSQR5/10/20/30/60` 的滚动索引实现会使绝大部分结果变成 NaN 后填 0，
@@ -68,8 +74,11 @@
 	- `_preprocess_common()`：在完整历史上按股票计算严格因果特征和标签；
 	- `build_walk_forward_folds()`：按实际交易日构造扩展窗口验证折和 5 日 purge。
 	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
-	- 三折完成后，取各折最佳 epoch 的中位数，并应用 `min_final_epochs` 下限，重新拟合全量 scaler 后训练最终推理模型；
+	- 三个随机种子分别完成三折训练；checkpoint 只使用从验证期末向前每隔
+	  5 个交易日抽取的非重叠日期；
+	- 九折完成后统一选择最终 epoch，重新拟合一个全量 scaler，并训练三个最终模型；
 	- 当前使用 `learning_rate=3e-5`、`patience=12` 和 `id_dropout=0.1`，让验证折有更充分的改善机会，同时减弱股票 ID 正则化。
+	- CUDA 上使用 AMP 加速 Transformer 前向，排序和仓位损失保持 FP32；同时按配置启用 TF32、fused AdamW、pinned memory 与 non-blocking 传输。
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
@@ -81,13 +90,15 @@
 	- `exposure_loss` 根据该 Top-5 的真实平均收益监督总仓位。
 - 评估指标：`calculate_ranking_metrics()`
 	- 计算等权 Top-5 收益、动态权重组合收益、总仓位、现金、最大单股仓位、Rank IC、回归 MAE 和原有归一化指标；
-	- 汇总多折均值、最差折表现及训练—验证差距。
+	- 分离等权满仓、等权同仓位、Allocation 与 Exposure 的收益贡献；
+	- 汇总均值、最差折、P10、标准差、正收益率、下行波动及模型排名分歧。
 	- checkpoint 使用 `weighted_portfolio_return + checkpoint_rank_ic_weight * rank_ic` 组合指标，使选中股票后的权重头也参与模型选择。
 
 训练产物：
-- `fold_N/best_model.pth`、`fold_N/scaler.pkl`、`fold_N/metrics.json`：逐折产物；
-- `best_model.pth`、`scaler.pkl`：全量重训后供推理使用的最终产物；
-- `final_training.json`、`full_train/log/`：全量重训轮数、样本范围和日志；
+- `seed_<seed>/fold_N/`：九组 checkpoint、scaler、指标、日志与 OOF 输出；
+- `seed_<seed>/best_model.pth`：三个全量重训模型；
+- `scaler.pkl`：三个全量模型共用的全量标准化器；
+- `ensemble_policy.json`：OOF 选择的 Allocation 混合与分歧降仓策略；
 - `stockid2idx.json`：训练与推理共用的股票 ID 映射；
 - `cross_validation_summary.json`：多折汇总；
 - `config.json`：训练时配置快照；
@@ -97,15 +108,17 @@
 推理主脚本，流程：
 1. 加载历史数据，取最新交易日；
 2. 执行与训练一致的特征工程；
-3. 加载 `scaler.pkl` 进行特征标准化；
-4. 用 `best_model.pth` 对全部可预测股票打分；
-5. 按 ranking score 降序取前5只，用 Allocation Head 的 softmax 权重乘 Exposure Head 总仓位，输出到 `result.csv`：
+3. 从模型目录加载训练时 `config.json` 和全量 `scaler.pkl`，源码参数漂移只报告、不参与模型构造；
+4. 加载三个全量模型，将各自 ranking score 转为横截面百分位后求均值；
+5. 选择 ensemble Top-5，平均三个 Allocation 分布，并按模型排名分歧将总仓位向
+   0.20 收缩，输出到 `result.csv`：
 	 - `stock_id`
-	 - `weight`（5只股票之和严格位于 `[0.80, 0.999999]`）
+	 - `weight`（5只股票之和严格位于 `[0.20, 0.999999]`）
 
 写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
-`1 - sum(weight)`。
+`1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
+Top-5、排名分歧、策略参数、股票仓位和现金。
 
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：
@@ -171,3 +184,6 @@ wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
 
 3) GPU/CPU自动选择  
 代码会按 `CUDA -> MPS -> CPU` 顺序自动选择设备；无GPU时可直接CPU运行。
+CUDA 默认启用 AMP、TF32、fused AdamW、pinned memory 和 non-blocking
+传输；若 8 GB 显存仍出现 OOM，只需将 `batch_size` 从 8 降回 4，不要关闭
+损失 FP32 或修改模型维度。
