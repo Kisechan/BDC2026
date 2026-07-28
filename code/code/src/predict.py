@@ -7,12 +7,14 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+from scipy.stats import spearmanr
 
 from config import config
 from model import StockTransformer
 from utils import add_relative_market_features
 from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
+from utils import extract_selection_risk_context
 from utils import RELATIVE_MARKET_FEATURES, RELATIVE_MARKET_FEATURE_SET
 
 
@@ -331,6 +333,17 @@ def main():
 		latest_date,
 		stockid2idx,
 	)
+	selection_risk_context = None
+	if 'selection_risk_gamma' in policy:
+		selection_risk_context = extract_selection_risk_context(
+			sequences_np,
+			features,
+			scaler,
+			lookback=int(policy.get(
+				'selection_risk_lookback',
+				trained_config.get('selection_risk_lookback', 20),
+			)),
+		)
 
 	if torch.cuda.is_available():
 		device = torch.device('cuda')
@@ -348,6 +361,10 @@ def main():
 	model_allocations = []
 	model_exposures = []
 	model_diagnostics = []
+	base_identity_seed = int(trained_config.get(
+		'identity_sensitivity_seed',
+		20260728,
+	))
 	with torch.inference_mode():
 		for model_idx, model_path in enumerate(model_paths):
 			model = StockTransformer(
@@ -360,19 +377,20 @@ def main():
 			)
 			model.to(device)
 			model.eval()
-			with torch.autocast(
-				device_type=device.type,
-				dtype=torch.float16,
-				enabled=(
-					device.type == 'cuda'
-					and trained_config.get('amp_enabled', True)
-				),
-			):
-				score_output, _, allocation_output, exposure_output = model(
-					x,
-					stock_index_tensor,
-					stock_mask,
-				)
+			def run_model(indices):
+				with torch.autocast(
+					device_type=device.type,
+					dtype=torch.float16,
+					enabled=(
+						device.type == 'cuda'
+						and trained_config.get('amp_enabled', True)
+					),
+				):
+					return model(x, indices, stock_mask)
+
+			score_output, _, allocation_output, exposure_output = run_model(
+				stock_index_tensor
+			)
 			scores = score_output.squeeze(0).float().cpu().numpy()
 			allocation_logits = (
 				allocation_output.squeeze(0).float().cpu().numpy()
@@ -382,11 +400,70 @@ def main():
 			model_allocations.append(allocation_logits)
 			model_exposures.append(exposure)
 			model_top = np.argsort(scores, kind='stable')[::-1][:5]
+			unk_scores_output, _, _, unk_exposure_output = run_model(
+				torch.ones_like(stock_index_tensor)
+			)
+			permutation_rng = np.random.default_rng(
+				base_identity_seed + int(model_seeds[model_idx])
+			)
+			identity_permutation = np.arange(len(stockid2idx) + 2)
+			known_identity_indices = np.arange(2, len(stockid2idx) + 2)
+			identity_permutation[known_identity_indices] = (
+				permutation_rng.permutation(known_identity_indices)
+			)
+			permuted_indices = identity_permutation[
+				np.asarray(sequence_stock_indices)
+			]
+			permuted_index_tensor = torch.as_tensor(
+				permuted_indices,
+				dtype=torch.long,
+				device=device,
+			).unsqueeze(0)
+			permuted_scores_output, _, _, permuted_exposure_output = run_model(
+				permuted_index_tensor
+			)
+
+			def identity_comparison(alternative_output, alternative_exposure):
+				alternative_scores = (
+					alternative_output.squeeze(0).float().cpu().numpy()
+				)
+				alternative_top = np.argsort(
+					alternative_scores,
+					kind='stable',
+				)[::-1][:5]
+				correlation = spearmanr(scores, alternative_scores).statistic
+				return {
+					'score_spearman': float(
+						correlation if np.isfinite(correlation) else 0.0
+					),
+					'top5_overlap': float(
+						len(set(model_top).intersection(alternative_top)) / 5
+					),
+					'top5': [
+						sequence_stock_ids[index]
+						for index in alternative_top
+					],
+					'exposure': float(
+						alternative_exposure.squeeze(0).float().cpu().item()
+					),
+				}
+
 			model_diagnostics.append({
 				'seed': int(model_seeds[model_idx]),
 				'model_path': policy['model_paths'][model_idx],
 				'exposure': exposure,
+				'identity_gate': float(
+					model.identity_gate_value().detach().float().cpu().item()
+				),
 				'top5': [sequence_stock_ids[index] for index in model_top],
+				'all_unk_vs_real': identity_comparison(
+					unk_scores_output,
+					unk_exposure_output,
+				),
+				'permuted_vs_real': identity_comparison(
+					permuted_scores_output,
+					permuted_exposure_output,
+				),
 			})
 			del model
 
@@ -399,6 +476,15 @@ def main():
 		allocation_temperature=float(policy['allocation_temperature']),
 		allocation_blend=float(policy['allocation_blend']),
 		disagreement_gamma=float(policy['disagreement_gamma']),
+		selection_risk_context=selection_risk_context,
+		selection_risk_gamma=float(policy.get(
+			'selection_risk_gamma',
+			0.0,
+		)),
+		selection_candidate_k=int(policy.get(
+			'selection_candidate_k',
+			20,
+		)),
 		top_k=int(policy.get('top_k', 5)),
 	)
 	top_indices = portfolio['top_indices']
@@ -430,12 +516,42 @@ def main():
 		'policy': {
 			'allocation_blend': float(policy['allocation_blend']),
 			'disagreement_gamma': float(policy['disagreement_gamma']),
+			'selection_risk_gamma': float(policy.get(
+				'selection_risk_gamma',
+				0.0,
+			)),
+			'selection_candidate_k': int(policy.get(
+				'selection_candidate_k',
+				20,
+			)),
 			'min_exposure': float(policy['min_exposure']),
 			'max_exposure': float(policy['max_exposure']),
 		},
 		'models': model_diagnostics,
 		'ensemble': {
 			'top5': top5,
+			'raw_top5': [
+				sequence_stock_ids[index]
+				for index in portfolio['raw_top_indices']
+			],
+			'selection_details': [
+				{
+					'stock_id': sequence_stock_ids[index],
+					'selected_rank': selected_rank,
+					'raw_rank': int(
+						portfolio['selected_raw_ranks'][selected_rank - 1]
+					),
+					'reversal_risk': float(
+						portfolio['selected_reversal_risk'][selected_rank - 1]
+					),
+					'correlation_risk': float(
+						portfolio['selected_correlation_risk'][
+							selected_rank - 1
+						]
+					),
+				}
+				for selected_rank, index in enumerate(top_indices, start=1)
+			],
 			'weights': [float(weight) for weight in position_weights],
 			'ensemble_scores': [
 				float(portfolio['ensemble_scores'][index])
@@ -446,6 +562,20 @@ def main():
 				for value in portfolio['selected_disagreement']
 			],
 			'mean_disagreement': float(portfolio['mean_disagreement']),
+			'selected_reversal_risk': [
+				float(value)
+				for value in portfolio['selected_reversal_risk']
+			],
+			'selected_correlation_risk': [
+				float(value)
+				for value in portfolio['selected_correlation_risk']
+			],
+			'mean_positive_correlation': float(
+				portfolio['mean_positive_correlation']
+			),
+			'raw_mean_positive_correlation': float(
+				portfolio['raw_mean_positive_correlation']
+			),
 			'base_exposure': float(portfolio['base_exposure']),
 			'final_exposure': weight_sum,
 			'cash_weight': 1.0 - weight_sum,
@@ -457,6 +587,12 @@ def main():
 	print(f'预测日期: {latest_date.date()}')
 	print(f'参与排序股票数: {len(sequence_stock_ids)}')
 	print(f'模型平均排名分歧: {portfolio["mean_disagreement"]:.6f}')
+	print(
+		f'风险选择 gamma/相关性: '
+		f'{float(policy.get("selection_risk_gamma", 0.0)):.4f} / '
+		f'{portfolio["mean_positive_correlation"]:.4f} '
+		f'(原始 {portfolio["raw_mean_positive_correlation"]:.4f})'
+	)
 	print(f'分歧调整前仓位: {portfolio["base_exposure"]:.12f}')
 	print(f'提交权重和: {weight_sum:.12f}')
 	print(f'现金权重: {1.0 - weight_sum:.12f}')
