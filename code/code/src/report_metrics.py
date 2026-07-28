@@ -28,14 +28,20 @@ def print_cross_validation() -> None:
     with open(summary_path, "r", encoding="utf-8") as handle:
         summary = json.load(handle)
 
-    seeds = summary.get("ensemble_seeds")
-    if seeds:
+    seeds = summary.get("ensemble_seeds", [])
+    if len(seeds) > 1:
         print(
-            "\n[模型验证：三随机种子 × 三折 walk-forward，"
+            f"\n[模型验证：{len(seeds)} 随机种子 × "
+            f"{int(summary.get('num_folds', 3))} 折 walk-forward，"
             f"每 {summary.get('evaluation_stride', 1)} 个交易日评估]"
         )
     else:
-        print("\n[模型验证：三折 walk-forward]")
+        seed_label = seeds[0] if seeds else "-"
+        print(
+            f"\n[模型验证：单随机种子 {seed_label} × "
+            f"{int(summary.get('num_folds', 3))} 折 walk-forward，"
+            f"每 {summary.get('evaluation_stride', 1)} 个交易日评估]"
+        )
     print(f"平均 Top-5 收益: {_pct(float(summary['mean_top5_return']))}")
     print(f"最差折 Top-5 收益: {_pct(float(summary['worst_fold_top5_return']))}")
     if "mean_weighted_portfolio_return" in summary:
@@ -88,10 +94,11 @@ def print_cross_validation() -> None:
         mean_random = float(np.mean(random_baselines))
         print(f"平均随机/全池等权: {_pct(mean_random)}")
         print(f"平均相对随机超额: {_pct(float(summary['mean_top5_return']) - mean_random)}")
-    if "promotion_criteria" in summary:
+    promotion = summary.get("promotion_criteria")
+    if promotion and promotion.get("applicable", True):
         print(
             "Ensemble promotion criteria: "
-            f"{'PASS' if summary['promotion_criteria'].get('passed') else 'FAIL'}"
+            f"{'PASS' if promotion.get('passed') else 'FAIL'}"
         )
 
 

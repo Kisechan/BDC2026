@@ -261,7 +261,8 @@ def main():
 	if config_drift:
 		print('检测到源码配置与训练快照差异，推理采用训练快照:')
 		print(json.dumps(config_drift, indent=2, ensure_ascii=False))
-	if not policy.get('promotion_criteria', {}).get('passed', True):
+	promotion = policy.get('promotion_criteria', {})
+	if promotion.get('applicable', True) and not promotion.get('passed', True):
 		print('警告: OOF ensemble 未满足全部 promotion criteria，请结合报告判断是否提交。')
 
 	scaler_path = os.path.join(
@@ -274,10 +275,19 @@ def main():
 		os.path.join(output_dir, relative_path)
 		for relative_path in policy.get('model_paths', [])
 	]
-	if len(model_paths) != 3:
-		raise ValueError('ensemble_policy.json 必须声明三个全量模型')
-	if len(policy.get('ensemble_seeds', [])) != len(model_paths):
-		raise ValueError('ensemble seed 与模型路径数量不一致')
+	ensemble_enabled = bool(policy.get(
+		'ensemble_enabled',
+		len(model_paths) > 1,
+	))
+	if not model_paths:
+		raise ValueError('ensemble_policy.json 未声明全量模型')
+	if ensemble_enabled and len(model_paths) < 2:
+		raise ValueError('ensemble 模式至少需要两个全量模型')
+	if not ensemble_enabled and len(model_paths) != 1:
+		raise ValueError('单模型模式必须且只能声明一个全量模型')
+	model_seeds = policy.get('ensemble_seeds', [])
+	if len(model_seeds) != len(model_paths):
+		raise ValueError('训练 seed 与模型路径数量不一致')
 	for model_path in model_paths:
 		if not os.path.exists(model_path):
 			raise FileNotFoundError(f'未找到 ensemble 模型: {model_path}')
@@ -363,7 +373,7 @@ def main():
 			model_exposures.append(exposure)
 			model_top = np.argsort(scores, kind='stable')[::-1][:5]
 			model_diagnostics.append({
-				'seed': int(policy['ensemble_seeds'][model_idx]),
+				'seed': int(model_seeds[model_idx]),
 				'model_path': policy['model_paths'][model_idx],
 				'exposure': exposure,
 				'top5': [sequence_stock_ids[index] for index in model_top],
