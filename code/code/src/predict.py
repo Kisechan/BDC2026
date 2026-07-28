@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from config import config
 from model import StockTransformer
+from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
 
 
@@ -63,10 +64,12 @@ assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
 
 
-def preprocess_predict_data(df, stockid2idx):
-	assert config['feature_num'] in feature_engineer_func_map, f"Unsupported feature_num: {config['feature_num']}"
-	feature_engineer = feature_engineer_func_map[config['feature_num']]
-	feature_columns = feature_cloums_map[config['feature_num']]
+def preprocess_predict_data(df, stockid2idx, runtime_config=None):
+	runtime_config = runtime_config or config
+	feature_num = runtime_config['feature_num']
+	assert feature_num in feature_engineer_func_map, f"Unsupported feature_num: {feature_num}"
+	feature_engineer = feature_engineer_func_map[feature_num]
+	feature_columns = feature_cloums_map[feature_num]
 
 	df = df.copy()
 	df = df.sort_values(['股票代码', '日期']).reset_index(drop=True)
@@ -106,11 +109,18 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 	return np.asarray(sequences, dtype=np.float32), sequence_stock_ids, sequence_stock_indices
 
 
-def build_bounded_positions(scores, allocation_logits, exposure, top_k=5):
+def build_bounded_positions(
+	scores,
+	allocation_logits,
+	exposure,
+	top_k=5,
+	runtime_config=None,
+):
 	"""按 ranking score 选股，并将相对权重严格缩放到 Exposure Head 总仓位。"""
-	min_exposure = float(config.get('min_exposure', 0.80))
-	max_exposure = float(config.get('max_exposure', 0.999999))
-	temperature = float(config.get('allocation_temperature', 1.0))
+	runtime_config = runtime_config or config
+	min_exposure = float(runtime_config.get('min_exposure', 0.80))
+	max_exposure = float(runtime_config.get('max_exposure', 0.999999))
+	temperature = float(runtime_config.get('allocation_temperature', 1.0))
 	if not 0.0 <= min_exposure < max_exposure < 1.0:
 		raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
 	if temperature <= 0:
@@ -149,8 +159,9 @@ def build_bounded_positions(scores, allocation_logits, exposure, top_k=5):
 	return top_indices, positions, bounded_exposure
 
 
-def validate_result(output_df, candidate_stock_ids):
+def validate_result(output_df, candidate_stock_ids, runtime_config=None):
 	"""在写盘前后使用赛事约束校验预测结果。"""
+	runtime_config = runtime_config or config
 	required_columns = ['stock_id', 'weight']
 	if output_df.columns.tolist() != required_columns:
 		raise ValueError(f'结果列必须严格为 {required_columns}')
@@ -172,8 +183,8 @@ def validate_result(output_df, candidate_stock_ids):
 	weight_sum = float(weights.sum(dtype=np.float64))
 	if weight_sum > 1.0:
 		raise ValueError(f'结果权重和不能超过1，当前为 {weight_sum:.12f}')
-	min_exposure = float(config.get('min_exposure', 0.80))
-	max_exposure = float(config.get('max_exposure', 0.999999))
+	min_exposure = float(runtime_config.get('min_exposure', 0.80))
+	max_exposure = float(runtime_config.get('max_exposure', 0.999999))
 	if weight_sum < min_exposure or weight_sum > max_exposure:
 		raise ValueError(
 			f'结果总仓位必须位于 [{min_exposure}, {max_exposure}]，'
@@ -183,20 +194,95 @@ def validate_result(output_df, candidate_stock_ids):
 	return weight_sum
 
 
+def make_serialization_safe_positions(portfolio, runtime_config):
+	"""把 ensemble 仓位移到合法区间内部，避免 CSV 浮点往返触碰边界。"""
+	min_exposure = float(runtime_config['min_exposure'])
+	max_exposure = float(runtime_config['max_exposure'])
+	margin = 1e-10
+	safe_exposure = float(np.clip(
+		portfolio['exposure'],
+		min_exposure + margin,
+		max_exposure - margin,
+	))
+	positions = np.asarray(portfolio['positions'], dtype=np.float64).copy()
+	positions *= safe_exposure / positions.sum(dtype=np.float64)
+	positions[np.argmax(positions)] += (
+		safe_exposure - positions.sum(dtype=np.float64)
+	)
+	if (positions < 0).any() or positions.sum(dtype=np.float64) > 1.0:
+		raise ValueError('序列化安全调整后仓位不合法')
+	return positions, safe_exposure
+
+
+def compare_runtime_configs(saved_config, live_config):
+	"""报告源码配置与训练快照漂移；推理始终以训练快照为准。"""
+	ignored_keys = {'output_dir'}
+	return {
+		key: {
+			'trained': saved_config.get(key),
+			'live': live_config.get(key),
+		}
+		for key in sorted(set(saved_config) | set(live_config))
+		if key not in ignored_keys
+		and saved_config.get(key) != live_config.get(key)
+	}
+
+
 def main():
-	data_file = os.path.join(config['data_path'], 'train.csv')
-	model_path = os.path.join(config['output_dir'], 'best_model.pth')
-	stock_mapping_path = os.path.join(config['output_dir'], 'stockid2idx.json')
-	scaler_path = os.path.join(config['output_dir'], 'scaler.pkl')
+	output_dir = config['output_dir']
+	trained_config_path = os.path.join(output_dir, 'config.json')
+	policy_path = os.path.join(output_dir, 'ensemble_policy.json')
+	stock_mapping_path = os.path.join(output_dir, 'stockid2idx.json')
 	output_path = os.path.join('./output/', 'result.csv')
+	diagnostics_path = os.path.join('./output/', 'prediction_diagnostics.json')
 
-	if not os.path.exists(model_path):
-		raise FileNotFoundError(f'未找到模型文件: {model_path}')
+	for path, description in [
+		(trained_config_path, '训练配置快照'),
+		(policy_path, 'ensemble 策略'),
+		(stock_mapping_path, '股票 ID 映射'),
+	]:
+		if not os.path.exists(path):
+			raise FileNotFoundError(f'未找到{description}: {path}')
+	with open(trained_config_path, 'r', encoding='utf-8') as f:
+		trained_config = json.load(f)
+	with open(policy_path, 'r', encoding='utf-8') as f:
+		policy = json.load(f)
+	for key in ('min_exposure', 'max_exposure'):
+		if not np.isclose(
+			float(policy[key]),
+			float(trained_config[key]),
+			rtol=0.0,
+			atol=1e-12,
+		):
+			raise ValueError(
+				f'ensemble policy 的 {key} 与训练配置不一致'
+			)
+	config_drift = compare_runtime_configs(trained_config, config)
+	if config_drift:
+		print('检测到源码配置与训练快照差异，推理采用训练快照:')
+		print(json.dumps(config_drift, indent=2, ensure_ascii=False))
+	if not policy.get('promotion_criteria', {}).get('passed', True):
+		print('警告: OOF ensemble 未满足全部 promotion criteria，请结合报告判断是否提交。')
+
+	scaler_path = os.path.join(
+		output_dir,
+		policy.get('scaler_path', 'scaler.pkl'),
+	)
 	if not os.path.exists(scaler_path):
-		raise FileNotFoundError(f'未找到Scaler文件: {scaler_path}')
-	if not os.path.exists(stock_mapping_path):
-		raise FileNotFoundError(f'未找到股票ID映射: {stock_mapping_path}')
+		raise FileNotFoundError(f'未找到 Scaler: {scaler_path}')
+	model_paths = [
+		os.path.join(output_dir, relative_path)
+		for relative_path in policy.get('model_paths', [])
+	]
+	if len(model_paths) != 3:
+		raise ValueError('ensemble_policy.json 必须声明三个全量模型')
+	if len(policy.get('ensemble_seeds', [])) != len(model_paths):
+		raise ValueError('ensemble seed 与模型路径数量不一致')
+	for model_path in model_paths:
+		if not os.path.exists(model_path):
+			raise FileNotFoundError(f'未找到 ensemble 模型: {model_path}')
 
+	data_file = os.path.join(trained_config['data_path'], 'train.csv')
 	raw_df = pd.read_csv(data_file, dtype={'股票代码': str})
 	raw_df['股票代码'] = raw_df['股票代码'].astype(str).str.zfill(6)
 	raw_df['日期'] = pd.to_datetime(raw_df['日期'])
@@ -206,13 +292,17 @@ def main():
 	with open(stock_mapping_path, 'r', encoding='utf-8') as f:
 		stockid2idx = json.load(f)
 
-	processed, features = preprocess_predict_data(raw_df, stockid2idx)
+	processed, features = preprocess_predict_data(
+		raw_df,
+		stockid2idx,
+		runtime_config=trained_config,
+	)
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 	scaler = joblib.load(scaler_path)
 	processed[features] = scaler.transform(processed[features])
 
-	sequence_length = config['sequence_length']
+	sequence_length = trained_config['sequence_length']
 	sequences_np, sequence_stock_ids, sequence_stock_indices = build_inference_sequences(
 		processed,
 		features,
@@ -229,48 +319,129 @@ def main():
 	else:
 		device = torch.device('cpu')
 
-	model = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stockid2idx))
-	model.load_state_dict(torch.load(model_path, map_location=device))
-	model.to(device)
-	model.eval()
+	x = torch.from_numpy(sequences_np).unsqueeze(0).to(device)
+	stock_index_tensor = torch.LongTensor(
+		sequence_stock_indices
+	).unsqueeze(0).to(device)
+	stock_mask = torch.ones_like(stock_index_tensor, dtype=torch.float32)
+	model_scores = []
+	model_allocations = []
+	model_exposures = []
+	model_diagnostics = []
+	with torch.inference_mode():
+		for model_idx, model_path in enumerate(model_paths):
+			model = StockTransformer(
+				input_dim=len(features),
+				config=trained_config,
+				num_stocks=len(stockid2idx),
+			)
+			model.load_state_dict(
+				torch.load(model_path, map_location=device, weights_only=True)
+			)
+			model.to(device)
+			model.eval()
+			with torch.autocast(
+				device_type=device.type,
+				dtype=torch.float16,
+				enabled=(
+					device.type == 'cuda'
+					and trained_config.get('amp_enabled', True)
+				),
+			):
+				score_output, _, allocation_output, exposure_output = model(
+					x,
+					stock_index_tensor,
+					stock_mask,
+				)
+			scores = score_output.squeeze(0).float().cpu().numpy()
+			allocation_logits = (
+				allocation_output.squeeze(0).float().cpu().numpy()
+			)
+			exposure = float(exposure_output.squeeze(0).float().cpu().item())
+			model_scores.append(scores)
+			model_allocations.append(allocation_logits)
+			model_exposures.append(exposure)
+			model_top = np.argsort(scores, kind='stable')[::-1][:5]
+			model_diagnostics.append({
+				'seed': int(policy['ensemble_seeds'][model_idx]),
+				'model_path': policy['model_paths'][model_idx],
+				'exposure': exposure,
+				'top5': [sequence_stock_ids[index] for index in model_top],
+			})
+			del model
 
-	with torch.no_grad():
-		x = torch.from_numpy(sequences_np).unsqueeze(0).to(device)  # [1, N, L, F]
-		stock_index_tensor = torch.LongTensor(sequence_stock_indices).unsqueeze(0).to(device)
-		stock_mask = torch.ones_like(stock_index_tensor, dtype=torch.float32)
-		score_output, _, allocation_output, exposure_output = model(
-			x,
-			stock_index_tensor,
-			stock_mask,
-		)
-		scores = score_output.squeeze(0).detach().cpu().numpy()
-		allocation_logits = allocation_output.squeeze(0).detach().cpu().numpy()
-		exposure = float(exposure_output.squeeze(0).detach().cpu().item())
-
-	top_indices, position_weights, exposure = build_bounded_positions(
-		scores,
-		allocation_logits,
-		exposure,
-		top_k=5,
+	portfolio = build_ensemble_portfolio(
+		np.stack(model_scores),
+		np.stack(model_allocations),
+		np.asarray(model_exposures),
+		min_exposure=float(trained_config['min_exposure']),
+		max_exposure=float(trained_config['max_exposure']),
+		allocation_temperature=float(policy['allocation_temperature']),
+		allocation_blend=float(policy['allocation_blend']),
+		disagreement_gamma=float(policy['disagreement_gamma']),
+		top_k=int(policy.get('top_k', 5)),
+	)
+	top_indices = portfolio['top_indices']
+	position_weights, exposure = make_serialization_safe_positions(
+		portfolio,
+		trained_config,
 	)
 	top5 = [sequence_stock_ids[i] for i in top_indices]
 	output_df = pd.DataFrame({
 		'stock_id': top5,
 		'weight': position_weights,
 	})
-	validate_result(output_df, stock_ids)
+	validate_result(output_df, stock_ids, runtime_config=trained_config)
 	os.makedirs(os.path.dirname(output_path), exist_ok=True)
 	output_df.to_csv(output_path, index=False, encoding='utf-8')
 
 	# 重新读取实际提交文件，避免序列化精度或股票代码格式破坏约束。
 	written_df = pd.read_csv(output_path, dtype={'stock_id': str})
-	weight_sum = validate_result(written_df, stock_ids)
+	weight_sum = validate_result(
+		written_df,
+		stock_ids,
+		runtime_config=trained_config,
+	)
+	diagnostics = {
+		'prediction_date': latest_date.strftime('%Y-%m-%d'),
+		'num_ranked_stocks': len(sequence_stock_ids),
+		'config_drift': config_drift,
+		'promotion_criteria': policy.get('promotion_criteria', {}),
+		'policy': {
+			'allocation_blend': float(policy['allocation_blend']),
+			'disagreement_gamma': float(policy['disagreement_gamma']),
+			'min_exposure': float(policy['min_exposure']),
+			'max_exposure': float(policy['max_exposure']),
+		},
+		'models': model_diagnostics,
+		'ensemble': {
+			'top5': top5,
+			'weights': [float(weight) for weight in position_weights],
+			'ensemble_scores': [
+				float(portfolio['ensemble_scores'][index])
+				for index in top_indices
+			],
+			'selected_disagreement': [
+				float(value)
+				for value in portfolio['selected_disagreement']
+			],
+			'mean_disagreement': float(portfolio['mean_disagreement']),
+			'base_exposure': float(portfolio['base_exposure']),
+			'final_exposure': weight_sum,
+			'cash_weight': 1.0 - weight_sum,
+		},
+	}
+	with open(diagnostics_path, 'w', encoding='utf-8') as f:
+		json.dump(diagnostics, f, indent=2, ensure_ascii=False)
 
 	print(f'预测日期: {latest_date.date()}')
 	print(f'参与排序股票数: {len(sequence_stock_ids)}')
+	print(f'模型平均排名分歧: {portfolio["mean_disagreement"]:.6f}')
+	print(f'分歧调整前仓位: {portfolio["base_exposure"]:.12f}')
 	print(f'提交权重和: {weight_sum:.12f}')
 	print(f'现金权重: {1.0 - weight_sum:.12f}')
 	print(f'结果已写入: {output_path}')
+	print(f'推理诊断已写入: {diagnostics_path}')
 
 
 if __name__ == '__main__':
