@@ -11,3 +11,9 @@ because checkpoints from different input dimensions are incompatible.
 
 - Keep commits small and focused, and push completed commits promptly.
 - Create a descriptive Git tag for every new model/code version before comparing or sharing its results.
+
+## File organization
+
+- Avoid adding new files unless the change cannot reasonably fit an existing
+  module. Prefer extending the closest existing module and document why any new
+  file is necessary.
