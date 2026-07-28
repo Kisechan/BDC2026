@@ -13,7 +13,7 @@
 
 训练与推理主流程如下：
 1. 读取历史行情数据（`data/stock_data.csv`）；
-2. 做特征工程（39特征或`158+39`特征）；
+2. 做单股量价特征工程，并增加同日横截面相对特征与市场状态特征；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
 4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
 5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、相对仓位和总仓位损失；
@@ -64,6 +64,8 @@
 - `engineer_features_39()`：精简技术指标特征（兼容名称 `39`）；
 - `engineer_features()`：Alpha 类特征；
 - `engineer_features_158plus39()`：合并后的 171 列时序特征（兼容名称 `158+39`）；
+- `add_relative_market_features()`：在单股特征合并后增加7个同日横截面百分位和
+  5个市场状态特征；所有输入只依赖当前及过去行情；
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
 - rank ensemble、OOF 对齐、收益分解和策略网格标定函数。
 
@@ -72,6 +74,13 @@
 现已从特征计算和训练/推理特征表中删除。另删除 20 个可由保留列精确恢复的特征：
 `IMXD=IMAX-IMIN`、`CNTD=CNTP-CNTN`、`SUMD=SUMP-SUMN`、
 `VSUMD=VSUMP-VSUMN`（每组各 5 个窗口）。`158+39` 名称仅为兼容旧配置保留。
+当前 `158+39_reduced25_relmarket12` 使用166个 `reduced25` 输入，加上：
+
+- 5/20/60日收益、20日波动率、20日量比、MA20距离和MA60距离的同日横截面百分位；
+- 市场等权5/20日收益、上涨家数占比、MA20以上家数占比和20日收益离散度。
+
+共178个连续输入。横截面只使用同一交易日可观测股票，市场状态值广播给当天所有股票；
+每折 StandardScaler 仍只使用该折训练期拟合。
 
 ### [train.py](train.py)
 训练主脚本，关键内容：
