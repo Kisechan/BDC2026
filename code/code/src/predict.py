@@ -10,8 +10,10 @@ from tqdm import tqdm
 
 from config import config
 from model import StockTransformer
+from utils import add_relative_market_features
 from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
+from utils import RELATIVE_MARKET_FEATURES, RELATIVE_MARKET_FEATURE_SET
 
 
 feature_cloums_map = {
@@ -60,8 +62,14 @@ feature_cloums_map['158+39_reduced25'] = [
 	if name not in LINEAR_REDUNDANT_FEATURES
 ]
 feature_engineer_func_map['158+39_reduced25'] = engineer_features_158plus39
+feature_cloums_map[RELATIVE_MARKET_FEATURE_SET] = [
+	*feature_cloums_map['158+39_reduced25'],
+	*RELATIVE_MARKET_FEATURES,
+]
+feature_engineer_func_map[RELATIVE_MARKET_FEATURE_SET] = engineer_features_158plus39
 assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
+assert len(feature_cloums_map[RELATIVE_MARKET_FEATURE_SET]) == 178
 
 
 def preprocess_predict_data(df, stockid2idx, runtime_config=None):
@@ -83,6 +91,8 @@ def preprocess_predict_data(df, stockid2idx, runtime_config=None):
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))
 
 	processed = pd.concat(processed_list).reset_index(drop=True)
+	if feature_num == RELATIVE_MARKET_FEATURE_SET:
+		processed = add_relative_market_features(processed)
 	processed['instrument'] = processed['股票代码'].map(stockid2idx).fillna(1)
 	processed['instrument'] = processed['instrument'].astype(np.int64)
 	processed['日期'] = pd.to_datetime(processed['日期'])

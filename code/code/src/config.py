@@ -1,6 +1,6 @@
 # 配置参数
 sequence_length = 60
-feature_num = '158+39_reduced25'
+feature_num = '158+39_reduced25_relmarket12'
 patience_num = 12
 experiment_name = 'single_seed_3fold'
 config = {
@@ -20,7 +20,8 @@ config = {
     'stock_embedding_dim': 4,
     'id_dropout': 0.1,
     'embedding_dropout': 0.1,
-    'feature_num': feature_num,  # 166 个实际连续输入；名称保留“158+39”特征族血缘
+    # 166 个 reduced25 输入 + 12 个横截面相对/市场状态输入。
+    'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'grad_clip': True,
     'num_folds': 3,

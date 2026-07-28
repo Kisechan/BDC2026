@@ -10,7 +10,9 @@ from scipy.stats import spearmanr
 from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
+from utils import add_relative_market_features
 from utils import engineer_features_39, engineer_features_158plus39
+from utils import RELATIVE_MARKET_FEATURES, RELATIVE_MARKET_FEATURE_SET
 from utils import create_ranking_dataset_vectorized
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
 from utils import summarize_ensemble_days
@@ -78,8 +80,14 @@ feature_cloums_map['158+39_reduced25'] = [
     if name not in LINEAR_REDUNDANT_FEATURES
 ]
 feature_engineer_func_map['158+39_reduced25'] = engineer_features_158plus39
+feature_cloums_map[RELATIVE_MARKET_FEATURE_SET] = [
+    *feature_cloums_map['158+39_reduced25'],
+    *RELATIVE_MARKET_FEATURES,
+]
+feature_engineer_func_map[RELATIVE_MARKET_FEATURE_SET] = engineer_features_158plus39
 assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
+assert len(feature_cloums_map[RELATIVE_MARKET_FEATURE_SET]) == 178
 
 
 def _build_label_and_clean(processed, drop_small_open=True):
@@ -118,6 +126,8 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
         processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc=desc))
 
     processed = pd.concat(processed_list).reset_index(drop=True)
+    if config['feature_num'] == RELATIVE_MARKET_FEATURE_SET:
+        processed = add_relative_market_features(processed)
 
     # 映射股票索引，并剔除映射失败样本
     processed['instrument'] = processed['股票代码'].map(stockid2idx)
