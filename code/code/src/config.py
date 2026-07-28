@@ -2,9 +2,11 @@
 sequence_length = 60
 feature_num = '158+39_reduced25'
 patience_num = 12
-experiment_name = 'robust_3seed_ensemble'
+experiment_name = 'single_seed_3fold'
 config = {
-    'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
+    # 单个样本输入最近 60 个交易日；叠加最长 60 日滚动特征后，
+    # 原始行情的有效感受野最多约为 119 个交易日。
+    'sequence_length': sequence_length,
     'd_model': 128,          # Transformer隐藏维度；原始特征维度由 feature_num 对应的特征表决定
     'nhead': 4,             # 注意力头数量
     'num_layers': 2,        # Transformer层数
@@ -24,6 +26,9 @@ config = {
     'num_folds': 3,
     'validation_months': 2,
     'evaluation_stride': 5,
+    'seed': 42,
+    'ensemble_enabled': False,
+    # 默认只运行 seed=42 的三折；仅在 ensemble_enabled=True 时使用下列种子。
     'ensemble_seeds': [42, 142, 242],
     'checkpoint_metric': 'weighted_portfolio_return_plus_rank_ic',
     'checkpoint_rank_ic_weight': 0.1,
