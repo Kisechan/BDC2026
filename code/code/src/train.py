@@ -653,7 +653,6 @@ def train_ranking_model(
 ):
     model.train()
     total_loss = 0
-    total_metrics = {}
     total_loss_components = {}
     local_step = 0
     
@@ -744,23 +743,6 @@ def train_ranking_model(
             for name, value in batch_loss_components.items():
                 total_loss_components[name] = total_loss_components.get(name, 0.0) + value.item()
             
-            # 计算评估指标
-            with torch.no_grad():
-                metrics = calculate_ranking_metrics(
-                    masked_outputs,
-                    masked_targets,
-                    masks,
-                    predicted_returns=masked_return_outputs,
-                    allocation_logits=masked_allocation_outputs,
-                    exposures=exposures,
-                    allocation_temperature=config.get('allocation_temperature', 1.0),
-                    k=5,
-                )
-                for k, v in metrics.items():
-                    if k not in total_metrics:
-                        total_metrics[k] = 0
-                    total_metrics[k] += v
-            
             local_step += 1
             if writer:
                 writer.add_scalar('train/loss', batch_loss.item(), global_step=epoch*len(dataloader)+local_step)
@@ -770,17 +752,17 @@ def train_ranking_model(
                         value.item(),
                         global_step=epoch*len(dataloader)+local_step,
                     )
-                for k, v in metrics.items():
-                    writer.add_scalar(f'train/{k}', v, global_step=epoch*len(dataloader)+local_step)
     
-    # 计算平均指标
+    # 训练阶段只记录损失项。完整收益/Rank IC 指标在每个 epoch 的验证阶段计算，
+    # 避免 batch 级 SciPy Spearman 与 GPU→CPU 同步阻塞训练吞吐。
     if local_step > 0:
-        for k in total_metrics:
-            total_metrics[k] /= local_step
         for name, value in total_loss_components.items():
-            total_metrics[name] = value / local_step
+            total_loss_components[name] = value / local_step
     
-    return total_loss / len(dataloader) if len(dataloader) > 0 else 0, total_metrics
+    return (
+        total_loss / len(dataloader) if len(dataloader) > 0 else 0,
+        total_loss_components,
+    )
 
 def evaluate_ranking_model(
     model,
@@ -1351,11 +1333,7 @@ def train_final_model(
             f"ic_loss={train_metrics.get('ic_loss', 0.0):.4f}, "
             f"regression={train_metrics.get('regression_loss', 0.0):.4f}, "
             f"allocation={train_metrics.get('allocation_loss', 0.0):.4f}, "
-            f"exposure_loss={train_metrics.get('exposure_loss', 0.0):.4f}, "
-            f"top5={train_metrics.get('top5_return', 0.0):.6f}, "
-            f"rank_ic={train_metrics.get('rank_ic', 0.0):.4f}, "
-            f"weighted_return={train_metrics.get('weighted_portfolio_return', 0.0):.6f}, "
-            f"exposure={train_metrics.get('gross_exposure', 0.0):.4f}"
+            f"exposure_loss={train_metrics.get('exposure_loss', 0.0):.4f}"
         )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))

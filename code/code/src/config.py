@@ -11,7 +11,7 @@ config = {
     'nhead': 4,             # 注意力头数量
     'num_layers': 2,        # Transformer层数
     'dim_feedforward': 256, # 前馈网络维度
-    'batch_size': 8,        # 排序任务batch_size可以小一些，因为每个batch包含更多股票
+    'batch_size': 12,       # 2080 Ti 显存余量充足；仍需留意股票维度的二次复杂度
     'max_epochs': 50,
     'min_final_epochs': 8,
     'patience': patience_num,
