@@ -15,12 +15,15 @@
 1. 读取历史行情数据（`data/stock_data.csv`）；
 2. 做特征工程（39特征或`158+39`特征）；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
-4. 对三个随机种子分别构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
+4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
 5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、相对仓位和总仓位损失；
-6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存九组 OOF 输出并标定
-   Allocation 混合和模型分歧降仓策略；
-7. 取九个最佳 epoch 的中位数与最小全量轮数的较大值，用全部标签有效样本
-   重训三个最终模型。
+6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存三组 OOF 输出并标定
+   Allocation 与等权的混合比例；
+7. 取三个最佳 epoch 的中位数与最小全量轮数的较大值，用全部标签有效样本
+   重训一个最终模型。
+
+三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
+使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
 
 ---
 
@@ -28,14 +31,16 @@
 
 ### [config.py](config.py)
 统一管理训练与推理参数，包括：
-- 序列长度 `sequence_length`（默认60）；
+- 序列长度 `sequence_length`（默认60；配合最长60日滚动指标，原始行情的有效
+  感受野最多约119个交易日）；
 - 模型超参数（`d_model`、`nhead`、`num_layers` 等）；
 - 训练超参数（`batch_size`、`max_epochs`、`patience`、`learning_rate`、`weight_decay`）；
 - 排序与仓位损失参数（`pairwise_weight`、`top5_weight`、`base_weight`、
   `allocation_weight`、`exposure_weight` 及相应 temperature）；
 - 多折切分、ID 正则化与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、
   `id_dropout`、`embedding_dropout`、`regression_weight`）；
-- 三种子集成、周频验证与 OOF 策略网格（`ensemble_seeds`、`evaluation_stride`、
+- 单种子/可选多种子模式、周频验证与 OOF 策略网格（`seed`、
+  `ensemble_enabled`、`ensemble_seeds`、`evaluation_stride`、
   `allocation_blend_grid`、`disagreement_gamma_grid`）；
 - CUDA AMP、TF32、fused AdamW、pinned memory 和 non-blocking 传输开关；
 - 数据路径和输出路径（默认输出到 `output/`）。
@@ -74,9 +79,10 @@
 	- `_preprocess_common()`：在完整历史上按股票计算严格因果特征和标签；
 	- `build_walk_forward_folds()`：按实际交易日构造扩展窗口验证折和 5 日 purge。
 	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
-	- 三个随机种子分别完成三折训练；checkpoint 只使用从验证期末向前每隔
+	- 默认固定随机种子42完成三折训练；checkpoint 只使用从验证期末向前每隔
 	  5 个交易日抽取的非重叠日期；
-	- 九折完成后统一选择最终 epoch，重新拟合一个全量 scaler，并训练三个最终模型；
+	- 三折完成后统一选择最终 epoch，重新拟合一个全量 scaler，并训练一个最终模型；
+	- 将 `ensemble_enabled=True` 可恢复三种子 × 三折及三个全量模型的稳健性实验；
 	- 当前使用 `learning_rate=3e-5`、`patience=12` 和 `id_dropout=0.1`，让验证折有更充分的改善机会，同时减弱股票 ID 正则化。
 	- CUDA 上使用 AMP 加速 Transformer 前向，排序和仓位损失保持 FP32；同时按配置启用 TF32、fused AdamW、pinned memory 与 non-blocking 传输。
 - 数据集组织：
@@ -95,10 +101,10 @@
 	- checkpoint 使用 `weighted_portfolio_return + checkpoint_rank_ic_weight * rank_ic` 组合指标，使选中股票后的权重头也参与模型选择。
 
 训练产物：
-- `seed_<seed>/fold_N/`：九组 checkpoint、scaler、指标、日志与 OOF 输出；
-- `seed_<seed>/best_model.pth`：三个全量重训模型；
-- `scaler.pkl`：三个全量模型共用的全量标准化器；
-- `ensemble_policy.json`：OOF 选择的 Allocation 混合与分歧降仓策略；
+- `seed_42/fold_N/`：默认三组 checkpoint、scaler、指标、日志与 OOF 输出；
+- `seed_42/best_model.pth`：默认单个全量重训模型；
+- `scaler.pkl`：全量标准化器；
+- `ensemble_policy.json`：训练模式、模型路径及 OOF 选择的仓位策略；
 - `stockid2idx.json`：训练与推理共用的股票 ID 映射；
 - `cross_validation_summary.json`：多折汇总；
 - `config.json`：训练时配置快照；
@@ -109,9 +115,10 @@
 1. 加载历史数据，取最新交易日；
 2. 执行与训练一致的特征工程；
 3. 从模型目录加载训练时 `config.json` 和全量 `scaler.pkl`，源码参数漂移只报告、不参与模型构造；
-4. 加载三个全量模型，将各自 ranking score 转为横截面百分位后求均值；
-5. 选择 ensemble Top-5，平均三个 Allocation 分布，并按模型排名分歧将总仓位向
-   0.20 收缩，输出到 `result.csv`：
+4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
+   转为横截面百分位后求均值；
+5. 选择 Top-5。集成模式会平均各模型 Allocation 分布，并可按模型排名分歧将
+   总仓位向 0.20 收缩，输出到 `result.csv`：
 	 - `stock_id`
 	 - `weight`（5只股票之和严格位于 `[0.20, 0.999999]`）
 
@@ -119,6 +126,11 @@
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
 Top-5、排名分歧、策略参数、股票仓位和现金。
+
+`sequence_length=60` 不代表模型只看到两个月的信息：单日输入已包含最长60日滚动
+特征，再拼接60个时点后，有效原始行情跨度最多约119个交易日。直接改成90或120会
+增加显存、训练时间并减少可用样本，且不能直接解决市场阶段反转。若后续比较序列长度，
+建议固定特征、损失与随机种子，用单种子三折分别比较40/60/90，而不是仅看一次全量训练。
 
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：
