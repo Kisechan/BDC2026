@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12'
 patience_num = 12
-experiment_name = 'single_seed_3fold'
+experiment_name = 'idgate_reversal_diverse_heads_v2'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
@@ -18,8 +18,12 @@ config = {
     'learning_rate': 3e-5,
     'dropout': 0.1,
     'stock_embedding_dim': 4,
-    'id_dropout': 0.1,
+    'id_dropout': 0.2,
     'embedding_dropout': 0.1,
+    'id_gate_enabled': True,
+    'id_gate_init': 0.20,
+    'id_gate_regularization': 0.01,
+    'identity_sensitivity_seed': 20260728,
     # 166 个 reduced25 输入 + 12 个横截面相对/市场状态输入。
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
@@ -39,13 +43,25 @@ config = {
     'regression_beta': 0.02,
     'allocation_weight': 0.1,
     'exposure_weight': 1.0,
+    'allocation_candidate_k': 20,
+    'allocation_return_clip': 0.10,
     'allocation_temperature': 1.0,
     'allocation_target_temperature': 0.10,
     'exposure_target_temperature': 0.02,
+    'exposure_selected_return_weight': 0.70,
+    'exposure_market_return_weight': 0.30,
+    'exposure_downside_weight': 0.25,
+    'exposure_market_encoder_enabled': True,
+    'exposure_market_hidden_size': 16,
+    # relmarket12 最后五列依次为市场收益、宽度与离散度。
+    'market_state_feature_indices': [173, 174, 175, 176, 177],
     'min_exposure': 0.20,
     'max_exposure': 0.999999,
     'allocation_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
     'disagreement_gamma_grid': [0.0, 2.0, 4.0, 8.0],
+    'selection_risk_gamma_grid': [0.0, 0.05, 0.10, 0.20],
+    'selection_candidate_k': 20,
+    'selection_risk_lookback': 20,
     'ensemble_downside_weight': 0.5,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
@@ -54,6 +70,16 @@ config = {
     'base_weight': 1.0, # 非top-k样本权重
     'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
     'weight_decay': 1e-4,
+
+    # 当前 relmarket12 基线的晋级门槛；测试周不参与这些阈值。
+    'promotion_mean_weighted_return': 0.019902,
+    'promotion_worst_fold_weighted_return': 0.012523,
+    'promotion_p10_weighted_return': -0.025672,
+    'promotion_mean_rank_ic': 0.0514,
+    'promotion_id_score_correlation': 0.90,
+    'promotion_id_top5_overlap': 0.40,
+    'promotion_min_exposure_std': 0.01,
+    'fixed_exposure_baseline': 0.6231689453125,
 
     # 保持损失为 FP32，仅对 Transformer 前向启用 AMP。
     'amp_enabled': True,

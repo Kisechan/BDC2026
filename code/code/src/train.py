@@ -14,6 +14,7 @@ from utils import add_relative_market_features
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import RELATIVE_MARKET_FEATURES, RELATIVE_MARKET_FEATURE_SET
 from utils import create_ranking_dataset_vectorized
+from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
 from utils import summarize_ensemble_days
 import joblib
@@ -160,8 +161,13 @@ class WeightedRankingLoss(nn.Module):
                  base_weight=1.0, regression_weight=0.2, regression_beta=0.02,
                  ic_weight=0.2, allocation_weight=0.1, exposure_weight=1.0,
                  allocation_temperature=1.0, allocation_target_temperature=0.02,
+                 allocation_candidate_k=20, allocation_return_clip=0.10,
                  exposure_target_temperature=0.02, min_exposure=0.80,
-                 max_exposure=0.999999):
+                 max_exposure=0.999999,
+                 exposure_selected_return_weight=0.70,
+                 exposure_market_return_weight=0.30,
+                 exposure_downside_weight=0.25,
+                 id_gate_regularization=0.0):
         super(WeightedRankingLoss, self).__init__()
         if listwise_temperature <= 0:
             raise ValueError('listwise_temperature 必须大于 0')
@@ -178,7 +184,17 @@ class WeightedRankingLoss(nn.Module):
         self.exposure_weight = exposure_weight
         self.allocation_temperature = allocation_temperature
         self.allocation_target_temperature = allocation_target_temperature
+        self.allocation_candidate_k = int(allocation_candidate_k)
+        self.allocation_return_clip = float(allocation_return_clip)
         self.exposure_target_temperature = exposure_target_temperature
+        self.exposure_selected_return_weight = float(
+            exposure_selected_return_weight
+        )
+        self.exposure_market_return_weight = float(
+            exposure_market_return_weight
+        )
+        self.exposure_downside_weight = float(exposure_downside_weight)
+        self.id_gate_regularization = float(id_gate_regularization)
         self.min_exposure = min_exposure
         self.max_exposure = max_exposure
         if min(
@@ -189,6 +205,17 @@ class WeightedRankingLoss(nn.Module):
             raise ValueError('仓位损失的 temperature 必须大于 0')
         if not 0.0 <= min_exposure < max_exposure < 1.0:
             raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
+        if self.allocation_candidate_k < self.k:
+            raise ValueError('allocation_candidate_k 不能小于 Top-k')
+        if self.allocation_return_clip <= 0:
+            raise ValueError('allocation_return_clip 必须大于 0')
+        if min(
+            self.exposure_selected_return_weight,
+            self.exposure_market_return_weight,
+            self.exposure_downside_weight,
+            self.id_gate_regularization,
+        ) < 0:
+            raise ValueError('Exposure 与 ID gate 损失权重不能为负')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -257,13 +284,23 @@ class WeightedRankingLoss(nn.Module):
         raw_returns,
     ):
         """监督预测 Top-k 内的相对权重，并根据该组合真实收益监督总仓位。"""
-        k = min(self.k, y_pred.size(1))
-        selected_indices = torch.topk(y_pred.detach(), k, dim=1).indices
-        selected_allocation_logits = allocation_logits.gather(1, selected_indices)
-        selected_returns = raw_returns.gather(1, selected_indices)
+        allocation_k = min(self.allocation_candidate_k, y_pred.size(1))
+        allocation_indices = torch.topk(
+            y_pred.detach(),
+            allocation_k,
+            dim=1,
+        ).indices
+        selected_allocation_logits = allocation_logits.gather(
+            1,
+            allocation_indices,
+        )
+        allocation_returns = raw_returns.gather(1, allocation_indices).clamp(
+            min=-self.allocation_return_clip,
+            max=self.allocation_return_clip,
+        )
 
         target_relative_weights = F.softmax(
-            selected_returns / self.allocation_target_temperature,
+            allocation_returns / self.allocation_target_temperature,
             dim=1,
         )
         predicted_log_weights = F.log_softmax(
@@ -274,14 +311,34 @@ class WeightedRankingLoss(nn.Module):
             target_relative_weights * predicted_log_weights
         ).sum(dim=1).mean()
 
+        exposure_k = min(self.k, y_pred.size(1))
+        exposure_indices = torch.topk(
+            y_pred.detach(),
+            exposure_k,
+            dim=1,
+        ).indices
+        selected_returns = raw_returns.gather(1, exposure_indices)
         selected_mean_return = selected_returns.mean(dim=1)
-        target_exposure_ratio = torch.sigmoid(
-            selected_mean_return / self.exposure_target_temperature
+        market_mean_return = raw_returns.mean(dim=1)
+        selected_downside = torch.sqrt(
+            torch.relu(-selected_returns).square().mean(dim=1) + 1e-12
         )
-        target_exposure = self.min_exposure + (
-            self.max_exposure - self.min_exposure
-        ) * target_exposure_ratio
-        exposure_loss = F.mse_loss(exposure.reshape(-1), target_exposure)
+        exposure_signal = (
+            self.exposure_selected_return_weight * selected_mean_return
+            + self.exposure_market_return_weight * market_mean_return
+            - self.exposure_downside_weight * selected_downside
+        )
+        target_exposure_probability = torch.sigmoid(
+            exposure_signal / self.exposure_target_temperature
+        )
+        predicted_exposure_probability = (
+            (exposure.reshape(-1) - self.min_exposure)
+            / (self.max_exposure - self.min_exposure)
+        ).clamp(min=1e-6, max=1.0 - 1e-6)
+        exposure_loss = F.binary_cross_entropy(
+            predicted_exposure_probability,
+            target_exposure_probability,
+        )
         return allocation_loss, exposure_loss
         
     def forward(
@@ -292,6 +349,7 @@ class WeightedRankingLoss(nn.Module):
         raw_returns,
         allocation_logits,
         exposure,
+        identity_gate=None,
         return_components=False,
     ):
         """
@@ -334,6 +392,10 @@ class WeightedRankingLoss(nn.Module):
             'allocation_loss': self.allocation_weight * allocation,
             'exposure_loss': self.exposure_weight * exposure_loss,
         }
+        if identity_gate is not None and self.id_gate_regularization > 0:
+            components['id_gate_regularization'] = (
+                self.id_gate_regularization * identity_gate.square()
+            )
         total_loss = sum(components.values())
         if return_components:
             return total_loss, components
@@ -719,6 +781,7 @@ def train_ranking_model(
                     valid_raw_return.unsqueeze(0),
                     valid_allocation_logits.unsqueeze(0),
                     exposures[i].reshape(1),
+                    identity_gate=model.identity_gate_value(),
                     return_components=True,
                 )
                 batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
@@ -772,6 +835,8 @@ def evaluate_ranking_model(
     writer,
     epoch,
     return_predictions=False,
+    selection_risk_feature_names=None,
+    selection_risk_scaler=None,
 ):
     model.eval()
     total_loss = 0
@@ -839,6 +904,7 @@ def evaluate_ranking_model(
                         valid_true.unsqueeze(0),
                         valid_allocation_logits.unsqueeze(0),
                         exposures[i].reshape(1),
+                        identity_gate=model.identity_gate_value(),
                     )
                     batch_loss = batch_loss + loss if batch_loss is not None else loss
             
@@ -868,7 +934,7 @@ def evaluate_ranking_model(
                     ).flatten()
                     if valid_indices.numel() < 5:
                         continue
-                    prediction_records.append({
+                    prediction_record = {
                         'prediction_date': prediction_date,
                         'stock_indices': (
                             stock_indices[i][valid_indices]
@@ -887,7 +953,23 @@ def evaluate_ranking_model(
                             .detach().cpu().numpy()
                         ),
                         'exposure': float(exposures[i].item()),
-                    })
+                    }
+                    if (
+                        selection_risk_feature_names is not None
+                        and selection_risk_scaler is not None
+                    ):
+                        risk_context = extract_selection_risk_context(
+                            sequences[i][valid_indices]
+                            .detach().float().cpu().numpy(),
+                            selection_risk_feature_names,
+                            selection_risk_scaler,
+                            lookback=int(config.get(
+                                'selection_risk_lookback',
+                                20,
+                            )),
+                        )
+                        prediction_record.update(risk_context)
+                    prediction_records.append(prediction_record)
             
             num_batches += 1
     
@@ -902,6 +984,143 @@ def evaluate_ranking_model(
     if return_predictions:
         return avg_loss, total_metrics, prediction_records
     return avg_loss, total_metrics
+
+
+def evaluate_identity_sensitivity(
+    model,
+    dataloader,
+    device,
+    permutation_seed,
+    top_k=5,
+):
+    """仅对最佳checkpoint执行ID消融，避免把测试周用于模型选择。"""
+    model.eval()
+    real_top5_returns = []
+    comparisons = {
+        'all_unk_vs_real': [],
+        'permuted_vs_real': [],
+    }
+    real_exposures = []
+    alternative_exposures = {
+        'all_unk_vs_real': [],
+        'permuted_vs_real': [],
+    }
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(permutation_seed))
+    identity_permutation = torch.arange(model.num_stocks + 2)
+    known_identity_indices = torch.arange(2, model.num_stocks + 2)
+    identity_permutation[known_identity_indices] = known_identity_indices[
+        torch.randperm(model.num_stocks, generator=generator)
+    ]
+
+    with torch.inference_mode():
+        for batch in dataloader:
+            sequences = move_batch_tensor(batch['sequences'], device)
+            targets = move_batch_tensor(batch['targets'], device)
+            stock_indices = move_batch_tensor(batch['stock_indices'], device)
+            masks = move_batch_tensor(batch['masks'], device)
+            all_unk_indices = stock_indices.masked_fill(masks.bool(), 1)
+            permuted_indices = identity_permutation.to(device)[stock_indices]
+
+            outputs_by_mode = {}
+            for mode, indices in (
+                ('real', stock_indices),
+                ('all_unk_vs_real', all_unk_indices),
+                ('permuted_vs_real', permuted_indices),
+            ):
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=use_amp(device),
+                ):
+                    scores, _, _, exposures = model(
+                        sequences,
+                        indices,
+                        masks,
+                    )
+                outputs_by_mode[mode] = (
+                    scores.float(),
+                    exposures.float(),
+                )
+
+            for row_index in range(stock_indices.size(0)):
+                valid_indices = masks[row_index].nonzero(
+                    as_tuple=False
+                ).flatten()
+                if valid_indices.numel() < top_k:
+                    continue
+                real_scores = outputs_by_mode['real'][0][
+                    row_index, valid_indices
+                ].detach().cpu().numpy()
+                valid_targets = targets[
+                    row_index, valid_indices
+                ].detach().cpu().numpy()
+                real_order = np.argsort(
+                    real_scores,
+                    kind='stable',
+                )[::-1]
+                real_top = set(real_order[:top_k].tolist())
+                real_return = float(valid_targets[real_order[:top_k]].mean())
+                real_top5_returns.append(real_return)
+                real_exposures.append(float(
+                    outputs_by_mode['real'][1][row_index].item()
+                ))
+
+                for mode in comparisons:
+                    alternative_scores = outputs_by_mode[mode][0][
+                        row_index, valid_indices
+                    ].detach().cpu().numpy()
+                    correlation = spearmanr(
+                        real_scores,
+                        alternative_scores,
+                    ).statistic
+                    alternative_order = np.argsort(
+                        alternative_scores,
+                        kind='stable',
+                    )[::-1]
+                    alternative_top = set(
+                        alternative_order[:top_k].tolist()
+                    )
+                    alternative_return = float(
+                        valid_targets[alternative_order[:top_k]].mean()
+                    )
+                    comparisons[mode].append({
+                        'score_spearman': float(
+                            correlation if np.isfinite(correlation) else 0.0
+                        ),
+                        'top5_overlap': len(
+                            real_top.intersection(alternative_top)
+                        ) / top_k,
+                        'top5_return': alternative_return,
+                        'top5_return_delta_vs_real': (
+                            alternative_return - real_return
+                        ),
+                    })
+                    alternative_exposures[mode].append(float(
+                        outputs_by_mode[mode][1][row_index].item()
+                    ))
+
+    if not real_top5_returns:
+        raise ValueError('ID敏感性评估没有有效日期')
+    result = {
+        'num_evaluation_dates': len(real_top5_returns),
+        'identity_gate': float(
+            model.identity_gate_value().detach().cpu().item()
+        ),
+        'real': {
+            'mean_top5_return': float(np.mean(real_top5_returns)),
+            'mean_exposure': float(np.mean(real_exposures)),
+        },
+    }
+    for mode, rows in comparisons.items():
+        result[mode] = {
+            key: float(np.mean([row[key] for row in rows]))
+            for key in rows[0]
+        }
+        result[mode]['mean_exposure'] = float(np.mean(
+            alternative_exposures[mode]
+        ))
+    return result
 
 
 def predict_top_stocks(model, data, features, sequence_length, scaler, stockid2idx, device, top_k=5):
@@ -1035,13 +1254,40 @@ def build_training_components(model):
         exposure_weight=config.get('exposure_weight', 1.0),
         allocation_temperature=config.get('allocation_temperature', 1.0),
         allocation_target_temperature=config.get('allocation_target_temperature', 0.02),
+        allocation_candidate_k=config.get('allocation_candidate_k', 20),
+        allocation_return_clip=config.get('allocation_return_clip', 0.10),
         exposure_target_temperature=config.get('exposure_target_temperature', 0.02),
+        exposure_selected_return_weight=config.get(
+            'exposure_selected_return_weight',
+            0.70,
+        ),
+        exposure_market_return_weight=config.get(
+            'exposure_market_return_weight',
+            0.30,
+        ),
+        exposure_downside_weight=config.get('exposure_downside_weight', 0.25),
+        id_gate_regularization=config.get('id_gate_regularization', 0.0),
         min_exposure=config.get('min_exposure', 0.80),
         max_exposure=config.get('max_exposure', 0.999999),
     )
+    regular_parameters = []
+    no_decay_parameters = []
+    for name, parameter in model.named_parameters():
+        if name == 'identity_gate_logit':
+            no_decay_parameters.append(parameter)
+        else:
+            regular_parameters.append(parameter)
+    optimizer_parameters = [{
+        'params': regular_parameters,
+        'weight_decay': config['weight_decay'],
+    }]
+    if no_decay_parameters:
+        optimizer_parameters.append({
+            'params': no_decay_parameters,
+            'weight_decay': 0.0,
+        })
     optimizer_kwargs = {
         'lr': config['learning_rate'],
-        'weight_decay': config['weight_decay'],
     }
     if (
         next(model.parameters()).is_cuda
@@ -1050,13 +1296,13 @@ def build_training_components(model):
         optimizer_kwargs['fused'] = True
     try:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            optimizer_parameters,
             **optimizer_kwargs,
         )
     except (RuntimeError, TypeError):
         optimizer_kwargs.pop('fused', None)
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            optimizer_parameters,
             **optimizer_kwargs,
         )
     return criterion, optimizer
@@ -1075,6 +1321,32 @@ def calculate_checkpoint_score(metrics, checkpoint_metric):
             + config.get('checkpoint_rank_ic_weight', 0.2) * metrics.get('rank_ic', 0.0)
         )
     return metrics.get(checkpoint_metric, 0.0)
+
+
+def summarize_identity_sensitivity(fold_results):
+    """汇总各折最佳checkpoint的ID消融结果。"""
+    sensitivity_rows = [
+        result['id_sensitivity']
+        for result in fold_results
+        if 'id_sensitivity' in result
+    ]
+    if not sensitivity_rows:
+        return {}
+    summary = {
+        'num_folds': len(sensitivity_rows),
+        'mean_identity_gate': float(np.mean([
+            row['identity_gate'] for row in sensitivity_rows
+        ])),
+    }
+    for mode in ('all_unk_vs_real', 'permuted_vs_real'):
+        keys = sensitivity_rows[0][mode].keys()
+        summary[mode] = {
+            key: float(np.mean([
+                row[mode][key] for row in sensitivity_rows
+            ]))
+            for key in keys
+        }
+    return summary
 
 
 def train_one_fold(
@@ -1188,6 +1460,7 @@ def train_one_fold(
             f"val_rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}, "
             f"val_weighted_return={eval_metrics.get('weighted_portfolio_return', 0.0):.6f}, "
             f"val_exposure={eval_metrics.get('gross_exposure', 0.0):.4f}, "
+            f"id_gate={model.identity_gate_value().detach().item():.4f}, "
             f"checkpoint_score={current_score:.6f}"
         )
 
@@ -1217,6 +1490,19 @@ def train_one_fold(
         None,
         best_epoch - 1,
         return_predictions=True,
+        selection_risk_feature_names=features,
+        selection_risk_scaler=scaler,
+    )
+    id_sensitivity = evaluate_identity_sensitivity(
+        model,
+        val_loader,
+        device,
+        permutation_seed=(
+            int(config.get('identity_sensitivity_seed', 20260728))
+            + int(base_seed) * 100
+            + int(fold_number)
+        ),
+        top_k=5,
     )
     train_eval_metrics = {key: float(value) for key, value in train_eval_metrics.items()}
     val_eval_metrics = {key: float(value) for key, value in val_eval_metrics.items()}
@@ -1237,6 +1523,7 @@ def train_one_fold(
         'num_non_overlapping_validation_samples': len(val_eval_dataset),
         'train_metrics': train_eval_metrics,
         'val_metrics': val_eval_metrics,
+        'id_sensitivity': id_sensitivity,
         'top5_gap': train_eval_metrics.get('top5_return', 0.0) - val_eval_metrics.get('top5_return', 0.0),
         'weighted_portfolio_return_gap': (
             train_eval_metrics.get('weighted_portfolio_return', 0.0)
@@ -1333,7 +1620,8 @@ def train_final_model(
             f"ic_loss={train_metrics.get('ic_loss', 0.0):.4f}, "
             f"regression={train_metrics.get('regression_loss', 0.0):.4f}, "
             f"allocation={train_metrics.get('allocation_loss', 0.0):.4f}, "
-            f"exposure_loss={train_metrics.get('exposure_loss', 0.0):.4f}"
+            f"exposure_loss={train_metrics.get('exposure_loss', 0.0):.4f}, "
+            f"id_gate={model.identity_gate_value().detach().item():.4f}"
         )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
@@ -1345,6 +1633,9 @@ def train_final_model(
         'min_final_epochs': config['min_final_epochs'],
         'train_end': pd.Timestamp(train_end).strftime('%Y-%m-%d'),
         'ranking_samples': len(train_dataset),
+        'identity_gate': float(
+            model.identity_gate_value().detach().cpu().item()
+        ),
     }
     with open(os.path.join(output_dir, 'final_training.json'), 'w', encoding='utf-8') as file:
         json.dump(metadata, file, indent=2, ensure_ascii=False)
@@ -1403,6 +1694,20 @@ def main():
 
     full_data, features = preprocess_data(full_df, is_train=True, stockid2idx=stockid2idx)
     full_data['日期'] = pd.to_datetime(full_data['日期'])
+    if config.get('exposure_market_encoder_enabled', False):
+        expected_market_indices = [
+            features.index(name)
+            for name in RELATIVE_MARKET_FEATURES[-5:]
+        ]
+        configured_market_indices = [
+            int(index)
+            for index in config.get('market_state_feature_indices', [])
+        ]
+        if configured_market_indices != expected_market_indices:
+            raise ValueError(
+                'market_state_feature_indices 与市场状态特征位置不一致: '
+                f'{configured_market_indices} != {expected_market_indices}'
+            )
 
     fold_results = []
     oof_records = {
@@ -1458,6 +1763,18 @@ def main():
             )
             if ensemble_enabled else [0.0]
         ),
+        selection_risk_gamma_grid=config.get(
+            'selection_risk_gamma_grid',
+            [0.0],
+        ),
+        selection_candidate_k=int(config.get(
+            'selection_candidate_k',
+            20,
+        )),
+        fixed_exposure_baseline=float(config.get(
+            'fixed_exposure_baseline',
+            0.6231689453125,
+        )),
         downside_weight=config.get('ensemble_downside_weight', 0.5),
         top_k=5,
     )
@@ -1473,6 +1790,15 @@ def main():
             ),
             allocation_blend=1.0,
             disagreement_gamma=0.0,
+            selection_risk_gamma=0.0,
+            selection_candidate_k=int(config.get(
+                'selection_candidate_k',
+                20,
+            )),
+            fixed_exposure_baseline=float(config.get(
+                'fixed_exposure_baseline',
+                0.6231689453125,
+            )),
             downside_weight=config.get('ensemble_downside_weight', 0.5),
             top_k=5,
         )
@@ -1480,40 +1806,60 @@ def main():
         metrics['mean_weighted_portfolio_return']
         for metrics in single_seed_summaries.values()
     ]))
-    mean_single_p10 = float(np.mean([
-        metrics['p10_weighted_portfolio_return']
-        for metrics in single_seed_summaries.values()
-    ]))
-    mean_single_worst_fold = float(np.mean([
-        metrics['worst_fold_weighted_portfolio_return']
-        for metrics in single_seed_summaries.values()
-    ]))
     ensemble_metrics = policy['oof_metrics']
-    if ensemble_enabled:
-        promotion_criteria = {
-            'applicable': True,
-            'mean_return_not_below_single_model_average': bool(
-                ensemble_metrics['mean_weighted_portfolio_return']
-                >= mean_single_return
-            ),
-            'p10_or_worst_fold_improved': bool(
-                ensemble_metrics['p10_weighted_portfolio_return']
-                >= mean_single_p10
-                or ensemble_metrics[
-                    'worst_fold_weighted_portfolio_return'
-                ] >= mean_single_worst_fold
-            ),
-        }
-        promotion_criteria['passed'] = all(
-            value for key, value in promotion_criteria.items()
-            if key != 'applicable'
-        )
-    else:
-        promotion_criteria = {
-            'applicable': False,
-            'passed': True,
-            'reason': 'single_seed_mode',
-        }
+    identity_sensitivity = summarize_identity_sensitivity(fold_results)
+    unk_sensitivity = identity_sensitivity.get('all_unk_vs_real', {})
+    promotion_criteria = {
+        'applicable': True,
+        'mean_weighted_return': bool(
+            ensemble_metrics['mean_weighted_portfolio_return']
+            >= config.get('promotion_mean_weighted_return', 0.019902)
+        ),
+        'worst_fold_weighted_return': bool(
+            ensemble_metrics['worst_fold_weighted_portfolio_return']
+            >= config.get(
+                'promotion_worst_fold_weighted_return',
+                0.012523,
+            )
+        ),
+        'p10_weighted_return': bool(
+            ensemble_metrics['p10_weighted_portfolio_return']
+            > config.get('promotion_p10_weighted_return', -0.025672)
+        ),
+        'mean_rank_ic': bool(
+            ensemble_metrics['mean_rank_ic']
+            >= config.get('promotion_mean_rank_ic', 0.0514)
+        ),
+        'allocation_at_exposure_positive': bool(
+            ensemble_metrics[
+                'mean_allocation_at_exposure_contribution'
+            ] > 0.0
+        ),
+        'selection_correlation_improved': bool(
+            ensemble_metrics['mean_positive_correlation']
+            < ensemble_metrics['raw_mean_positive_correlation']
+        ),
+        'exposure_objective_improved': bool(
+            ensemble_metrics['policy_objective']
+            > ensemble_metrics['fixed_exposure_policy_objective']
+        ),
+        'exposure_not_constant': bool(
+            ensemble_metrics['exposure_std']
+            >= config.get('promotion_min_exposure_std', 0.01)
+        ),
+        'id_score_correlation': bool(
+            unk_sensitivity.get('score_spearman', 0.0)
+            >= config.get('promotion_id_score_correlation', 0.90)
+        ),
+        'id_top5_overlap': bool(
+            unk_sensitivity.get('top5_overlap', 0.0)
+            >= config.get('promotion_id_top5_overlap', 0.40)
+        ),
+    }
+    promotion_criteria['passed'] = all(
+        value for key, value in promotion_criteria.items()
+        if key != 'applicable'
+    )
 
     # 所有已运行折 checkpoint 统一决定全量模型训练轮数。
     median_best_epoch = int(np.median([result['best_epoch'] for result in fold_results]))
@@ -1555,6 +1901,10 @@ def main():
         'model_paths': model_paths,
         'scaler_path': 'scaler.pkl',
         'config_path': 'config.json',
+        'selection_risk_lookback': int(config.get(
+            'selection_risk_lookback',
+            20,
+        )),
         'promotion_criteria': promotion_criteria,
     })
     with open(
@@ -1600,9 +1950,27 @@ def main():
         'mean_allocation_contribution': ensemble_metrics[
             'mean_allocation_contribution'
         ],
+        'mean_allocation_at_exposure_contribution': ensemble_metrics[
+            'mean_allocation_at_exposure_contribution'
+        ],
         'mean_exposure_contribution': ensemble_metrics[
             'mean_exposure_contribution'
         ],
+        'mean_positive_correlation': ensemble_metrics[
+            'mean_positive_correlation'
+        ],
+        'raw_mean_positive_correlation': ensemble_metrics[
+            'raw_mean_positive_correlation'
+        ],
+        'mean_reversal_risk': ensemble_metrics['mean_reversal_risk'],
+        'exposure_std': ensemble_metrics['exposure_std'],
+        'exposure_return_spearman': ensemble_metrics[
+            'exposure_return_spearman'
+        ],
+        'fixed_exposure_policy_objective': ensemble_metrics[
+            'fixed_exposure_policy_objective'
+        ],
+        'identity_sensitivity': identity_sensitivity,
         'ensemble_oof': ensemble_metrics,
         'single_seed_oof': single_seed_summaries,
         'single_seed_mean_weighted_return': mean_single_return,
