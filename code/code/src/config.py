@@ -4,8 +4,8 @@ feature_num = '158+39_reduced25'
 patience_num = 12
 experiment_name = 'single_seed_3fold'
 config = {
-    # 单个样本输入最近 60 个交易日；叠加最长 60 日滚动特征后，
-    # 原始行情的有效感受野最多约为 119 个交易日。
+    # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
+    # t-119，因此显式窗口已覆盖约 120 个行情观测。
     'sequence_length': sequence_length,
     'd_model': 128,          # Transformer隐藏维度；原始特征维度由 feature_num 对应的特征表决定
     'nhead': 4,             # 注意力头数量
