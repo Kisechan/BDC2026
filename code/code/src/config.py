@@ -2,14 +2,14 @@
 sequence_length = 60
 feature_num = '158+39_reduced25'
 patience_num = 12
-experiment_name = 'weight_exposure_heads'
+experiment_name = 'robust_3seed_ensemble'
 config = {
     'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
     'd_model': 128,          # Transformer隐藏维度；原始特征维度由 feature_num 对应的特征表决定
     'nhead': 4,             # 注意力头数量
     'num_layers': 2,        # Transformer层数
     'dim_feedforward': 256, # 前馈网络维度
-    'batch_size': 4,        # 排序任务batch_size可以小一些，因为每个batch包含更多股票
+    'batch_size': 8,        # 排序任务batch_size可以小一些，因为每个batch包含更多股票
     'max_epochs': 50,
     'min_final_epochs': 8,
     'patience': patience_num,
@@ -23,6 +23,8 @@ config = {
     'grad_clip': True,
     'num_folds': 3,
     'validation_months': 2,
+    'evaluation_stride': 5,
+    'ensemble_seeds': [42, 142, 242],
     'checkpoint_metric': 'weighted_portfolio_return_plus_rank_ic',
     'checkpoint_rank_ic_weight': 0.1,
     'purge_days': 5,
@@ -32,10 +34,13 @@ config = {
     'allocation_weight': 0.1,
     'exposure_weight': 1.0,
     'allocation_temperature': 1.0,
-    'allocation_target_temperature': 0.02,
+    'allocation_target_temperature': 0.10,
     'exposure_target_temperature': 0.02,
-    'min_exposure': 0.80,
+    'min_exposure': 0.20,
     'max_exposure': 0.999999,
+    'allocation_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
+    'disagreement_gamma_grid': [0.0, 2.0, 4.0, 8.0],
+    'ensemble_downside_weight': 0.5,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
@@ -43,6 +48,15 @@ config = {
     'base_weight': 1.0, # 非top-k样本权重
     'top5_weight': 2.0, # top-5样本权重（应大于base_weight）
     'weight_decay': 1e-4,
+
+    # 保持损失为 FP32，仅对 Transformer 前向启用 AMP。
+    'amp_enabled': True,
+    'tf32_enabled': True,
+    'fused_optimizer': True,
+    'pin_memory': True,
+    'non_blocking_transfer': True,
+    'num_workers': 0,
+    'deterministic_training': True,
 
     'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
     'data_path': './data',
