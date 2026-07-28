@@ -1264,7 +1264,7 @@ def train_one_fold(
 
 
 def prepare_full_training_dataset(full_data, features, output_dir):
-    """全量 scaler 与排序数据集只构建一次，供三个随机种子共享。"""
+    """全量 scaler 与排序数据集只构建一次，供已启用的随机种子共享。"""
     train_data = full_data.copy()
     train_data[features] = train_data[features].replace(
         [np.inf, -np.inf],
@@ -1352,7 +1352,7 @@ def train_final_model(
     metadata = {
         'base_seed': int(base_seed),
         'epochs': num_epochs,
-        'epoch_selection': 'median_across_nine_fold_checkpoints',
+        'epoch_selection': 'median_across_all_fold_checkpoints',
         'median_best_epoch': median_best_epoch,
         'min_final_epochs': config['min_final_epochs'],
         'train_end': pd.Timestamp(train_end).strftime('%Y-%m-%d'),
@@ -1365,12 +1365,19 @@ def train_final_model(
 
 
 def main():
-    ensemble_seeds = [int(seed) for seed in config.get(
+    configured_ensemble_seeds = [int(seed) for seed in config.get(
         'ensemble_seeds',
         [42, 142, 242],
     )]
-    if len(ensemble_seeds) != 3 or len(set(ensemble_seeds)) != 3:
-        raise ValueError('ensemble_seeds 必须包含三个不同的随机种子')
+    ensemble_enabled = bool(config.get('ensemble_enabled', False))
+    if ensemble_enabled:
+        ensemble_seeds = configured_ensemble_seeds
+        if len(ensemble_seeds) < 2:
+            raise ValueError('启用 ensemble 时至少需要两个随机种子')
+    else:
+        ensemble_seeds = [int(config.get('seed', 42))]
+    if not ensemble_seeds or len(set(ensemble_seeds)) != len(ensemble_seeds):
+        raise ValueError('训练随机种子必须非空且互不重复')
     set_seed(ensemble_seeds[0])
     output_dir = config['output_dir']
     os.makedirs(output_dir, exist_ok=True)
@@ -1385,7 +1392,8 @@ def main():
         device = torch.device('cpu')
     configure_accelerator(device)
     print(
-        f"训练设备: {device}; AMP={use_amp(device)}; "
+        f"训练模式: {'多种子 ensemble' if ensemble_enabled else '单种子三折'}; "
+        f"seeds={ensemble_seeds}; 设备: {device}; AMP={use_amp(device)}; "
         f"TF32={device.type == 'cuda' and config.get('tf32_enabled', True)}; "
         f"batch_size={config['batch_size']}"
     )
@@ -1455,9 +1463,12 @@ def main():
             'allocation_blend_grid',
             [0.0, 0.25, 0.5, 0.75, 1.0],
         ),
-        disagreement_gamma_grid=config.get(
-            'disagreement_gamma_grid',
-            [0.0, 2.0, 4.0, 8.0],
+        disagreement_gamma_grid=(
+            config.get(
+                'disagreement_gamma_grid',
+                [0.0, 2.0, 4.0, 8.0],
+            )
+            if ensemble_enabled else [0.0]
         ),
         downside_weight=config.get('ensemble_downside_weight', 0.5),
         top_k=5,
@@ -1490,21 +1501,33 @@ def main():
         for metrics in single_seed_summaries.values()
     ]))
     ensemble_metrics = policy['oof_metrics']
-    promotion_criteria = {
-        'mean_return_not_below_single_model_average': bool(
-            ensemble_metrics['mean_weighted_portfolio_return']
-            >= mean_single_return
-        ),
-        'p10_or_worst_fold_improved': bool(
-            ensemble_metrics['p10_weighted_portfolio_return']
-            >= mean_single_p10
-            or ensemble_metrics['worst_fold_weighted_portfolio_return']
-            >= mean_single_worst_fold
-        ),
-    }
-    promotion_criteria['passed'] = all(promotion_criteria.values())
+    if ensemble_enabled:
+        promotion_criteria = {
+            'applicable': True,
+            'mean_return_not_below_single_model_average': bool(
+                ensemble_metrics['mean_weighted_portfolio_return']
+                >= mean_single_return
+            ),
+            'p10_or_worst_fold_improved': bool(
+                ensemble_metrics['p10_weighted_portfolio_return']
+                >= mean_single_p10
+                or ensemble_metrics[
+                    'worst_fold_weighted_portfolio_return'
+                ] >= mean_single_worst_fold
+            ),
+        }
+        promotion_criteria['passed'] = all(
+            value for key, value in promotion_criteria.items()
+            if key != 'applicable'
+        )
+    else:
+        promotion_criteria = {
+            'applicable': False,
+            'passed': True,
+            'reason': 'single_seed_mode',
+        }
 
-    # 九个折 checkpoint 统一决定三个全量模型的训练轮数。
+    # 所有已运行折 checkpoint 统一决定全量模型训练轮数。
     median_best_epoch = int(np.median([result['best_epoch'] for result in fold_results]))
     min_final_epochs = config.get('min_final_epochs', 1)
     if not 1 <= min_final_epochs <= config['max_epochs']:
@@ -1538,6 +1561,8 @@ def main():
         )
 
     policy.update({
+        'ensemble_enabled': ensemble_enabled,
+        'mode': 'rank_ensemble' if ensemble_enabled else 'single_model',
         'ensemble_seeds': ensemble_seeds,
         'model_paths': model_paths,
         'scaler_path': 'scaler.pkl',
@@ -1552,6 +1577,10 @@ def main():
         json.dump(policy, file, indent=2, ensure_ascii=False)
 
     summary = {
+        'training_mode': (
+            'rank_ensemble' if ensemble_enabled else 'single_seed_3fold'
+        ),
+        'num_folds': len(folds),
         'evaluation_stride': int(config.get('evaluation_stride', 5)),
         'ensemble_seeds': ensemble_seeds,
         'mean_top5_return': ensemble_metrics['mean_top5_return'],
@@ -1593,7 +1622,8 @@ def main():
         'folds': fold_results,
         'full_training': {
             'epochs': final_epochs,
-            'epoch_selection': 'median_across_nine_fold_checkpoints',
+            'epoch_selection': 'median_across_all_fold_checkpoints',
+            'num_fold_checkpoints': len(fold_results),
             'median_best_epoch': median_best_epoch,
             'min_final_epochs': min_final_epochs,
             'models': full_training,
@@ -1611,6 +1641,6 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     best_score = main()
     print(
-        f"\n########## 训练完成！OOF ensemble 平均组合收益: "
+        f"\n########## 训练完成！OOF 平均组合收益: "
         f"{best_score:.6f} ##########"
     )
