@@ -21,7 +21,7 @@ feature_cloums_map = {
 		'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',
 		'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'
 	],
-	'158+39': [
+	'158+39_reduced20': [
 		'开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
 		'KMID', 'KLEN', 'KMID2', 'KUP', 'KUP2', 'KLOW', 'KLOW2', 'KSFT', 'KSFT2', 'OPEN0', 'HIGH0', 'LOW0',
 		'VWAP0', 'ROC5', 'ROC10', 'ROC20', 'ROC30', 'ROC60', 'MA5', 'MA10', 'MA20', 'MA30', 'MA60', 'STD5',
@@ -46,8 +46,21 @@ feature_cloums_map = {
 
 feature_engineer_func_map = {
 	'39': engineer_features_39,
-	'158+39': engineer_features_158plus39,
+	'158+39_reduced20': engineer_features_158plus39,
 }
+
+# 与训练阶段保持完全相同的 166 维消融配置；名称保留 158+39 特征族血缘。
+LINEAR_REDUNDANT_FEATURES = {
+	'high_low_spread', 'open_close_spread', 'high_close_spread',
+	'low_close_spread', 'kdj_j',
+}
+feature_cloums_map['158+39_reduced25'] = [
+	name for name in feature_cloums_map['158+39_reduced20']
+	if name not in LINEAR_REDUNDANT_FEATURES
+]
+feature_engineer_func_map['158+39_reduced25'] = engineer_features_158plus39
+assert len(feature_cloums_map['158+39_reduced20']) == 171
+assert len(feature_cloums_map['158+39_reduced25']) == 166
 
 
 def preprocess_predict_data(df, stockid2idx):

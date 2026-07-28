@@ -1,11 +1,11 @@
 # 配置参数
 sequence_length = 60
-feature_num = '158+39'
+feature_num = '158+39_reduced25'
 patience_num = 12
-experiment_name = 'reduced_features_171'
+experiment_name = 'linear_redundancy_removed'
 config = {
     'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
-    'd_model': 128,          # Transformer输入维度
+    'd_model': 128,          # Transformer隐藏维度；原始特征维度由 feature_num 对应的特征表决定
     'nhead': 4,             # 注意力头数量
     'num_layers': 2,        # Transformer层数
     'dim_feedforward': 256, # 前馈网络维度
@@ -18,7 +18,7 @@ config = {
     'stock_embedding_dim': 4,
     'id_dropout': 0.1,
     'embedding_dropout': 0.1,
-    'feature_num': feature_num,
+    'feature_num': feature_num,  # 166 个实际连续输入；名称保留“158+39”特征族血缘
     'max_grad_norm': 5.0,
     'grad_clip': True,
     'num_folds': 3,
