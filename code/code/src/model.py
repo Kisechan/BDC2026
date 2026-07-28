@@ -121,6 +121,26 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1),
         )
+
+        # Top-k 内相对仓位分配头；输出 logits，推理时经 softmax 后乘总仓位。
+        self.allocation_head = nn.Sequential(
+            nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
+            nn.ReLU(),
+            nn.Dropout(config['dropout'] * 0.5),
+            nn.Linear(config['d_model'] // 4, 1),
+        )
+
+        # 市场级总仓位头。现金不单独建模，恒等于 1 - exposure。
+        self.min_exposure = float(config.get('min_exposure', 0.80))
+        self.max_exposure = float(config.get('max_exposure', 0.999999))
+        if not 0.0 <= self.min_exposure < self.max_exposure < 1.0:
+            raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
+        self.exposure_head = nn.Sequential(
+            nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
+            nn.ReLU(),
+            nn.Dropout(config['dropout'] * 0.5),
+            nn.Linear(config['d_model'] // 4, 1),
+        )
         
         # 初始化权重
         self._init_weights()
@@ -179,9 +199,26 @@ class StockTransformer(nn.Module):
         # 生成排序分数
         scores = self.score_head(ranking_features)  # [batch*num_stocks, 1]
         predicted_returns = self.return_head(ranking_features)  # [batch*num_stocks, 1]
+        allocation_logits = self.allocation_head(ranking_features)  # [batch*num_stocks, 1]
         
         # 重塑为最终输出格式
         output = scores.view(batch_size, num_stocks)  # [batch, num_stocks]
         return_output = predicted_returns.view(batch_size, num_stocks)
-        
-        return output, return_output
+        allocation_output = allocation_logits.view(batch_size, num_stocks)
+
+        ranking_features_by_stock = ranking_features.view(batch_size, num_stocks, -1)
+        if stock_mask is None:
+            pooled_market_features = ranking_features_by_stock.mean(dim=1)
+        else:
+            valid_mask = stock_mask.to(ranking_features_by_stock.dtype).unsqueeze(-1)
+            pooled_market_features = (
+                (ranking_features_by_stock * valid_mask).sum(dim=1)
+                / valid_mask.sum(dim=1).clamp(min=1.0)
+            )
+        raw_exposure = torch.sigmoid(self.exposure_head(pooled_market_features)).squeeze(-1)
+        exposure = self.min_exposure + (
+            self.max_exposure - self.min_exposure
+        ) * raw_exposure
+        exposure = exposure.clamp(min=self.min_exposure, max=self.max_exposure)
+
+        return output, return_output, allocation_output, exposure
