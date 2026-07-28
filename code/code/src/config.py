@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25'
 patience_num = 12
-experiment_name = 'linear_redundancy_removed'
+experiment_name = 'weight_exposure_heads'
 config = {
     'sequence_length': sequence_length,   # 使用过去60个交易日的数据（排序任务可以用稍短的序列）
     'd_model': 128,          # Transformer隐藏维度；原始特征维度由 feature_num 对应的特征表决定
@@ -23,12 +23,19 @@ config = {
     'grad_clip': True,
     'num_folds': 3,
     'validation_months': 2,
-    'checkpoint_metric': 'top5_return_plus_rank_ic',
+    'checkpoint_metric': 'weighted_portfolio_return_plus_rank_ic',
     'checkpoint_rank_ic_weight': 0.1,
     'purge_days': 5,
 
     'regression_weight': 0.05,
     'regression_beta': 0.02,
+    'allocation_weight': 0.1,
+    'exposure_weight': 1.0,
+    'allocation_temperature': 1.0,
+    'allocation_target_temperature': 0.02,
+    'exposure_target_temperature': 0.02,
+    'min_exposure': 0.80,
+    'max_exposure': 0.999999,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
