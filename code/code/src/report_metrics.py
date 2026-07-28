@@ -31,6 +31,19 @@ def print_cross_validation() -> None:
     print("\n[模型验证：三折 walk-forward]")
     print(f"平均 Top-5 收益: {_pct(float(summary['mean_top5_return']))}")
     print(f"最差折 Top-5 收益: {_pct(float(summary['worst_fold_top5_return']))}")
+    if "mean_weighted_portfolio_return" in summary:
+        print(
+            "平均动态权重组合收益: "
+            f"{_pct(float(summary['mean_weighted_portfolio_return']))}"
+        )
+        print(
+            "最差折动态权重组合收益: "
+            f"{_pct(float(summary['worst_fold_weighted_portfolio_return']))}"
+        )
+        print(
+            f"平均股票仓位/现金: {float(summary['mean_gross_exposure']):.2%} / "
+            f"{float(summary['mean_cash_weight']):.2%}"
+        )
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
     random_baselines = []
     for fold in summary.get("folds", []):
@@ -99,7 +112,10 @@ def print_realized_return() -> None:
         end_date = test["日期"].max().date()
 
         print(f"\n[本地后验评分：{start_date} ~ {end_date}]")
-        print(f"模型组合收益: {_pct(portfolio_return)} (仓位 {gross_exposure:.2%})")
+        print(
+            f"模型组合收益: {_pct(portfolio_return)} "
+            f"(股票 {gross_exposure:.2%}, 现金 {1.0 - gross_exposure:.2%})"
+        )
         print(f"基线—全股票等权: {_pct(universe_return)}")
         print(f"基线—现金: {_pct(0.0)}")
         print(f"事后上界—全池 Top-5 等权: {_pct(oracle_top5_return)}")

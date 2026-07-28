@@ -853,6 +853,11 @@ def calculate_checkpoint_score(metrics, checkpoint_metric):
             metrics.get('top5_return', 0.0)
             + config.get('checkpoint_rank_ic_weight', 0.2) * metrics.get('rank_ic', 0.0)
         )
+    if checkpoint_metric == 'weighted_portfolio_return_plus_rank_ic':
+        return (
+            metrics.get('weighted_portfolio_return', 0.0)
+            + config.get('checkpoint_rank_ic_weight', 0.2) * metrics.get('rank_ic', 0.0)
+        )
     return metrics.get(checkpoint_metric, 0.0)
 
 
@@ -996,6 +1001,10 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir):
         'train_metrics': train_eval_metrics,
         'val_metrics': val_eval_metrics,
         'top5_gap': train_eval_metrics.get('top5_return', 0.0) - val_eval_metrics.get('top5_return', 0.0),
+        'weighted_portfolio_return_gap': (
+            train_eval_metrics.get('weighted_portfolio_return', 0.0)
+            - val_eval_metrics.get('weighted_portfolio_return', 0.0)
+        ),
         'rank_ic_gap': train_eval_metrics.get('rank_ic', 0.0) - val_eval_metrics.get('rank_ic', 0.0),
     }
     with open(os.path.join(fold_dir, 'metrics.json'), 'w', encoding='utf-8') as file:
@@ -1139,15 +1148,28 @@ def main():
         )
 
     val_top5 = [result['val_metrics']['top5_return'] for result in fold_results]
+    val_weighted_returns = [
+        result['val_metrics']['weighted_portfolio_return'] for result in fold_results
+    ]
+    val_exposures = [result['val_metrics']['gross_exposure'] for result in fold_results]
     val_rank_ic = [result['val_metrics']['rank_ic'] for result in fold_results]
     top5_gaps = [result['top5_gap'] for result in fold_results]
+    weighted_return_gaps = [
+        result['weighted_portfolio_return_gap'] for result in fold_results
+    ]
     rank_ic_gaps = [result['rank_ic_gap'] for result in fold_results]
     summary = {
         'mean_top5_return': float(np.mean(val_top5)),
         'worst_fold_top5_return': float(np.min(val_top5)),
+        'mean_weighted_portfolio_return': float(np.mean(val_weighted_returns)),
+        'worst_fold_weighted_portfolio_return': float(np.min(val_weighted_returns)),
+        'mean_gross_exposure': float(np.mean(val_exposures)),
+        'mean_cash_weight': float(1.0 - np.mean(val_exposures)),
         'mean_rank_ic': float(np.mean(val_rank_ic)),
         'mean_top5_gap': float(np.mean(top5_gaps)),
         'worst_top5_gap': float(np.max(top5_gaps)),
+        'mean_weighted_portfolio_return_gap': float(np.mean(weighted_return_gaps)),
+        'worst_weighted_portfolio_return_gap': float(np.max(weighted_return_gaps)),
         'mean_rank_ic_gap': float(np.mean(rank_ic_gaps)),
         'folds': fold_results,
     }
