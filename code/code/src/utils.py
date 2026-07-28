@@ -20,6 +20,12 @@ RELATIVE_MARKET_FEATURES = (
     'market_breadth_above_ma20',
     'market_return_20_dispersion',
 )
+SELECTION_MOMENTUM_FEATURES = (
+    'cs_return_5_pct',
+    'cs_return_20_pct',
+    'cs_return_60_pct',
+)
+SELECTION_RETURN_FEATURE = 'return_1'
 
 
 def add_relative_market_features(df):
@@ -731,6 +737,198 @@ def _stable_softmax(values):
     return probabilities / probabilities.sum(dtype=np.float64)
 
 
+def extract_selection_risk_context(
+    sequences,
+    feature_names,
+    scaler,
+    lookback=20,
+):
+    """从已标准化序列恢复严格因果的反转与相关性输入。"""
+    sequences = np.asarray(sequences, dtype=np.float64)
+    if sequences.ndim != 3 or sequences.shape[0] == 0:
+        raise ValueError('风险上下文序列必须为非空 [股票, 时间, 特征] 数组')
+    if sequences.shape[2] != len(feature_names):
+        raise ValueError('风险上下文序列维度与特征名称不一致')
+    if lookback < 2 or sequences.shape[1] < lookback:
+        raise ValueError('selection_risk_lookback 超出可用序列长度')
+    required = (*SELECTION_MOMENTUM_FEATURES, SELECTION_RETURN_FEATURE)
+    missing = [name for name in required if name not in feature_names]
+    if missing:
+        raise ValueError(f'风险选择缺少特征: {missing}')
+    if not hasattr(scaler, 'mean_') or not hasattr(scaler, 'scale_'):
+        raise ValueError('风险上下文需要已拟合的 StandardScaler')
+
+    def inverse_feature(name):
+        index = feature_names.index(name)
+        return (
+            sequences[:, :, index] * float(scaler.scale_[index])
+            + float(scaler.mean_[index])
+        )
+
+    momentum_percentiles = np.stack([
+        inverse_feature(name)[:, -1]
+        for name in SELECTION_MOMENTUM_FEATURES
+    ], axis=1)
+    return_history = inverse_feature(SELECTION_RETURN_FEATURE)[:, -lookback:]
+    momentum_percentiles = np.nan_to_num(
+        momentum_percentiles,
+        nan=0.5,
+        posinf=1.0,
+        neginf=0.0,
+    )
+    momentum_percentiles = np.clip(momentum_percentiles, 0.0, 1.0)
+    return_history = np.nan_to_num(
+        return_history,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    return {
+        'momentum_percentiles': momentum_percentiles,
+        'return_history': return_history,
+    }
+
+
+def _positive_correlation_matrix(return_history):
+    return_history = np.asarray(return_history, dtype=np.float64)
+    if return_history.ndim != 2 or return_history.shape[1] < 2:
+        raise ValueError('return_history 必须为 [股票, 时间] 二维数组')
+    centered = return_history - return_history.mean(axis=1, keepdims=True)
+    norms = np.sqrt(np.sum(centered ** 2, axis=1, keepdims=True))
+    normalized = np.divide(
+        centered,
+        norms,
+        out=np.zeros_like(centered),
+        where=norms > 1e-12,
+    )
+    correlations = normalized @ normalized.T
+    correlations = np.clip(correlations, -1.0, 1.0)
+    np.fill_diagonal(correlations, 1.0)
+    return np.maximum(correlations, 0.0)
+
+
+def _mean_pairwise_correlation(correlations, indices):
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size < 2:
+        return 0.0
+    selected = correlations[np.ix_(indices, indices)]
+    values = selected[np.triu_indices(indices.size, k=1)]
+    return float(values.mean()) if values.size else 0.0
+
+
+def select_risk_aware_top_indices(
+    scores,
+    momentum_percentiles,
+    return_history,
+    risk_gamma=0.0,
+    candidate_k=20,
+    top_k=5,
+):
+    """从排名候选中以反转风险和历史正相关惩罚贪心选择Top-k。"""
+    scores = np.asarray(scores, dtype=np.float64)
+    momentum_percentiles = np.asarray(
+        momentum_percentiles,
+        dtype=np.float64,
+    )
+    return_history = np.asarray(return_history, dtype=np.float64)
+    if scores.ndim != 1 or scores.size < top_k:
+        raise ValueError(f'风险选择至少需要 {top_k} 只股票')
+    if momentum_percentiles.shape != (scores.size, 3):
+        raise ValueError('momentum_percentiles 必须为 [股票, 3]')
+    if return_history.ndim != 2 or return_history.shape[0] != scores.size:
+        raise ValueError('return_history 股票维度与分数不一致')
+    if risk_gamma < 0:
+        raise ValueError('selection_risk_gamma 不能为负')
+    candidate_k = min(int(candidate_k), scores.size)
+    if candidate_k < top_k:
+        raise ValueError('selection_candidate_k 不能小于 Top-k')
+    if not (
+        np.isfinite(scores).all()
+        and np.isfinite(momentum_percentiles).all()
+        and np.isfinite(return_history).all()
+    ):
+        raise ValueError('风险选择输入包含 NaN 或无穷值')
+
+    raw_order = np.lexsort((np.arange(scores.size), -scores))
+    raw_top_indices = raw_order[:top_k]
+    candidate_indices = raw_order[:candidate_k]
+    cs5, cs20, cs60 = momentum_percentiles.T
+    reversal_risk = (
+        0.6 * np.maximum(cs60 - cs5, 0.0)
+        + 0.4 * np.maximum(cs20 - cs5, 0.0)
+    )
+    positive_correlations = _positive_correlation_matrix(return_history)
+
+    if risk_gamma == 0.0:
+        selected = raw_top_indices.tolist()
+        selected_correlation_risks = [
+            0.0 if position == 0 else float(
+                positive_correlations[index, selected[:position]].mean()
+            )
+            for position, index in enumerate(selected)
+        ]
+    else:
+        selected = []
+        selected_correlation_risks = []
+        remaining = set(int(index) for index in candidate_indices)
+        while len(selected) < top_k:
+            best_index = None
+            best_utility = -float('inf')
+            best_correlation_risk = 0.0
+            for index in sorted(remaining):
+                correlation_risk = (
+                    0.0
+                    if not selected
+                    else float(
+                        positive_correlations[index, selected].mean()
+                    )
+                )
+                combined_risk = (
+                    0.5 * reversal_risk[index]
+                    if not selected
+                    else (
+                        0.5 * reversal_risk[index]
+                        + 0.5 * correlation_risk
+                    )
+                )
+                utility = scores[index] - risk_gamma * combined_risk
+                if (
+                    utility > best_utility
+                    or (
+                        np.isclose(utility, best_utility, rtol=0.0, atol=1e-15)
+                        and (best_index is None or index < best_index)
+                    )
+                ):
+                    best_index = index
+                    best_utility = utility
+                    best_correlation_risk = correlation_risk
+            selected.append(best_index)
+            selected_correlation_risks.append(best_correlation_risk)
+            remaining.remove(best_index)
+
+    selected = np.asarray(selected, dtype=np.int64)
+    raw_rank_by_index = np.empty(scores.size, dtype=np.int64)
+    raw_rank_by_index[raw_order] = np.arange(1, scores.size + 1)
+    return {
+        'top_indices': selected,
+        'raw_top_indices': raw_top_indices,
+        'selected_raw_ranks': raw_rank_by_index[selected],
+        'reversal_risk': reversal_risk[selected],
+        'correlation_risk': np.asarray(
+            selected_correlation_risks,
+            dtype=np.float64,
+        ),
+        'mean_positive_correlation': _mean_pairwise_correlation(
+            positive_correlations,
+            selected,
+        ),
+        'raw_mean_positive_correlation': _mean_pairwise_correlation(
+            positive_correlations,
+            raw_top_indices,
+        ),
+    }
+
+
 def build_ensemble_portfolio(
     score_matrix,
     allocation_matrix,
@@ -740,6 +938,9 @@ def build_ensemble_portfolio(
     allocation_temperature=1.0,
     allocation_blend=1.0,
     disagreement_gamma=0.0,
+    selection_risk_context=None,
+    selection_risk_gamma=0.0,
+    selection_candidate_k=20,
     top_k=5,
 ):
     """用 rank ensemble 选股，并按模型分歧将仓位向最低仓位收缩。"""
@@ -771,8 +972,31 @@ def build_ensemble_portfolio(
         axis=0,
     )
     ensemble_scores = percentile_matrix.mean(axis=0)
-    # lexsort 在相同 ensemble score 时按原股票顺序选择，保证完全可复现。
-    top_indices = np.lexsort((np.arange(num_stocks), -ensemble_scores))[:top_k]
+    if selection_risk_context is None:
+        if selection_risk_gamma != 0.0:
+            raise ValueError('非零 selection_risk_gamma 需要风险上下文')
+        raw_top_indices = np.lexsort(
+            (np.arange(num_stocks), -ensemble_scores)
+        )[:top_k]
+        risk_selection = {
+            'top_indices': raw_top_indices,
+            'raw_top_indices': raw_top_indices,
+            'selected_raw_ranks': np.arange(1, top_k + 1),
+            'reversal_risk': np.zeros(top_k, dtype=np.float64),
+            'correlation_risk': np.zeros(top_k, dtype=np.float64),
+            'mean_positive_correlation': 0.0,
+            'raw_mean_positive_correlation': 0.0,
+        }
+    else:
+        risk_selection = select_risk_aware_top_indices(
+            ensemble_scores,
+            selection_risk_context['momentum_percentiles'],
+            selection_risk_context['return_history'],
+            risk_gamma=selection_risk_gamma,
+            candidate_k=selection_candidate_k,
+            top_k=top_k,
+        )
+    top_indices = risk_selection['top_indices']
 
     learned_weights = np.stack([
         _stable_softmax(
@@ -814,6 +1038,16 @@ def build_ensemble_portfolio(
         'mean_disagreement': mean_disagreement,
         'base_exposure': base_exposure,
         'exposure': adjusted_exposure,
+        'raw_top_indices': risk_selection['raw_top_indices'],
+        'selected_raw_ranks': risk_selection['selected_raw_ranks'],
+        'selected_reversal_risk': risk_selection['reversal_risk'],
+        'selected_correlation_risk': risk_selection['correlation_risk'],
+        'mean_positive_correlation': risk_selection[
+            'mean_positive_correlation'
+        ],
+        'raw_mean_positive_correlation': risk_selection[
+            'raw_mean_positive_correlation'
+        ],
     }
 
 
@@ -838,6 +1072,10 @@ def align_oof_prediction_records(records_by_model, fold):
     for day_idx, prediction_date in enumerate(reference_dates):
         reference = sorted_records[0][day_idx]
         reference_stocks = np.asarray(reference['stock_indices'], dtype=np.int64)
+        has_risk_context = all(
+            key in reference
+            for key in ('momentum_percentiles', 'return_history')
+        )
         for records in sorted_records[1:]:
             stocks = np.asarray(records[day_idx]['stock_indices'], dtype=np.int64)
             if not np.array_equal(stocks, reference_stocks):
@@ -853,7 +1091,26 @@ def align_oof_prediction_records(records_by_model, fold):
                 raise ValueError(
                     f'Fold {fold} 在 {prediction_date} 的真实收益不一致'
                 )
-        days.append({
+            other_has_risk_context = all(
+                key in records[day_idx]
+                for key in ('momentum_percentiles', 'return_history')
+            )
+            if other_has_risk_context != has_risk_context:
+                raise ValueError(
+                    f'Fold {fold} 在 {prediction_date} 的风险上下文不一致'
+                )
+            if has_risk_context:
+                for key in ('momentum_percentiles', 'return_history'):
+                    if not np.allclose(
+                        records[day_idx][key],
+                        reference[key],
+                        rtol=0.0,
+                        atol=1e-8,
+                    ):
+                        raise ValueError(
+                            f'Fold {fold} 在 {prediction_date} 的 {key} 不一致'
+                        )
+        day = {
             'fold': int(fold),
             'prediction_date': prediction_date,
             'stock_indices': reference_stocks,
@@ -872,7 +1129,19 @@ def align_oof_prediction_records(records_by_model, fold):
             'exposures': np.asarray([
                 records[day_idx]['exposure'] for records in sorted_records
             ], dtype=np.float64),
-        })
+        }
+        if has_risk_context:
+            day['selection_risk_context'] = {
+                'momentum_percentiles': np.asarray(
+                    reference['momentum_percentiles'],
+                    dtype=np.float64,
+                ),
+                'return_history': np.asarray(
+                    reference['return_history'],
+                    dtype=np.float64,
+                ),
+            }
+        days.append(day)
     return days
 
 
@@ -883,6 +1152,9 @@ def summarize_ensemble_days(
     allocation_temperature,
     allocation_blend,
     disagreement_gamma,
+    selection_risk_gamma=0.0,
+    selection_candidate_k=20,
+    fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
     top_k=5,
     include_daily=False,
@@ -899,6 +1171,9 @@ def summarize_ensemble_days(
             allocation_temperature=allocation_temperature,
             allocation_blend=allocation_blend,
             disagreement_gamma=disagreement_gamma,
+            selection_risk_context=day.get('selection_risk_context'),
+            selection_risk_gamma=selection_risk_gamma,
+            selection_candidate_k=selection_candidate_k,
             top_k=top_k,
         )
         selected = portfolio['top_indices']
@@ -909,6 +1184,13 @@ def summarize_ensemble_days(
         )
         weighted_return = float(
             np.dot(portfolio['positions'], selected_returns)
+        )
+        allocation_at_exposure_contribution = float(
+            portfolio['exposure']
+            * (allocation_only_return - equal_full_return)
+        )
+        fixed_exposure_return = float(
+            fixed_exposure_baseline * allocation_only_return
         )
         rank_ic = spearmanr(
             portfolio['ensemble_scores'],
@@ -926,12 +1208,25 @@ def summarize_ensemble_days(
             'allocation_contribution': (
                 allocation_only_return - equal_full_return
             ),
+            'allocation_at_exposure_contribution': (
+                allocation_at_exposure_contribution
+            ),
             'exposure_contribution': (
                 weighted_return - allocation_only_return
             ),
+            'fixed_exposure_return': fixed_exposure_return,
             'gross_exposure': portfolio['exposure'],
             'cash_weight': 1.0 - portfolio['exposure'],
             'model_disagreement': portfolio['mean_disagreement'],
+            'mean_positive_correlation': portfolio[
+                'mean_positive_correlation'
+            ],
+            'raw_mean_positive_correlation': portfolio[
+                'raw_mean_positive_correlation'
+            ],
+            'mean_reversal_risk': float(
+                np.mean(portfolio['selected_reversal_risk'])
+            ),
             'rank_ic': float(rank_ic) if np.isfinite(rank_ic) else 0.0,
         })
 
@@ -942,6 +1237,26 @@ def summarize_ensemble_days(
     ], dtype=np.float64)
     negative_returns = np.minimum(weighted_returns, 0.0)
     downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
+    fixed_exposure_returns = np.asarray([
+        row['fixed_exposure_return'] for row in daily
+    ], dtype=np.float64)
+    fixed_negative_returns = np.minimum(fixed_exposure_returns, 0.0)
+    fixed_downside_deviation = float(np.sqrt(
+        np.mean(fixed_negative_returns ** 2)
+    ))
+    gross_exposures = np.asarray([
+        row['gross_exposure'] for row in daily
+    ], dtype=np.float64)
+    top5_returns = np.asarray([
+        row['top5_return'] for row in daily
+    ], dtype=np.float64)
+    if gross_exposures.std() < 1e-12 or top5_returns.std() < 1e-12:
+        exposure_return_correlation = 0.0
+    else:
+        exposure_return_correlation = spearmanr(
+            gross_exposures,
+            top5_returns,
+        ).statistic
 
     def mean(key):
         return float(np.mean([row[key] for row in daily]))
@@ -992,7 +1307,21 @@ def summarize_ensemble_days(
         'mean_cash_weight': mean('cash_weight'),
         'mean_model_disagreement': mean('model_disagreement'),
         'mean_allocation_contribution': mean('allocation_contribution'),
+        'mean_allocation_at_exposure_contribution': mean(
+            'allocation_at_exposure_contribution'
+        ),
         'mean_exposure_contribution': mean('exposure_contribution'),
+        'exposure_std': float(gross_exposures.std()),
+        'exposure_return_spearman': float(
+            exposure_return_correlation
+            if np.isfinite(exposure_return_correlation)
+            else 0.0
+        ),
+        'mean_positive_correlation': mean('mean_positive_correlation'),
+        'raw_mean_positive_correlation': mean(
+            'raw_mean_positive_correlation'
+        ),
+        'mean_reversal_risk': mean('mean_reversal_risk'),
         'worst_fold_weighted_portfolio_return': float(min(
             row['mean_weighted_portfolio_return'] for row in fold_summaries
         )),
@@ -1001,6 +1330,10 @@ def summarize_ensemble_days(
         )),
         'policy_objective': float(
             weighted_returns.mean() - downside_weight * downside_deviation
+        ),
+        'fixed_exposure_policy_objective': float(
+            fixed_exposure_returns.mean()
+            - downside_weight * fixed_downside_deviation
         ),
         'folds': fold_summaries,
     }
@@ -1016,6 +1349,9 @@ def calibrate_ensemble_policy(
     allocation_temperature,
     allocation_blend_grid,
     disagreement_gamma_grid,
+    selection_risk_gamma_grid=(0.0,),
+    selection_candidate_k=20,
+    fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
     top_k=5,
 ):
@@ -1023,21 +1359,26 @@ def calibrate_ensemble_policy(
     candidates = []
     for allocation_blend in allocation_blend_grid:
         for disagreement_gamma in disagreement_gamma_grid:
-            metrics = summarize_ensemble_days(
-                ensemble_days,
-                min_exposure=min_exposure,
-                max_exposure=max_exposure,
-                allocation_temperature=allocation_temperature,
-                allocation_blend=float(allocation_blend),
-                disagreement_gamma=float(disagreement_gamma),
-                downside_weight=downside_weight,
-                top_k=top_k,
-            )
-            candidates.append({
-                'allocation_blend': float(allocation_blend),
-                'disagreement_gamma': float(disagreement_gamma),
-                'metrics': metrics,
-            })
+            for selection_risk_gamma in selection_risk_gamma_grid:
+                metrics = summarize_ensemble_days(
+                    ensemble_days,
+                    min_exposure=min_exposure,
+                    max_exposure=max_exposure,
+                    allocation_temperature=allocation_temperature,
+                    allocation_blend=float(allocation_blend),
+                    disagreement_gamma=float(disagreement_gamma),
+                    selection_risk_gamma=float(selection_risk_gamma),
+                    selection_candidate_k=selection_candidate_k,
+                    fixed_exposure_baseline=fixed_exposure_baseline,
+                    downside_weight=downside_weight,
+                    top_k=top_k,
+                )
+                candidates.append({
+                    'allocation_blend': float(allocation_blend),
+                    'disagreement_gamma': float(disagreement_gamma),
+                    'selection_risk_gamma': float(selection_risk_gamma),
+                    'metrics': metrics,
+                })
     if not candidates:
         raise ValueError('ensemble policy 搜索网格不能为空')
     best = max(
@@ -1047,6 +1388,7 @@ def calibrate_ensemble_policy(
             candidate['metrics']['mean_weighted_portfolio_return'],
             -candidate['metrics']['downside_deviation'],
             -candidate['disagreement_gamma'],
+            -candidate['selection_risk_gamma'],
             -abs(candidate['allocation_blend'] - 0.5),
         ),
     )
@@ -1057,6 +1399,9 @@ def calibrate_ensemble_policy(
         allocation_temperature=allocation_temperature,
         allocation_blend=best['allocation_blend'],
         disagreement_gamma=best['disagreement_gamma'],
+        selection_risk_gamma=best['selection_risk_gamma'],
+        selection_candidate_k=selection_candidate_k,
+        fixed_exposure_baseline=fixed_exposure_baseline,
         downside_weight=downside_weight,
         top_k=top_k,
         include_daily=True,
@@ -1064,6 +1409,9 @@ def calibrate_ensemble_policy(
     return {
         'allocation_blend': best['allocation_blend'],
         'disagreement_gamma': best['disagreement_gamma'],
+        'selection_risk_gamma': best['selection_risk_gamma'],
+        'selection_candidate_k': int(selection_candidate_k),
+        'fixed_exposure_baseline': float(fixed_exposure_baseline),
         'min_exposure': float(min_exposure),
         'max_exposure': float(max_exposure),
         'allocation_temperature': float(allocation_temperature),
