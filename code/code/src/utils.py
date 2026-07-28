@@ -3,6 +3,7 @@ import numpy as np
 import joblib
 import os
 from tqdm import tqdm
+from scipy.stats import rankdata, spearmanr
 
 # 特征工程
 def _rolling_linear_regression(x, y):
@@ -506,7 +507,7 @@ def create_ranking_dataset_vectorized(
 ):
     """
     向量化加速版本：预计算每只股票的所有滑动窗口，再按日期聚合。
-    保持与原函数完全相同的输出格式。
+    返回每日序列、标签、相关性、股票索引和预测日期。
     """
     # if ranking_data_path and os.path.exists(ranking_data_path):
     #     print(f"加载已有的排序数据集: {ranking_data_path}")
@@ -561,6 +562,7 @@ def create_ranking_dataset_vectorized(
     targets = []
     relevance_scores = []
     stock_indices = []
+    prediction_dates = []
 
     print("Step 3: 构建每日样本并计算 relevance...")
     grouped_by_date = window_df.groupby('date')
@@ -594,6 +596,7 @@ def create_ranking_dataset_vectorized(
         targets.append(day_targets)
         relevance_scores.append(relevance)
         stock_indices.append(day_stocks)
+        prediction_dates.append(pd.Timestamp(date).strftime('%Y-%m-%d'))
 
     print(f"成功创建 {len(sequences)} 个训练样本")
     if len(sequences) > 0:
@@ -605,4 +608,367 @@ def create_ranking_dataset_vectorized(
     #     joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
     #     print(f"数据集已保存到: {ranking_data_path}")
 
-    return sequences, targets, relevance_scores, stock_indices
+    return sequences, targets, relevance_scores, stock_indices, prediction_dates
+
+
+def percentile_ranks(values):
+    """将横截面分数转换为 [0, 1] 百分位，消除不同模型的分数尺度差异。"""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError('percentile_ranks 需要非空一维数组')
+    if not np.isfinite(values).all():
+        raise ValueError('排名分数包含 NaN 或无穷值')
+    if values.size == 1:
+        return np.ones(1, dtype=np.float64)
+    return (rankdata(values, method='average') - 1.0) / (values.size - 1.0)
+
+
+def _stable_softmax(values):
+    values = np.asarray(values, dtype=np.float64)
+    shifted = values - np.max(values)
+    probabilities = np.exp(shifted)
+    return probabilities / probabilities.sum(dtype=np.float64)
+
+
+def build_ensemble_portfolio(
+    score_matrix,
+    allocation_matrix,
+    exposures,
+    min_exposure,
+    max_exposure,
+    allocation_temperature=1.0,
+    allocation_blend=1.0,
+    disagreement_gamma=0.0,
+    top_k=5,
+):
+    """用 rank ensemble 选股，并按模型分歧将仓位向最低仓位收缩。"""
+    score_matrix = np.asarray(score_matrix, dtype=np.float64)
+    allocation_matrix = np.asarray(allocation_matrix, dtype=np.float64)
+    exposures = np.asarray(exposures, dtype=np.float64).reshape(-1)
+    if score_matrix.ndim != 2 or allocation_matrix.shape != score_matrix.shape:
+        raise ValueError('score_matrix 与 allocation_matrix 必须是同形二维数组')
+    num_models, num_stocks = score_matrix.shape
+    if num_models == 0 or num_stocks < top_k:
+        raise ValueError(f'集成模型为空或可选股票不足 {top_k} 只')
+    if exposures.shape != (num_models,):
+        raise ValueError('每个集成模型必须提供一个总仓位')
+    if not (
+        np.isfinite(score_matrix).all()
+        and np.isfinite(allocation_matrix).all()
+        and np.isfinite(exposures).all()
+    ):
+        raise ValueError('集成模型输出包含 NaN 或无穷值')
+    if not 0.0 <= min_exposure < max_exposure < 1.0:
+        raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
+    if allocation_temperature <= 0 or disagreement_gamma < 0:
+        raise ValueError('temperature 必须大于 0，gamma 不能为负')
+    if not 0.0 <= allocation_blend <= 1.0:
+        raise ValueError('allocation_blend 必须位于 [0, 1]')
+
+    percentile_matrix = np.stack(
+        [percentile_ranks(scores) for scores in score_matrix],
+        axis=0,
+    )
+    ensemble_scores = percentile_matrix.mean(axis=0)
+    # lexsort 在相同 ensemble score 时按原股票顺序选择，保证完全可复现。
+    top_indices = np.lexsort((np.arange(num_stocks), -ensemble_scores))[:top_k]
+
+    learned_weights = np.stack([
+        _stable_softmax(
+            allocation_matrix[model_idx, top_indices] / allocation_temperature
+        )
+        for model_idx in range(num_models)
+    ]).mean(axis=0)
+    equal_weights = np.full(top_k, 1.0 / top_k, dtype=np.float64)
+    relative_weights = (
+        allocation_blend * learned_weights
+        + (1.0 - allocation_blend) * equal_weights
+    )
+    relative_weights /= relative_weights.sum(dtype=np.float64)
+
+    selected_disagreement = percentile_matrix[:, top_indices].std(axis=0)
+    mean_disagreement = float(selected_disagreement.mean())
+    base_exposure = float(np.median(exposures))
+    base_exposure = float(np.clip(base_exposure, min_exposure, max_exposure))
+    adjusted_exposure = min_exposure + (
+        base_exposure - min_exposure
+    ) * np.exp(-disagreement_gamma * mean_disagreement)
+    adjusted_exposure = float(
+        np.clip(adjusted_exposure, min_exposure, max_exposure)
+    )
+    positions = relative_weights * adjusted_exposure
+    positions[np.argmax(positions)] += (
+        adjusted_exposure - positions.sum(dtype=np.float64)
+    )
+    if (positions < 0).any() or positions.sum(dtype=np.float64) > 1.0:
+        raise ValueError('集成仓位违反非负或总仓位不超过 1 的约束')
+
+    return {
+        'top_indices': top_indices,
+        'positions': positions,
+        'relative_weights': relative_weights,
+        'ensemble_scores': ensemble_scores,
+        'percentile_matrix': percentile_matrix,
+        'selected_disagreement': selected_disagreement,
+        'mean_disagreement': mean_disagreement,
+        'base_exposure': base_exposure,
+        'exposure': adjusted_exposure,
+    }
+
+
+def align_oof_prediction_records(records_by_model, fold):
+    """按日期和股票索引严格对齐同一折的多个随机种子 OOF 输出。"""
+    if not records_by_model:
+        raise ValueError('缺少 OOF 模型输出')
+    sorted_records = [
+        sorted(records, key=lambda record: record['prediction_date'])
+        for records in records_by_model
+    ]
+    reference_dates = [
+        record['prediction_date'] for record in sorted_records[0]
+    ]
+    if not reference_dates:
+        raise ValueError(f'Fold {fold} 没有 OOF 记录')
+
+    days = []
+    for records in sorted_records[1:]:
+        if [record['prediction_date'] for record in records] != reference_dates:
+            raise ValueError(f'Fold {fold} 的多模型 OOF 日期不一致')
+    for day_idx, prediction_date in enumerate(reference_dates):
+        reference = sorted_records[0][day_idx]
+        reference_stocks = np.asarray(reference['stock_indices'], dtype=np.int64)
+        for records in sorted_records[1:]:
+            stocks = np.asarray(records[day_idx]['stock_indices'], dtype=np.int64)
+            if not np.array_equal(stocks, reference_stocks):
+                raise ValueError(
+                    f'Fold {fold} 在 {prediction_date} 的股票顺序不一致'
+                )
+            if not np.allclose(
+                records[day_idx]['targets'],
+                reference['targets'],
+                rtol=0.0,
+                atol=1e-8,
+            ):
+                raise ValueError(
+                    f'Fold {fold} 在 {prediction_date} 的真实收益不一致'
+                )
+        days.append({
+            'fold': int(fold),
+            'prediction_date': prediction_date,
+            'stock_indices': reference_stocks,
+            'targets': np.asarray(reference['targets'], dtype=np.float64),
+            'scores': np.stack([
+                np.asarray(records[day_idx]['scores'], dtype=np.float64)
+                for records in sorted_records
+            ]),
+            'allocation_logits': np.stack([
+                np.asarray(
+                    records[day_idx]['allocation_logits'],
+                    dtype=np.float64,
+                )
+                for records in sorted_records
+            ]),
+            'exposures': np.asarray([
+                records[day_idx]['exposure'] for records in sorted_records
+            ], dtype=np.float64),
+        })
+    return days
+
+
+def summarize_ensemble_days(
+    ensemble_days,
+    min_exposure,
+    max_exposure,
+    allocation_temperature,
+    allocation_blend,
+    disagreement_gamma,
+    downside_weight=0.5,
+    top_k=5,
+    include_daily=False,
+):
+    """计算 OOF ensemble 的收益分解、下行风险和 Rank IC。"""
+    daily = []
+    for day in ensemble_days:
+        portfolio = build_ensemble_portfolio(
+            day['scores'],
+            day['allocation_logits'],
+            day['exposures'],
+            min_exposure=min_exposure,
+            max_exposure=max_exposure,
+            allocation_temperature=allocation_temperature,
+            allocation_blend=allocation_blend,
+            disagreement_gamma=disagreement_gamma,
+            top_k=top_k,
+        )
+        selected = portfolio['top_indices']
+        selected_returns = day['targets'][selected]
+        equal_full_return = float(selected_returns.mean())
+        allocation_only_return = float(
+            np.dot(portfolio['relative_weights'], selected_returns)
+        )
+        weighted_return = float(
+            np.dot(portfolio['positions'], selected_returns)
+        )
+        rank_ic = spearmanr(
+            portfolio['ensemble_scores'],
+            day['targets'],
+        ).statistic
+        daily.append({
+            'fold': int(day['fold']),
+            'prediction_date': day['prediction_date'],
+            'top5_return': equal_full_return,
+            'equal_weight_at_exposure_return': (
+                equal_full_return * portfolio['exposure']
+            ),
+            'allocation_only_return': allocation_only_return,
+            'weighted_portfolio_return': weighted_return,
+            'allocation_contribution': (
+                allocation_only_return - equal_full_return
+            ),
+            'exposure_contribution': (
+                weighted_return - allocation_only_return
+            ),
+            'gross_exposure': portfolio['exposure'],
+            'cash_weight': 1.0 - portfolio['exposure'],
+            'model_disagreement': portfolio['mean_disagreement'],
+            'rank_ic': float(rank_ic) if np.isfinite(rank_ic) else 0.0,
+        })
+
+    if not daily:
+        raise ValueError('没有可用于汇总的 ensemble OOF 日期')
+    weighted_returns = np.asarray([
+        row['weighted_portfolio_return'] for row in daily
+    ], dtype=np.float64)
+    negative_returns = np.minimum(weighted_returns, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
+
+    def mean(key):
+        return float(np.mean([row[key] for row in daily]))
+
+    fold_rows = {}
+    for row in daily:
+        fold_rows.setdefault(row['fold'], []).append(row)
+    fold_summaries = [
+        {
+            'fold': int(fold),
+            'mean_top5_return': float(np.mean([
+                row['top5_return'] for row in rows
+            ])),
+            'mean_weighted_portfolio_return': float(np.mean([
+                row['weighted_portfolio_return'] for row in rows
+            ])),
+            'worst_weighted_portfolio_return': float(np.min([
+                row['weighted_portfolio_return'] for row in rows
+            ])),
+            'mean_rank_ic': float(np.mean([
+                row['rank_ic'] for row in rows
+            ])),
+            'positive_rate': float(np.mean(np.asarray([
+                row['weighted_portfolio_return'] for row in rows
+            ]) > 0.0)),
+            'num_evaluation_dates': len(rows),
+        }
+        for fold, rows in sorted(fold_rows.items())
+    ]
+    summary = {
+        'num_evaluation_dates': len(daily),
+        'mean_top5_return': mean('top5_return'),
+        'mean_equal_weight_at_exposure_return': mean(
+            'equal_weight_at_exposure_return'
+        ),
+        'mean_allocation_only_return': mean('allocation_only_return'),
+        'mean_weighted_portfolio_return': float(weighted_returns.mean()),
+        'worst_weighted_portfolio_return': float(weighted_returns.min()),
+        'p10_weighted_portfolio_return': float(
+            np.quantile(weighted_returns, 0.10)
+        ),
+        'std_weighted_portfolio_return': float(weighted_returns.std()),
+        'positive_rate': float(np.mean(weighted_returns > 0.0)),
+        'downside_deviation': downside_deviation,
+        'mean_rank_ic': mean('rank_ic'),
+        'worst_rank_ic': float(min(row['rank_ic'] for row in daily)),
+        'mean_gross_exposure': mean('gross_exposure'),
+        'mean_cash_weight': mean('cash_weight'),
+        'mean_model_disagreement': mean('model_disagreement'),
+        'mean_allocation_contribution': mean('allocation_contribution'),
+        'mean_exposure_contribution': mean('exposure_contribution'),
+        'worst_fold_weighted_portfolio_return': float(min(
+            row['mean_weighted_portfolio_return'] for row in fold_summaries
+        )),
+        'worst_fold_top5_return': float(min(
+            row['mean_top5_return'] for row in fold_summaries
+        )),
+        'policy_objective': float(
+            weighted_returns.mean() - downside_weight * downside_deviation
+        ),
+        'folds': fold_summaries,
+    }
+    if include_daily:
+        summary['daily'] = daily
+    return summary
+
+
+def calibrate_ensemble_policy(
+    ensemble_days,
+    min_exposure,
+    max_exposure,
+    allocation_temperature,
+    allocation_blend_grid,
+    disagreement_gamma_grid,
+    downside_weight=0.5,
+    top_k=5,
+):
+    """仅用 OOF 收益网格选择 allocation 混合与分歧降仓强度。"""
+    candidates = []
+    for allocation_blend in allocation_blend_grid:
+        for disagreement_gamma in disagreement_gamma_grid:
+            metrics = summarize_ensemble_days(
+                ensemble_days,
+                min_exposure=min_exposure,
+                max_exposure=max_exposure,
+                allocation_temperature=allocation_temperature,
+                allocation_blend=float(allocation_blend),
+                disagreement_gamma=float(disagreement_gamma),
+                downside_weight=downside_weight,
+                top_k=top_k,
+            )
+            candidates.append({
+                'allocation_blend': float(allocation_blend),
+                'disagreement_gamma': float(disagreement_gamma),
+                'metrics': metrics,
+            })
+    if not candidates:
+        raise ValueError('ensemble policy 搜索网格不能为空')
+    best = max(
+        candidates,
+        key=lambda candidate: (
+            candidate['metrics']['policy_objective'],
+            candidate['metrics']['mean_weighted_portfolio_return'],
+            -candidate['metrics']['downside_deviation'],
+            -candidate['disagreement_gamma'],
+            -abs(candidate['allocation_blend'] - 0.5),
+        ),
+    )
+    best_metrics = summarize_ensemble_days(
+        ensemble_days,
+        min_exposure=min_exposure,
+        max_exposure=max_exposure,
+        allocation_temperature=allocation_temperature,
+        allocation_blend=best['allocation_blend'],
+        disagreement_gamma=best['disagreement_gamma'],
+        downside_weight=downside_weight,
+        top_k=top_k,
+        include_daily=True,
+    )
+    return {
+        'allocation_blend': best['allocation_blend'],
+        'disagreement_gamma': best['disagreement_gamma'],
+        'min_exposure': float(min_exposure),
+        'max_exposure': float(max_exposure),
+        'allocation_temperature': float(allocation_temperature),
+        'top_k': int(top_k),
+        'downside_weight': float(downside_weight),
+        'selection_metric': 'mean_return_minus_downside_weight_times_deviation',
+        'oof_metrics': best_metrics,
+        'grid_results': candidates,
+    }
