@@ -5,6 +5,107 @@ import os
 from tqdm import tqdm
 from scipy.stats import rankdata, spearmanr
 
+RELATIVE_MARKET_FEATURE_SET = '158+39_reduced25_relmarket12'
+RELATIVE_MARKET_FEATURES = (
+    'cs_return_5_pct',
+    'cs_return_20_pct',
+    'cs_return_60_pct',
+    'cs_volatility_20_pct',
+    'cs_volume_ratio_20_pct',
+    'cs_ma20_distance_pct',
+    'cs_ma60_distance_pct',
+    'market_return_5',
+    'market_return_20',
+    'market_breadth_up',
+    'market_breadth_above_ma20',
+    'market_return_20_dispersion',
+)
+
+
+def add_relative_market_features(df):
+    """增加严格因果的同日横截面相对特征与市场状态特征。"""
+    required = {'股票代码', '日期', '收盘', '成交量'}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f'相对市场特征缺少基础列: {sorted(missing)}')
+
+    panel = df.copy()
+    panel['日期'] = pd.to_datetime(panel['日期'])
+    panel['收盘'] = pd.to_numeric(panel['收盘'], errors='coerce')
+    panel['成交量'] = pd.to_numeric(panel['成交量'], errors='coerce')
+    panel = panel.sort_values(['股票代码', '日期'])
+
+    stock_codes = panel['股票代码']
+    dates = panel['日期']
+    close_by_stock = panel.groupby(stock_codes, sort=False)['收盘']
+    volume_by_stock = panel.groupby(stock_codes, sort=False)['成交量']
+
+    return_1 = close_by_stock.pct_change(periods=1, fill_method=None)
+    return_5 = close_by_stock.pct_change(periods=5, fill_method=None)
+    return_20 = close_by_stock.pct_change(periods=20, fill_method=None)
+    return_60 = close_by_stock.pct_change(periods=60, fill_method=None)
+    volatility_20 = return_1.groupby(
+        stock_codes,
+        sort=False,
+    ).transform(lambda values: values.rolling(20, min_periods=20).std())
+    volume_ma20 = volume_by_stock.transform(
+        lambda values: values.rolling(20, min_periods=20).mean()
+    )
+    close_ma20 = close_by_stock.transform(
+        lambda values: values.rolling(20, min_periods=20).mean()
+    )
+    close_ma60 = close_by_stock.transform(
+        lambda values: values.rolling(60, min_periods=60).mean()
+    )
+    volume_ratio_20 = panel['成交量'] / volume_ma20.replace(0.0, np.nan) - 1.0
+    ma20_distance = panel['收盘'] / close_ma20.replace(0.0, np.nan) - 1.0
+    ma60_distance = panel['收盘'] / close_ma60.replace(0.0, np.nan) - 1.0
+
+    relative_sources = {
+        'cs_return_5_pct': return_5,
+        'cs_return_20_pct': return_20,
+        'cs_return_60_pct': return_60,
+        'cs_volatility_20_pct': volatility_20,
+        'cs_volume_ratio_20_pct': volume_ratio_20,
+        'cs_ma20_distance_pct': ma20_distance,
+        'cs_ma60_distance_pct': ma60_distance,
+    }
+    for name, values in relative_sources.items():
+        # 缺少足够历史的股票不参与当日排名，并用中性百分位填充。
+        panel[name] = values.groupby(dates).rank(
+            method='average',
+            pct=True,
+        ).fillna(0.5)
+
+    panel['market_return_5'] = return_5.groupby(dates).transform('mean')
+    panel['market_return_20'] = return_20.groupby(dates).transform('mean')
+
+    up_indicator = return_1.gt(0.0).astype(float).where(return_1.notna())
+    above_ma20_indicator = (
+        ma20_distance.gt(0.0).astype(float).where(ma20_distance.notna())
+    )
+    panel['market_breadth_up'] = up_indicator.groupby(dates).transform('mean')
+    panel['market_breadth_above_ma20'] = (
+        above_ma20_indicator.groupby(dates).transform('mean')
+    )
+
+    market_return_20_mean = return_20.groupby(dates).transform('mean')
+    panel['market_return_20_dispersion'] = (
+        (return_20 - market_return_20_mean)
+        .pow(2)
+        .groupby(dates)
+        .transform('mean')
+        .pow(0.5)
+    )
+
+    panel[list(RELATIVE_MARKET_FEATURES)] = (
+        panel[list(RELATIVE_MARKET_FEATURES)]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    return panel.sort_index()
+
+
 # 特征工程
 def _rolling_linear_regression(x, y):
     x = np.vstack([np.ones(len(x)), x]).T
