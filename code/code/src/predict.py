@@ -106,6 +106,49 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 	return np.asarray(sequences, dtype=np.float32), sequence_stock_ids, sequence_stock_indices
 
 
+def build_bounded_positions(scores, allocation_logits, exposure, top_k=5):
+	"""按 ranking score 选股，并将相对权重严格缩放到 Exposure Head 总仓位。"""
+	min_exposure = float(config.get('min_exposure', 0.80))
+	max_exposure = float(config.get('max_exposure', 0.999999))
+	temperature = float(config.get('allocation_temperature', 1.0))
+	if not 0.0 <= min_exposure < max_exposure < 1.0:
+		raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
+	if temperature <= 0:
+		raise ValueError('allocation_temperature 必须大于 0')
+
+	scores = np.asarray(scores, dtype=np.float64)
+	allocation_logits = np.asarray(allocation_logits, dtype=np.float64)
+	if scores.ndim != 1 or allocation_logits.shape != scores.shape:
+		raise ValueError('ranking score 与 allocation logits 必须是一维同形数组')
+	if len(scores) < top_k:
+		raise ValueError(f'可预测股票不足{top_k}只，当前仅有 {len(scores)} 只')
+	if not np.isfinite(scores).all() or not np.isfinite(allocation_logits).all():
+		raise ValueError('模型输出包含 NaN 或无穷值')
+	if not np.isfinite(exposure):
+		raise ValueError('Exposure Head 输出包含 NaN 或无穷值')
+
+	serialization_margin = 1e-10
+	safe_min_exposure = min_exposure + serialization_margin
+	safe_max_exposure = max_exposure - serialization_margin
+	if safe_min_exposure >= safe_max_exposure:
+		raise ValueError('仓位上下界过窄，无法保留序列化安全边际')
+	bounded_exposure = float(
+		np.clip(exposure, safe_min_exposure, safe_max_exposure)
+	)
+	top_indices = np.argsort(scores)[::-1][:top_k]
+	selected_logits = allocation_logits[top_indices] / temperature
+	selected_logits = selected_logits - selected_logits.max()
+	relative_weights = np.exp(selected_logits)
+	relative_weights /= relative_weights.sum(dtype=np.float64)
+	positions = relative_weights * bounded_exposure
+
+	# 消除浮点累计误差，使写盘前的股票仓位和精确等于 bounded_exposure。
+	positions[np.argmax(positions)] += bounded_exposure - positions.sum(dtype=np.float64)
+	if (positions < 0).any() or positions.sum(dtype=np.float64) > 1.0:
+		raise ValueError('生成的股票仓位违反非负或总仓位不超过1的约束')
+	return top_indices, positions, bounded_exposure
+
+
 def validate_result(output_df, candidate_stock_ids):
 	"""在写盘前后使用赛事约束校验预测结果。"""
 	required_columns = ['stock_id', 'weight']
@@ -129,6 +172,13 @@ def validate_result(output_df, candidate_stock_ids):
 	weight_sum = float(weights.sum(dtype=np.float64))
 	if weight_sum > 1.0:
 		raise ValueError(f'结果权重和不能超过1，当前为 {weight_sum:.12f}')
+	min_exposure = float(config.get('min_exposure', 0.80))
+	max_exposure = float(config.get('max_exposure', 0.999999))
+	if weight_sum < min_exposure or weight_sum > max_exposure:
+		raise ValueError(
+			f'结果总仓位必须位于 [{min_exposure}, {max_exposure}]，'
+			f'当前为 {weight_sum:.12f}'
+		)
 
 	return weight_sum
 
@@ -188,19 +238,25 @@ def main():
 		x = torch.from_numpy(sequences_np).unsqueeze(0).to(device)  # [1, N, L, F]
 		stock_index_tensor = torch.LongTensor(sequence_stock_indices).unsqueeze(0).to(device)
 		stock_mask = torch.ones_like(stock_index_tensor, dtype=torch.float32)
-		score_output, _ = model(x, stock_index_tensor, stock_mask)
+		score_output, _, allocation_output, exposure_output = model(
+			x,
+			stock_index_tensor,
+			stock_mask,
+		)
 		scores = score_output.squeeze(0).detach().cpu().numpy()
+		allocation_logits = allocation_output.squeeze(0).detach().cpu().numpy()
+		exposure = float(exposure_output.squeeze(0).detach().cpu().item())
 
-	order = np.argsort(scores)[::-1]
-	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
-
-	# 排序分数只用于选股；组合严格使用等权，和交叉验证口径一致。
-	if len(ranked_stock_ids) < 5:
-		raise ValueError(f'可预测股票不足5只，当前仅有 {len(ranked_stock_ids)} 只')
-	top5 = ranked_stock_ids[:5]
+	top_indices, position_weights, exposure = build_bounded_positions(
+		scores,
+		allocation_logits,
+		exposure,
+		top_k=5,
+	)
+	top5 = [sequence_stock_ids[i] for i in top_indices]
 	output_df = pd.DataFrame({
 		'stock_id': top5,
-		'weight': [0.2] * 5,
+		'weight': position_weights,
 	})
 	validate_result(output_df, stock_ids)
 	os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -211,8 +267,9 @@ def main():
 	weight_sum = validate_result(written_df, stock_ids)
 
 	print(f'预测日期: {latest_date.date()}')
-	print(f'参与排序股票数: {len(ranked_stock_ids)}')
+	print(f'参与排序股票数: {len(sequence_stock_ids)}')
 	print(f'提交权重和: {weight_sum:.12f}')
+	print(f'现金权重: {1.0 - weight_sum:.12f}')
 	print(f'结果已写入: {output_path}')
 
 
