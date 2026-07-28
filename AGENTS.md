@@ -14,6 +14,8 @@ checkpoints from different architectures or input dimensions are incompatible.
 
 ## Git workflow
 
+- Make production implementation changes directly on `main`; do not create or
+  switch to feature branches unless the user explicitly requests one.
 - Keep commits small and focused, and push completed commits promptly.
 - Create a descriptive Git tag for every new model/code version before comparing or sharing its results.
 
