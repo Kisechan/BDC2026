@@ -3,7 +3,7 @@
 本项目是一个面向沪深300成分股的**排序学习选股**方案：
 - 输入：每只股票过去60个交易日的量价特征序列，以及独立的股票 ID；
 - 模型：`StockTransformer`，使用股票 ID Embedding、时序编码和股票间注意力；
-- 输出：每只股票的 ranking score 和辅助收益预测，最终选择 Top-5 组合。
+- 输出：ranking score 选择 Top-5，Allocation Head 分配相对权重，Exposure Head 决定总仓位，回归头提供辅助收益预测。
 
 ---
 
@@ -16,8 +16,8 @@
 2. 做特征工程（39特征或`158+39`特征）；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
 4. 按实际交易日构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
-5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC 和原始收益 SmoothL1 回归损失；
-6. 汇总平均/最差折 Top-5、Rank IC 和泛化差距；随后取各折最佳 epoch
+5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、相对仓位和总仓位损失；
+6. 汇总平均/最差折 Top-5、动态权重组合收益、Rank IC 和泛化差距；随后取各折最佳 epoch
    中位数与最小全量轮数的较大值，用全部标签有效样本重训最终模型。
 
 ---
@@ -29,7 +29,8 @@
 - 序列长度 `sequence_length`（默认60）；
 - 模型超参数（`d_model`、`nhead`、`num_layers` 等）；
 - 训练超参数（`batch_size`、`max_epochs`、`patience`、`learning_rate`、`weight_decay`）；
-- 排序损失权重参数（`pairwise_weight`、`top5_weight`、`base_weight`）；
+- 排序与仓位损失参数（`pairwise_weight`、`top5_weight`、`base_weight`、
+  `allocation_weight`、`exposure_weight` 及相应 temperature）；
 - 多折切分、ID 正则化与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、
   `id_dropout`、`embedding_dropout`、`regression_weight`）；
 - 数据路径和输出路径（默认输出到 `output/`）。
@@ -41,10 +42,12 @@
 - `FeatureAttention`：对时间维特征做注意力聚合；
 - 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做 dropout；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
-- `score_head` 与 `return_head`：分别输出排序分数和原始收益预测。
+- `score_head` 与 `return_head`：分别输出排序分数和原始收益预测；
+- `allocation_head`：输出 Top-5 内的相对仓位 logits；
+- `exposure_head`：输出 `[0.80, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
 
-输入包含特征张量、股票索引和有效股票 mask；模型返回两个
-`[batch, num_stocks]` 张量，分别对应排序分数和预测收益。
+输入包含特征张量、股票索引和有效股票 mask；模型返回排序分数、预测收益、
+相对仓位 logits 三个 `[batch, num_stocks]` 张量，以及一个 `[batch]` 总仓位张量。
 
 ### [utils.py](utils.py)
 包含特征工程与数据集构建逻辑：
@@ -73,11 +76,13 @@
 	- 将整数排名转成排名百分位，用 `listwise_temperature` 平滑目标分布，并通过 `listwise_weight` 控制 Listwise 尺度；
 	- 组合归一化 `listwise_loss`、RankNet `pairwise_loss`、Rank IC 相关性损失与原始收益 SmoothL1 辅助损失；
 	- 对真实Top-k样本施加更高权重。
-	- TensorBoard 分别记录四个加权损失分量，便于检查目标是否失衡。
+	- TensorBoard 分别记录六个加权损失分量，便于检查目标是否失衡。
+	- `allocation_loss` 监督 ranking head 当前 Top-5 内的相对仓位分布；
+	- `exposure_loss` 根据该 Top-5 的真实平均收益监督总仓位。
 - 评估指标：`calculate_ranking_metrics()`
-	- 计算等权 Top-5 收益、Rank IC、回归 MAE 和原有归一化指标；
+	- 计算等权 Top-5 收益、动态权重组合收益、总仓位、现金、最大单股仓位、Rank IC、回归 MAE 和原有归一化指标；
 	- 汇总多折均值、最差折表现及训练—验证差距。
-	- checkpoint 使用 `top5_return + checkpoint_rank_ic_weight * rank_ic` 组合指标。
+	- checkpoint 使用 `weighted_portfolio_return + checkpoint_rank_ic_weight * rank_ic` 组合指标，使选中股票后的权重头也参与模型选择。
 
 训练产物：
 - `fold_N/best_model.pth`、`fold_N/scaler.pkl`、`fold_N/metrics.json`：逐折产物；
@@ -94,12 +99,13 @@
 2. 执行与训练一致的特征工程；
 3. 加载 `scaler.pkl` 进行特征标准化；
 4. 用 `best_model.pth` 对全部可预测股票打分；
-5. 按分数降序取前5只，输出到 `output.csv`：
+5. 按 ranking score 降序取前5只，用 Allocation Head 的 softmax 权重乘 Exposure Head 总仓位，输出到 `result.csv`：
 	 - `stock_id`
-	 - `weight`（固定等权 `0.2`）
+	 - `weight`（5只股票之和严格位于 `[0.80, 0.999999]`）
 
 写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
-避免浮点序列化导致提交权重超过 1。
+避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
+`1 - sum(weight)`。
 
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：
