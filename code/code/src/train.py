@@ -117,7 +117,10 @@ class WeightedRankingLoss(nn.Module):
     def __init__(self, listwise_temperature=0.2, listwise_weight=0.2, k=5,
                  weight_factor=2.0, pairwise_weight=1,
                  base_weight=1.0, regression_weight=0.2, regression_beta=0.02,
-                 ic_weight=0.2):
+                 ic_weight=0.2, allocation_weight=0.1, exposure_weight=1.0,
+                 allocation_temperature=1.0, allocation_target_temperature=0.02,
+                 exposure_target_temperature=0.02, min_exposure=0.80,
+                 max_exposure=0.999999):
         super(WeightedRankingLoss, self).__init__()
         if listwise_temperature <= 0:
             raise ValueError('listwise_temperature 必须大于 0')
@@ -130,6 +133,21 @@ class WeightedRankingLoss(nn.Module):
         self.regression_weight = regression_weight
         self.regression_beta = regression_beta
         self.ic_weight = ic_weight
+        self.allocation_weight = allocation_weight
+        self.exposure_weight = exposure_weight
+        self.allocation_temperature = allocation_temperature
+        self.allocation_target_temperature = allocation_target_temperature
+        self.exposure_target_temperature = exposure_target_temperature
+        self.min_exposure = min_exposure
+        self.max_exposure = max_exposure
+        if min(
+            allocation_temperature,
+            allocation_target_temperature,
+            exposure_target_temperature,
+        ) <= 0:
+            raise ValueError('仓位损失的 temperature 必须大于 0')
+        if not 0.0 <= min_exposure < max_exposure < 1.0:
+            raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -189,8 +207,52 @@ class WeightedRankingLoss(nn.Module):
         ).clamp(min=1e-12)
         correlation = numerator / denominator
         return (1.0 - correlation).mean()
+
+    def allocation_and_exposure_loss(
+        self,
+        y_pred,
+        allocation_logits,
+        exposure,
+        raw_returns,
+    ):
+        """监督预测 Top-k 内的相对权重，并根据该组合真实收益监督总仓位。"""
+        k = min(self.k, y_pred.size(1))
+        selected_indices = torch.topk(y_pred.detach(), k, dim=1).indices
+        selected_allocation_logits = allocation_logits.gather(1, selected_indices)
+        selected_returns = raw_returns.gather(1, selected_indices)
+
+        target_relative_weights = F.softmax(
+            selected_returns / self.allocation_target_temperature,
+            dim=1,
+        )
+        predicted_log_weights = F.log_softmax(
+            selected_allocation_logits / self.allocation_temperature,
+            dim=1,
+        )
+        allocation_loss = -(
+            target_relative_weights * predicted_log_weights
+        ).sum(dim=1).mean()
+
+        selected_mean_return = selected_returns.mean(dim=1)
+        target_exposure_ratio = torch.sigmoid(
+            selected_mean_return / self.exposure_target_temperature
+        )
+        target_exposure = self.min_exposure + (
+            self.max_exposure - self.min_exposure
+        ) * target_exposure_ratio
+        exposure_loss = F.mse_loss(exposure.reshape(-1), target_exposure)
+        return allocation_loss, exposure_loss
         
-    def forward(self, y_pred, y_true, predicted_returns, raw_returns, return_components=False):
+    def forward(
+        self,
+        y_pred,
+        y_true,
+        predicted_returns,
+        raw_returns,
+        allocation_logits,
+        exposure,
+        return_components=False,
+    ):
         """
         y_pred: [batch, num_items]
         y_true: [batch, num_items] (真实涨跌幅)
@@ -215,6 +277,12 @@ class WeightedRankingLoss(nn.Module):
             raw_returns,
             beta=self.regression_beta,
         )
+        allocation, exposure_loss = self.allocation_and_exposure_loss(
+            y_pred,
+            allocation_logits,
+            exposure,
+            raw_returns,
+        )
         
         # 排序为主任务，原始收益回归为辅助任务。
         components = {
@@ -222,13 +290,24 @@ class WeightedRankingLoss(nn.Module):
             'pairwise_loss': self.pairwise_weight * pairwise,
             'ic_loss': self.ic_weight * rank_ic,
             'regression_loss': self.regression_weight * regression,
+            'allocation_loss': self.allocation_weight * allocation,
+            'exposure_loss': self.exposure_weight * exposure_loss,
         }
         total_loss = sum(components.values())
         if return_components:
             return total_loss, components
         return total_loss
 
-def calculate_ranking_metrics(y_pred, y_true, masks, predicted_returns=None, k=5):
+def calculate_ranking_metrics(
+    y_pred,
+    y_true,
+    masks,
+    predicted_returns=None,
+    allocation_logits=None,
+    exposures=None,
+    allocation_temperature=1.0,
+    k=5,
+):
     """计算新的评估指标：Top 5 收益之和，以及与理论最高值和随机值的比值"""
     batch_size = y_pred.size(0)
     
@@ -242,6 +321,10 @@ def calculate_ranking_metrics(y_pred, y_true, masks, predicted_returns=None, k=5
     final_score_list = []
     
     return_mae_list = []
+    weighted_portfolio_return_list = []
+    gross_exposure_list = []
+    cash_weight_list = []
+    max_position_list = []
     for i in range(batch_size):
         mask = masks[i]
         valid_indices = mask.nonzero().squeeze()
@@ -261,6 +344,22 @@ def calculate_ranking_metrics(y_pred, y_true, masks, predicted_returns=None, k=5
         _, pred_indices = torch.topk(valid_pred, k)
         pred_top_returns = valid_true[pred_indices]
         pred_return_sum = pred_top_returns.sum().item()
+
+        if allocation_logits is not None and exposures is not None:
+            valid_allocation_logits = allocation_logits[i][valid_indices]
+            selected_allocation_logits = valid_allocation_logits[pred_indices]
+            relative_weights = F.softmax(
+                selected_allocation_logits / allocation_temperature,
+                dim=0,
+            )
+            gross_exposure = exposures[i].clamp(min=0.0, max=1.0)
+            positions = relative_weights * gross_exposure
+            weighted_portfolio_return_list.append(
+                torch.sum(positions * pred_top_returns).item()
+            )
+            gross_exposure_list.append(gross_exposure.item())
+            cash_weight_list.append((1.0 - gross_exposure).item())
+            max_position_list.append(positions.max().item())
 
         rank_ic = spearmanr(
             valid_pred.detach().cpu().numpy(),
@@ -298,6 +397,13 @@ def calculate_ranking_metrics(y_pred, y_true, masks, predicted_returns=None, k=5
         'return_mae': np.mean(return_mae_list) if return_mae_list else 0.0,
         'max_return_sum': np.mean(max_return_sum_list) if max_return_sum_list else 0.0,
         'random_return_sum': np.mean(random_return_sum_list) if random_return_sum_list else 0.0,
+        'weighted_portfolio_return': (
+            np.mean(weighted_portfolio_return_list)
+            if weighted_portfolio_return_list else 0.0
+        ),
+        'gross_exposure': np.mean(gross_exposure_list) if gross_exposure_list else 0.0,
+        'cash_weight': np.mean(cash_weight_list) if cash_weight_list else 0.0,
+        'max_position': np.mean(max_position_list) if max_position_list else 0.0,
     }
     
     # 比值用逐样本均值，降低极端日影响
@@ -397,12 +503,17 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
         optimizer.zero_grad()
         
         # 模型预测
-        outputs, return_outputs = model(sequences, stock_indices, masks)
+        outputs, return_outputs, allocation_outputs, exposures = model(
+            sequences,
+            stock_indices,
+            masks,
+        )
         
         # 应用mask，只考虑有效股票
         masked_outputs = outputs * masks + (1 - masks) * (-1e9)  # 无效位置设为很小的值
         masked_targets = targets * masks
         masked_return_outputs = return_outputs * masks
+        masked_allocation_outputs = allocation_outputs * masks
         masked_relevance = relevance.float() * masks  # 使用预处理好的相关性得分
         
         # 计算损失（只对有效股票计算）
@@ -424,6 +535,7 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
             valid_pred = masked_outputs[i][valid_indices]
             valid_relevance = masked_relevance[i][valid_indices]
             valid_return_pred = masked_return_outputs[i][valid_indices]
+            valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
             valid_raw_return = masked_targets[i][valid_indices]
             
             if len(valid_pred) > 1:
@@ -433,6 +545,8 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
                     valid_relevance.unsqueeze(0),
                     valid_return_pred.unsqueeze(0),
                     valid_raw_return.unsqueeze(0),
+                    valid_allocation_logits.unsqueeze(0),
+                    exposures[i].reshape(1),
                     return_components=True,
                 )
                 batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
@@ -462,6 +576,9 @@ def train_ranking_model(model, dataloader, criterion, optimizer, device, epoch, 
                     masked_targets,
                     masks,
                     predicted_returns=masked_return_outputs,
+                    allocation_logits=masked_allocation_outputs,
+                    exposures=exposures,
+                    allocation_temperature=config.get('allocation_temperature', 1.0),
                     k=5,
                 )
                 for k, v in metrics.items():
@@ -504,12 +621,17 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
             masks = batch['masks'].to(device)
             
             # 模型预测
-            outputs, return_outputs = model(sequences, stock_indices, masks)
+            outputs, return_outputs, allocation_outputs, exposures = model(
+                sequences,
+                stock_indices,
+                masks,
+            )
             
             # 应用mask
             masked_outputs = outputs * masks + (1 - masks) * (-1e9)
             masked_targets = targets * masks
             masked_return_outputs = return_outputs * masks
+            masked_allocation_outputs = allocation_outputs * masks
             
             # 计算损失
             batch_loss = None
@@ -528,6 +650,7 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                 valid_pred = masked_outputs[i][valid_indices]
                 valid_true = masked_targets[i][valid_indices]
                 valid_return_pred = masked_return_outputs[i][valid_indices]
+                valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
                 
                 if len(valid_pred) > 1:
                     _, sorted_indices = torch.sort(valid_true, descending=True)
@@ -540,6 +663,8 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                         relevance_scores.unsqueeze(0),
                         valid_return_pred.unsqueeze(0),
                         valid_true.unsqueeze(0),
+                        valid_allocation_logits.unsqueeze(0),
+                        exposures[i].reshape(1),
                     )
                     batch_loss = batch_loss + loss if batch_loss is not None else loss
             
@@ -553,6 +678,9 @@ def evaluate_ranking_model(model, dataloader, criterion, device, writer, epoch):
                 masked_targets,
                 masks,
                 predicted_returns=masked_return_outputs,
+                allocation_logits=masked_allocation_outputs,
+                exposures=exposures,
+                allocation_temperature=config.get('allocation_temperature', 1.0),
                 k=5,
             )
             for k, v in metrics.items():
@@ -612,17 +740,32 @@ def predict_top_stocks(model, data, features, sequence_length, scaler, stockid2i
     
     with torch.no_grad():
         # 模型预测
-        outputs, _ = model(sequences, stock_indices, stock_mask)  # [1, num_stocks]
+        outputs, _, allocation_logits, exposures = model(
+            sequences,
+            stock_indices,
+            stock_mask,
+        )
         scores = outputs.squeeze().cpu().numpy()  # [num_stocks]
+        allocation_scores = allocation_logits.squeeze(0)
         
         # 获取排名前top_k的股票
         top_indices = np.argsort(scores)[::-1][:top_k]
+        top_index_tensor = torch.as_tensor(top_indices, device=device)
+        relative_weights = F.softmax(
+            allocation_scores[top_index_tensor]
+            / config.get('allocation_temperature', 1.0),
+            dim=0,
+        )
+        position_weights = (relative_weights * exposures[0]).cpu().numpy()
         
         top_stocks = []
         for idx in top_indices:
             top_stocks.append({
                 'stock_code': day_stock_codes[idx],
                 'predicted_score': scores[idx],
+                'weight': float(position_weights[len(top_stocks)]),
+                'exposure': float(exposures[0].item()),
+                'cash_weight': float(1.0 - exposures[0].item()),
                 'rank': len(top_stocks) + 1
             })
     
@@ -635,7 +778,8 @@ def save_predictions(top_stocks, output_path):
         results.append({
             '排名': stock['rank'],
             '股票代码': stock['stock_code'],
-            '预测分数': stock['predicted_score']
+            '预测分数': stock['predicted_score'],
+            '权重': stock['weight'],
         })
     
     df = pd.DataFrame(results)
@@ -686,6 +830,13 @@ def build_training_components(model):
         regression_weight=config['regression_weight'],
         regression_beta=config['regression_beta'],
         ic_weight=config.get('ic_weight', 0.2),
+        allocation_weight=config.get('allocation_weight', 0.1),
+        exposure_weight=config.get('exposure_weight', 1.0),
+        allocation_temperature=config.get('allocation_temperature', 1.0),
+        allocation_target_temperature=config.get('allocation_target_temperature', 0.02),
+        exposure_target_temperature=config.get('exposure_target_temperature', 0.02),
+        min_exposure=config.get('min_exposure', 0.80),
+        max_exposure=config.get('max_exposure', 0.999999),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -803,6 +954,8 @@ def train_one_fold(full_data, features, fold, num_stocks, device, output_dir):
             f"train_loss={train_loss:.4f}, eval_loss={eval_loss:.4f}, "
             f"val_top5={eval_metrics.get('top5_return', 0.0):.6f}, "
             f"val_rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}, "
+            f"val_weighted_return={eval_metrics.get('weighted_portfolio_return', 0.0):.6f}, "
+            f"val_exposure={eval_metrics.get('gross_exposure', 0.0):.4f}, "
             f"checkpoint_score={current_score:.6f}"
         )
 
@@ -917,8 +1070,12 @@ def train_final_model(
             f"pairwise={train_metrics.get('pairwise_loss', 0.0):.4f}, "
             f"ic_loss={train_metrics.get('ic_loss', 0.0):.4f}, "
             f"regression={train_metrics.get('regression_loss', 0.0):.4f}, "
+            f"allocation={train_metrics.get('allocation_loss', 0.0):.4f}, "
+            f"exposure_loss={train_metrics.get('exposure_loss', 0.0):.4f}, "
             f"top5={train_metrics.get('top5_return', 0.0):.6f}, "
-            f"rank_ic={train_metrics.get('rank_ic', 0.0):.4f}"
+            f"rank_ic={train_metrics.get('rank_ic', 0.0):.4f}, "
+            f"weighted_return={train_metrics.get('weighted_portfolio_return', 0.0):.6f}, "
+            f"exposure={train_metrics.get('gross_exposure', 0.0):.4f}"
         )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
