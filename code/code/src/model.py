@@ -68,11 +68,20 @@ class StockTransformer(nn.Module):
         self.num_stocks = num_stocks
         emb_dim = emb_dim or config.get('stock_embedding_dim', 16)
         self.id_dropout = config.get('id_dropout', 0.0)
+        self.id_gate_enabled = bool(config.get('id_gate_enabled', False))
 
         # 0: padding，1: 未登录股票，已知股票从 2 开始编号。
         self.stock_embedding = nn.Embedding(num_stocks + 2, emb_dim, padding_idx=0)
         self.embedding_dropout = nn.Dropout(config.get('embedding_dropout', 0.0))
         self.stock_embedding_proj = nn.Linear(emb_dim, config['d_model'])
+        if self.id_gate_enabled:
+            gate_init = float(config.get('id_gate_init', 0.20))
+            if not 0.0 < gate_init < 1.0:
+                raise ValueError('id_gate_init 必须位于 (0, 1)')
+            self.identity_gate_logit = nn.Parameter(torch.tensor(
+                math.log(gate_init / (1.0 - gate_init)),
+                dtype=torch.float32,
+            ))
         
         # 输入投影层
         self.input_proj = nn.Linear(input_dim, config['d_model'])
@@ -135,8 +144,40 @@ class StockTransformer(nn.Module):
         self.max_exposure = float(config.get('max_exposure', 0.999999))
         if not 0.0 <= self.min_exposure < self.max_exposure < 1.0:
             raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
+        self.exposure_market_encoder_enabled = bool(
+            config.get('exposure_market_encoder_enabled', False)
+        )
+        exposure_input_dim = config['d_model'] // 2
+        if self.exposure_market_encoder_enabled:
+            market_feature_indices = [
+                int(index)
+                for index in config.get('market_state_feature_indices', [])
+            ]
+            if not market_feature_indices:
+                raise ValueError(
+                    '启用 Exposure 市场编码器时必须配置 market_state_feature_indices'
+                )
+            if min(market_feature_indices) < 0 or max(market_feature_indices) >= input_dim:
+                raise ValueError('market_state_feature_indices 超出输入特征范围')
+            market_hidden_size = int(
+                config.get('exposure_market_hidden_size', 16)
+            )
+            if market_hidden_size < 1:
+                raise ValueError('exposure_market_hidden_size 必须大于 0')
+            self.register_buffer(
+                'market_state_feature_indices',
+                torch.tensor(market_feature_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.exposure_market_encoder = nn.GRU(
+                input_size=len(market_feature_indices),
+                hidden_size=market_hidden_size,
+                num_layers=1,
+                batch_first=True,
+            )
+            exposure_input_dim += market_hidden_size
         self.exposure_head = nn.Sequential(
-            nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
+            nn.Linear(exposure_input_dim, config['d_model'] // 4),
             nn.ReLU(),
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1),
@@ -152,6 +193,12 @@ class StockTransformer(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    def identity_gate_value(self):
+        """返回ID分支的有效缩放；旧配置保持原来的1.0。"""
+        if not self.id_gate_enabled:
+            return self.stock_embedding.weight.new_tensor(1.0)
+        return torch.sigmoid(self.identity_gate_logit)
     
     def forward(self, src, stock_indices, stock_mask=None):
         # src: [batch, num_stocks, seq_len, feature_dim]
@@ -182,7 +229,10 @@ class StockTransformer(nn.Module):
             embedding_indices = stock_indices.masked_fill(id_drop_mask, 1)
         stock_embeddings = self.embedding_dropout(self.stock_embedding(embedding_indices))
         identity_features = self.stock_embedding_proj(stock_embeddings)
-        stock_features = stock_features + identity_features
+        stock_features = (
+            stock_features
+            + self.identity_gate_value() * identity_features
+        )
         
         # 股票间交互注意力
         interactive_features = self.cross_stock_attention(
@@ -215,7 +265,28 @@ class StockTransformer(nn.Module):
                 (ranking_features_by_stock * valid_mask).sum(dim=1)
                 / valid_mask.sum(dim=1).clamp(min=1.0)
             )
-        raw_exposure = torch.sigmoid(self.exposure_head(pooled_market_features)).squeeze(-1)
+        exposure_features = pooled_market_features
+        if self.exposure_market_encoder_enabled:
+            market_values = src.index_select(
+                -1,
+                self.market_state_feature_indices,
+            )
+            if stock_mask is None:
+                market_sequence = market_values.mean(dim=1)
+            else:
+                market_mask = stock_mask.to(market_values.dtype)[:, :, None, None]
+                market_sequence = (
+                    (market_values * market_mask).sum(dim=1)
+                    / market_mask.sum(dim=1).clamp(min=1.0)
+                )
+            _, market_hidden = self.exposure_market_encoder(market_sequence)
+            exposure_features = torch.cat(
+                [pooled_market_features, market_hidden[-1]],
+                dim=-1,
+            )
+        raw_exposure = torch.sigmoid(
+            self.exposure_head(exposure_features)
+        ).squeeze(-1)
         exposure = self.min_exposure + (
             self.max_exposure - self.min_exposure
         ) * raw_exposure
