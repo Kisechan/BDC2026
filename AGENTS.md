@@ -7,8 +7,10 @@ after removing a further five linear duplicates (`high_low_spread`,
 `open_close_spread`, `high_close_spread`, `low_close_spread`, and `kdj_j`).
 The active `158+39_reduced25_relmarket12` experiment has 178 inputs after adding
 seven causal cross-sectional percentile features and five causal market-state
-features. Keep each experiment's model directory separate, because checkpoints
-from different input dimensions are incompatible.
+features. The active model experiment is `idgate_reversal_diverse_heads_v2`;
+it keeps the same 178 continuous inputs but changes the model heads and
+selection policy. Keep each experiment's model directory separate, because
+checkpoints from different architectures or input dimensions are incompatible.
 
 ## Git workflow
 

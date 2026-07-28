@@ -2,7 +2,7 @@
 
 本项目是一个面向沪深300成分股的**排序学习选股**方案：
 - 输入：每只股票过去60个交易日的量价特征序列，以及独立的股票 ID；
-- 模型：`StockTransformer`，使用股票 ID Embedding、时序编码和股票间注意力；
+- 模型：`StockTransformer`，使用受门控约束的股票 ID Embedding、时序编码和股票间注意力；
 - 输出：ranking score 选择 Top-5，Allocation Head 分配相对权重，Exposure Head 决定总仓位，回归头提供辅助收益预测。
 
 ---
@@ -16,9 +16,10 @@
 2. 做单股量价特征工程，并增加同日横截面相对特征与市场状态特征；
 3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
 4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
-5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、相对仓位和总仓位损失；
+5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、Top-20
+   相对仓位和风险感知总仓位损失；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存三组 OOF 输出并标定
-   Allocation 与等权的混合比例；
+   Allocation 与等权的混合比例，以及反转/相关性风险惩罚；
 7. 取三个最佳 epoch 的中位数与最小全量轮数的较大值，用全部标签有效样本
    重训一个最终模型。
 
@@ -38,10 +39,12 @@
 - 排序与仓位损失参数（`pairwise_weight`、`top5_weight`、`base_weight`、
   `allocation_weight`、`exposure_weight` 及相应 temperature）；
 - 多折切分、ID 正则化与辅助回归参数（`num_folds`、`validation_months`、`purge_days`、
-  `id_dropout`、`embedding_dropout`、`regression_weight`）；
+  `id_dropout`、`embedding_dropout`、`id_gate_init`、`id_gate_regularization`、
+  `regression_weight`）；
 - 单种子/可选多种子模式、周频验证与 OOF 策略网格（`seed`、
   `ensemble_enabled`、`ensemble_seeds`、`evaluation_stride`、
-  `allocation_blend_grid`、`disagreement_gamma_grid`）；
+  `allocation_blend_grid`、`disagreement_gamma_grid`、
+  `selection_risk_gamma_grid`）；
 - CUDA AMP、TF32、fused AdamW、pinned memory 和 non-blocking 传输开关；
 - 数据路径和输出路径（默认输出到 `output/`）。
 
@@ -50,11 +53,14 @@
 - `PositionalEncoding`：时序位置编码；
 - 时序编码器 `TransformerEncoder`：提取单股票历史序列表示；
 - `FeatureAttention`：对时间维特征做注意力聚合；
-- 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做 dropout；
+- 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做
+  dropout；可学习门控初值为0.20并带平方正则，限制 ID 分支影响；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
 - `score_head` 与 `return_head`：分别输出排序分数和原始收益预测；
-- `allocation_head`：输出 Top-5 内的相对仓位 logits；
-- `exposure_head`：输出 `[0.20, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
+- `allocation_head`：输出相对仓位 logits，训练监督覆盖预测 Top-20，最终只在
+  风险感知 Top-5 中重新 softmax；
+- `exposure_head`：将股票池聚合表示与5维市场状态序列的单层 GRU 表示拼接，输出
+  `[0.20, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
 
 输入包含特征张量、股票索引和有效股票 mask；模型返回排序分数、预测收益、
 相对仓位 logits 三个 `[batch, num_stocks]` 张量，以及一个 `[batch]` 总仓位张量。
@@ -67,7 +73,9 @@
 - `add_relative_market_features()`：在单股特征合并后增加7个同日横截面百分位和
   5个市场状态特征；所有输入只依赖当前及过去行情；
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
-- rank ensemble、OOF 对齐、收益分解和策略网格标定函数。
+- rank ensemble、OOF 对齐、收益分解和策略网格标定函数；
+- 风险感知 Top-5：从排名前20名候选中，使用5/20/60日横截面动量反转风险和
+  过去20日收益正相关进行因果约束；`selection_risk_gamma=0` 完全复现原始 Top-5。
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
 原 `RSQR5/10/20/30/60` 的滚动索引实现会使绝大部分结果变成 NaN 后填 0，
@@ -92,7 +100,8 @@
 	  5 个交易日抽取的非重叠日期；
 	- 三折完成后统一选择最终 epoch，重新拟合一个全量 scaler，并训练一个最终模型；
 	- 将 `ensemble_enabled=True` 可恢复三种子 × 三折及三个全量模型的稳健性实验；
-	- 当前使用 `learning_rate=3e-5`、`patience=12` 和 `id_dropout=0.1`，让验证折有更充分的改善机会，同时减弱股票 ID 正则化。
+	- 当前使用 `learning_rate=3e-5`、`patience=12`、`id_dropout=0.2`、
+	  `embedding_dropout=0.1` 和 ID 门控，降低股票代码记忆风险。
 	- CUDA 上使用 AMP 加速 Transformer 前向，排序和仓位损失保持 FP32；同时按配置启用 TF32、fused AdamW、pinned memory 与 non-blocking 传输。
 - 数据集组织：
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
@@ -100,13 +109,18 @@
 	- 将整数排名转成排名百分位，用 `listwise_temperature` 平滑目标分布，并通过 `listwise_weight` 控制 Listwise 尺度；
 	- 组合归一化 `listwise_loss`、RankNet `pairwise_loss`、Rank IC 相关性损失与原始收益 SmoothL1 辅助损失；
 	- 对真实Top-k样本施加更高权重。
-	- TensorBoard 分别记录六个加权损失分量，便于检查目标是否失衡。
-	- `allocation_loss` 监督 ranking head 当前 Top-5 内的相对仓位分布；
-	- `exposure_loss` 根据该 Top-5 的真实平均收益监督总仓位。
+	- TensorBoard分别记录各加权损失分量与ID门控正则，便于检查目标是否失衡；
+	- `allocation_loss` 监督 ranking head 当前 Top-20 内的相对仓位分布，目标收益
+	  先裁剪至 `[-10%, 10%]`；
+	- `exposure_loss` 使用 Top-5 收益、全市场收益和 Top-5 下行波动构造软目标，
+	  并以 BCE 训练总仓位。
 - 评估指标：`calculate_ranking_metrics()`
 	- 计算等权 Top-5 收益、动态权重组合收益、总仓位、现金、最大单股仓位、Rank IC、回归 MAE 和原有归一化指标；
 	- 分离等权满仓、等权同仓位、Allocation 与 Exposure 的收益贡献；
-	- 汇总均值、最差折、P10、标准差、正收益率、下行波动及模型排名分歧。
+	- 汇总均值、最差折、P10、标准差、正收益率、下行波动、组合相关性、反转风险
+	  及模型排名分歧；
+	- 每折最佳 checkpoint 额外执行真实 ID、全 UNK 和固定置换 ID 评估，报告分数
+	  相关性、Top-5 重合率及收益变化。
 	- checkpoint 使用 `weighted_portfolio_return + checkpoint_rank_ic_weight * rank_ic` 组合指标，使选中股票后的权重头也参与模型选择。
 
 训练产物：
@@ -119,6 +133,9 @@
 - `config.json`：训练时配置快照；
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
+当前模型输出目录为
+`model/60_158+39_reduced25_relmarket12_idgate_reversal_diverse_heads_v2/`。
+
 ### [predict.py](predict.py)
 推理主脚本，流程：
 1. 加载历史数据，取最新交易日；
@@ -126,15 +143,17 @@
 3. 从模型目录加载训练时 `config.json` 和全量 `scaler.pkl`，源码参数漂移只报告、不参与模型构造；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
-5. 选择 Top-5。集成模式会平均各模型 Allocation 分布，并可按模型排名分歧将
-   总仓位向 0.20 收缩，输出到 `result.csv`：
+5. 从排名前20名候选中按 OOF 选择的反转/相关性惩罚贪心选择 Top-5。集成模式会
+   平均各模型 Allocation 分布，并可按模型排名分歧将总仓位向0.20收缩，输出到
+   `result.csv`：
 	 - `stock_id`
 	 - `weight`（5只股票之和严格位于 `[0.20, 0.999999]`）
 
 写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
-Top-5、排名分歧、策略参数、股票仓位和现金。
+Top-5、原始 Top-5、选择前后名次、ID 消融、反转风险、组合相关性、策略参数、
+股票仓位和现金。
 
 `sequence_length=60` 不代表模型只看到两个月的信息：单日输入已包含最长60日窗口
 特征，再拼接60个时点后，最早的显式输入可追溯到`t-119`，覆盖约120个行情观测；
@@ -207,5 +226,5 @@ wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
 3) GPU/CPU自动选择  
 代码会按 `CUDA -> MPS -> CPU` 顺序自动选择设备；无GPU时可直接CPU运行。
 CUDA 默认启用 AMP、TF32、fused AdamW、pinned memory 和 non-blocking
-传输；若 8 GB 显存仍出现 OOM，只需将 `batch_size` 从 8 降回 4，不要关闭
+传输；若 8 GB 显存仍出现 OOM，可将 `batch_size` 从 12 降至 8 或 4，不要关闭
 损失 FP32 或修改模型维度。
