@@ -10,12 +10,12 @@ seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
 market-pressure features. The active model experiment is
-`regime_lambdarank_staged_v5_tail5_exposureblend_decay5y`; it keeps the 1/3-day
-risk heads and adds a holding-period-aligned 5-day downside head, while retaining
-the market regime gate, Allocation Head, and Exposure Head. Risk-head gradients
-remain isolated from Ranking, five-year ranking samples remain recency weighted,
-and OOF now calibrates both score risk and the blend between the learned Exposure
-Head and the fixed-exposure baseline.
+`nested_oof_diverse_tailregime_v6_decay5y`; it keeps the 1/3/5-day soft risk
+heads and adds a five-day tail-event head, while retaining the market regime
+gate, Allocation Head, and Exposure Head. Risk-head gradients remain isolated
+from Ranking, five-year ranking samples remain recency weighted, strategy
+promotion uses nested cross-fitted OOF, and Top-5 construction enforces a
+20/60-day correlation-cluster cap.
 Keep each experiment's
 model directory separate, because
 checkpoints from different architectures or input dimensions are incompatible.
@@ -26,6 +26,12 @@ checkpoints from different architectures or input dimensions are incompatible.
   switch to feature branches unless the user explicitly requests one.
 - Keep commits small and focused, and push completed commits promptly.
 - Create a descriptive Git tag for every new model/code version before comparing or sharing its results.
+- Use patch tags (`v1.N.x`) for training acceleration, bug fixes,
+  compatibility work, and other small behavior adjustments. Use the next minor
+  version (`v1.(N+1)`) only for a new model objective, validation protocol, or
+  major portfolio algorithm.
+- Every tag must accurately describe the scope of its changes; ordinary
+  optimizations must not advance the minor version.
 
 ## File organization
 

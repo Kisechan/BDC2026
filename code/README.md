@@ -17,9 +17,9 @@
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
 4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
-   回归；随后冻结Ranking主干，独立训练1/3日风险头和市场状态门控；
-6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存三组 OOF 输出并标定
-   Allocation 与等权的混合比例、风险分数惩罚，以及反转/相关性风险惩罚；
+   回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
+6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
+   每次只用另外两折标定 Allocation/Exposure 混合、风险与反转参数，再在留出折评估；
 7. 每折依次训练 Ranking、Risk/Regime、Allocation、Exposure；三折后把各阶段
    最佳optimizer更新步数中位数换算成全量epoch，进行四阶段全量重训。
 
@@ -59,8 +59,10 @@
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
 - `score_head` 与 `return_head`：分别输出5日Alpha分数和原始收益预测；
 - `risk_1d_head`、`risk_3d_head`、`risk_5d_head`：分别预测1、3、5日软下跌概率；
-- 独立 `regime_market_encoder`：用市场压力序列生成状态门控；风险强度不再固定
-  写入模型分数，而是仅通过OOF网格校准；
+- `tail_5d_head`：直接预测 `future_return_5d <= -3%`，四个风险头按
+  `0.15/0.20/0.30/0.35` 固定融合；
+- 独立 `regime_market_encoder`：用未来市场平均收益和跌超3%的横截面扩散率监督
+  市场压力门控；风险强度不再固定写入模型分数，而是仅通过OOF网格校准；
 - `allocation_head`：输出相对仓位 logits，训练监督覆盖预测 Top-20，最终只在
   风险感知 Top-5 中重新 softmax；
 - `exposure_head`：将股票池聚合表示、13维市场序列及Top-5分数离散度拼接，并通过
@@ -79,8 +81,9 @@
   5个市场状态特征；所有输入只依赖当前及过去行情；
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
 - rank ensemble、OOF 对齐、收益分解和策略网格标定函数；
-- 风险感知 Top-5：从排名前20名候选中，使用5/20/60日横截面动量反转风险和
-  过去20日收益正相关进行因果约束；`selection_risk_gamma=0` 完全复现原始 Top-5。
+- 风险感知 Top-5：从排名前30名候选中使用5/20/60日横截面动量反转风险；
+  同时以过去20日和60日相关性的最大值构图，相关系数不低于0.60的连通簇最多
+  入选2只。关闭簇约束且`selection_risk_gamma=0`时完整复现旧选择逻辑。
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
 原 `RSQR5/10/20/30/60` 的滚动索引实现会使绝大部分结果变成 NaN 后填 0，
@@ -155,7 +158,7 @@
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
 当前模型输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_regime_lambdarank_staged_v5_tail5_exposureblend_decay5y/`。
+`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_diverse_tailregime_v6_decay5y/`。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
@@ -164,8 +167,9 @@
 3. 从模型目录加载训练时 `config.json` 和全量 `scaler.pkl`，源码参数漂移只报告、不参与模型构造；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
-5. 先按OOF选择的短期风险分数惩罚调整Ranking百分位，再从前20名候选中按OOF
-   选择的反转/相关性惩罚贪心选择Top-5。集成模式会
+5. 先按全量OOF部署策略选择的短期/尾部风险分数惩罚调整Ranking百分位，再从
+   前30名候选中按反转软惩罚及20/60日相关簇硬上限贪心选择Top-5。交叉拟合
+   OOF只用于晋级评估，全量OOF策略只用于部署。集成模式会
    平均各模型 Allocation 分布，并可按模型排名分歧将总仓位向0.20收缩，输出到
    `result.csv`：
 	 - `stock_id`
@@ -174,8 +178,8 @@
 写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
-Top-5、原始 Top-5、选择前后名次、ID 消融、反转风险、组合相关性、策略参数、
-1/3日风险、市场状态门控、股票仓位和现金。
+Top-5、原始 Top-5、选择前后名次、相关簇编号、ID 消融、反转风险、组合相关性、
+策略参数、1/3/5日软风险、5日尾部事件风险、市场状态门控、股票仓位和现金。
 
 `sequence_length=60` 不代表模型只看到两个月的信息：单日输入已包含最长60日窗口
 特征，再拼接60个时点后，最早的显式输入可追溯到`t-119`，覆盖约120个行情观测；
