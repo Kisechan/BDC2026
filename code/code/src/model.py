@@ -401,68 +401,83 @@ class StockTransformer(nn.Module):
                 )
             )
 
-        ranking_features_by_stock = ranking_features.view(batch_size, num_stocks, -1)
-        if stock_mask is None:
-            pooled_market_features = ranking_features_by_stock.mean(dim=1)
-        else:
-            valid_mask = stock_mask.to(ranking_features_by_stock.dtype).unsqueeze(-1)
-            pooled_market_features = (
-                (ranking_features_by_stock * valid_mask).sum(dim=1)
-                / valid_mask.sum(dim=1).clamp(min=1.0)
+        # Exposure 的 GRU、组合摘要和 BCE 输入保持 FP32。该分支很小，
+        # 关闭 autocast 几乎不影响吞吐，但可避免 FP16 循环计算溢出。
+        with torch.autocast(device_type=src.device.type, enabled=False):
+            ranking_features_by_stock = ranking_features.float().view(
+                batch_size,
+                num_stocks,
+                -1,
             )
-        exposure_features = pooled_market_features
-        if self.exposure_market_encoder_enabled:
-            market_sequence = self._market_sequence(
-                src,
-                stock_mask,
-                self.market_state_feature_indices,
-            )
-            _, market_hidden = self.exposure_market_encoder(market_sequence)
-            exposure_features = torch.cat(
-                [pooled_market_features, market_hidden[-1]],
-                dim=-1,
-            )
-        if self.exposure_portfolio_summary_enabled:
-            top_k = min(5, num_stocks)
-            selection_scores = output
-            if stock_mask is not None:
-                selection_scores = selection_scores.masked_fill(
-                    ~stock_mask.bool(),
-                    -torch.inf,
+            if stock_mask is None:
+                pooled_market_features = ranking_features_by_stock.mean(dim=1)
+            else:
+                valid_mask = stock_mask.to(
+                    ranking_features_by_stock.dtype
+                ).unsqueeze(-1)
+                pooled_market_features = (
+                    (ranking_features_by_stock * valid_mask).sum(dim=1)
+                    / valid_mask.sum(dim=1).clamp(min=1.0)
                 )
-            top_indices = torch.topk(
-                selection_scores.detach(),
-                top_k,
-                dim=1,
-            ).indices
-            selected_risk_1d = torch.sigmoid(risk_1d_logits).gather(
-                1,
-                top_indices,
+            exposure_features = pooled_market_features
+            if self.exposure_market_encoder_enabled:
+                market_sequence = self._market_sequence(
+                    src.float(),
+                    stock_mask,
+                    self.market_state_feature_indices,
+                )
+                _, market_hidden = self.exposure_market_encoder(
+                    market_sequence
+                )
+                exposure_features = torch.cat(
+                    [pooled_market_features, market_hidden[-1]],
+                    dim=-1,
+                )
+            if self.exposure_portfolio_summary_enabled:
+                top_k = min(5, num_stocks)
+                selection_scores = output.float()
+                if stock_mask is not None:
+                    selection_scores = selection_scores.masked_fill(
+                        ~stock_mask.bool(),
+                        -torch.inf,
+                    )
+                top_indices = torch.topk(
+                    selection_scores.detach(),
+                    top_k,
+                    dim=1,
+                ).indices
+                selected_risk_1d = torch.sigmoid(
+                    risk_1d_logits.float()
+                ).gather(1, top_indices)
+                selected_risk_3d = torch.sigmoid(
+                    risk_3d_logits.float()
+                ).gather(1, top_indices)
+                selected_combined_risk = combined_risk.float().gather(
+                    1,
+                    top_indices,
+                )
+                selected_scores = selection_scores.gather(1, top_indices)
+                portfolio_summary = torch.stack([
+                    regime_gate.float(),
+                    selected_risk_1d.mean(dim=1),
+                    selected_risk_3d.mean(dim=1),
+                    selected_combined_risk.max(dim=1).values,
+                    selected_scores.std(dim=1, unbiased=False),
+                ], dim=1)
+                exposure_features = torch.cat(
+                    [exposure_features, portfolio_summary],
+                    dim=-1,
+                )
+            raw_exposure = torch.sigmoid(
+                self.exposure_head(exposure_features)
+            ).squeeze(-1)
+            exposure = self.min_exposure + (
+                self.max_exposure - self.min_exposure
+            ) * raw_exposure
+            exposure = exposure.clamp(
+                min=self.min_exposure,
+                max=self.max_exposure,
             )
-            selected_risk_3d = torch.sigmoid(risk_3d_logits).gather(
-                1,
-                top_indices,
-            )
-            selected_combined_risk = combined_risk.gather(1, top_indices)
-            selected_scores = output.gather(1, top_indices)
-            portfolio_summary = torch.stack([
-                regime_gate,
-                selected_risk_1d.mean(dim=1),
-                selected_risk_3d.mean(dim=1),
-                selected_combined_risk.max(dim=1).values,
-                selected_scores.std(dim=1, unbiased=False),
-            ], dim=1)
-            exposure_features = torch.cat(
-                [exposure_features, portfolio_summary],
-                dim=-1,
-            )
-        raw_exposure = torch.sigmoid(
-            self.exposure_head(exposure_features)
-        ).squeeze(-1)
-        exposure = self.min_exposure + (
-            self.max_exposure - self.min_exposure
-        ) * raw_exposure
-        exposure = exposure.clamp(min=self.min_exposure, max=self.max_exposure)
 
         if return_aux:
             return (

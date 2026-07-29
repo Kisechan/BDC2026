@@ -76,6 +76,16 @@ def cast_auxiliary_outputs_to_float(auxiliary_outputs):
     }
 
 
+def optimizer_parameters_with_grad(optimizer):
+    """只返回当前阶段优化器实际管理且已经产生梯度的参数。"""
+    return [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group['params']
+        if parameter.grad is not None
+    ]
+
+
 feature_cloums_map = {
     '39': ['开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅','sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv','volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',  'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'],
 
@@ -1202,7 +1212,10 @@ def train_ranking_model(
             grad_scaler.scale(batch_loss).backward()
             if config.get('grad_clip', True):
                 grad_scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    optimizer_parameters_with_grad(optimizer),
+                    config['max_grad_norm'],
+                )
                 if writer:
                     writer.add_scalar(
                         f'{stage}/train/grad_norm',
@@ -1780,6 +1793,9 @@ def configure_model_for_stage(model, stage):
             parameter.requires_grad = is_allocation
         else:
             parameter.requires_grad = is_exposure
+    # optimizer.zero_grad() 只清理当前优化器参数；阶段切换时必须主动清除
+    # 上一阶段残留梯度，防止其参与后续诊断或裁剪。
+    model.zero_grad(set_to_none=True)
 
 
 def set_model_stage_mode(model, stage, training):
