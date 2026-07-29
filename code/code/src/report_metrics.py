@@ -74,13 +74,33 @@ def print_cross_validation() -> None:
                 f"{float(summary['mean_model_disagreement']):.4f}"
             )
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
+    if "risk_score_penalty" in summary:
+        print(
+            "OOF Allocation混合/风险分数惩罚/选择gamma/相关性降仓: "
+            f"{float(summary.get('allocation_blend', 0.0)):.2f} / "
+            f"{float(summary['risk_score_penalty']):.2f} / "
+            f"{float(summary.get('selection_risk_gamma', 0.0)):.2f} / "
+            f"{float(summary.get('correlation_exposure_gamma', 0.0)):.2f}"
+        )
     random_baselines = []
+    policy_folds = {
+        int(row["fold"]): row
+        for row in summary.get("ensemble_oof", {}).get("folds", [])
+    }
     for fold in summary.get("folds", []):
         metrics = fold["val_metrics"]
         # random_return_sum is the expected sum of five randomly selected
         # stocks' returns, so divide it by five to compare with Top-5 mean.
         random_top5 = float(metrics["random_return_sum"]) / 5.0
-        top5_return = float(metrics["top5_return"])
+        policy_fold = policy_folds.get(int(fold["fold"]), {})
+        top5_return = float(policy_fold.get(
+            "mean_top5_return",
+            metrics["top5_return"],
+        ))
+        rank_ic = float(policy_fold.get(
+            "mean_rank_ic",
+            metrics["rank_ic"],
+        ))
         random_baselines.append(random_top5)
         print(
             f"  Seed {fold.get('base_seed', '-')} Fold {fold['fold']} "
@@ -88,7 +108,7 @@ def print_cross_validation() -> None:
             f"Top-5 {_pct(top5_return)}, "
             f"随机/全池等权 {_pct(random_top5)}, "
             f"超额 {_pct(top5_return - random_top5)}, "
-            f"Rank IC {float(metrics['rank_ic']):+.4f}"
+            f"Rank IC {rank_ic:+.4f}"
         )
     if random_baselines:
         mean_random = float(np.mean(random_baselines))

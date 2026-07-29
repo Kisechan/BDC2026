@@ -90,6 +90,9 @@ def resume_training_enabled():
     return os.environ.get('RESUME_TRAINING', '0') == '1'
 
 
+TRAINING_STAGES = ('ranking', 'risk', 'allocation', 'exposure')
+
+
 feature_cloums_map = {
     '39': ['开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅','sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv','volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',  'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'],
 
@@ -630,6 +633,7 @@ class WeightedRankingLoss(nn.Module):
                 'ic_loss': self.ic_weight * rank_ic,
                 'regression_loss': self.regression_weight * regression,
             })
+        if stage in {'risk', 'joint'}:
             if (
                 risk_1d_logits is not None
                 and risk_1d_targets is not None
@@ -905,6 +909,33 @@ class RankingDataset(torch.utils.data.Dataset):
         }
         if len(lengths) != 1:
             raise ValueError('排序数据集各字段长度不一致')
+        half_life = float(config.get(
+            'ranking_recency_half_life_days',
+            0.0,
+        ))
+        if half_life < 0:
+            raise ValueError('ranking_recency_half_life_days 不能为负')
+        if half_life == 0 or not prediction_dates:
+            self.recency_weights = np.ones(
+                len(prediction_dates),
+                dtype=np.float32,
+            )
+        else:
+            parsed_dates = pd.DatetimeIndex(pd.to_datetime(prediction_dates))
+            trading_dates = pd.DatetimeIndex(sorted(parsed_dates.unique()))
+            date_positions = {
+                date: position
+                for position, date in enumerate(trading_dates)
+            }
+            latest_position = len(trading_dates) - 1
+            ages = np.asarray([
+                latest_position - date_positions[date]
+                for date in parsed_dates
+            ], dtype=np.float64)
+            self.recency_weights = np.power(
+                0.5,
+                ages / half_life,
+            ).astype(np.float32)
     
     def __len__(self):
         return len(self.sequences)
@@ -950,6 +981,10 @@ class RankingDataset(torch.utils.data.Dataset):
                     copy=True,
                 )
             ),
+            'recency_weight': torch.tensor(
+                self.recency_weights[idx],
+                dtype=torch.float32,
+            ),
         }
 
 def collate_fn(batch):
@@ -962,6 +997,9 @@ def collate_fn(batch):
     risk_3d_targets = [item['risk_3d_targets'] for item in batch]
     regime_targets = [item['regime_targets'] for item in batch]
     prediction_dates = [item['prediction_date'] for item in batch]
+    recency_weights = torch.stack([
+        item['recency_weight'] for item in batch
+    ])
     
     # 找到最大股票数量
     max_stocks = max(seq.size(0) for seq in sequences)
@@ -1037,6 +1075,7 @@ def collate_fn(batch):
         'risk_3d_targets': torch.stack(padded_risk_3d_targets),
         'regime_targets': torch.stack(padded_regime_targets),
         'prediction_dates': prediction_dates,
+        'recency_weights': recency_weights,
     }
 
 
@@ -1110,6 +1149,10 @@ def train_ranking_model(
             batch['regime_targets'],
             device,
         )
+        recency_weights = move_batch_tensor(
+            batch['recency_weights'],
+            device,
+        )
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -1147,6 +1190,7 @@ def train_ranking_model(
         # 计算损失（只对有效股票计算）
         batch_loss = None
         batch_loss_components = {}
+        batch_weight_total = None
         batch_size = sequences.size(0)
         
         for i in range(batch_size):
@@ -1204,14 +1248,33 @@ def train_ranking_model(
                     stage=stage,
                     return_components=True,
                 )
-                batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
+                sample_weight = (
+                    recency_weights[i]
+                    if stage == 'ranking'
+                    else recency_weights.new_tensor(1.0)
+                )
+                weighted_loss = sample_weight * loss
+                batch_loss = (
+                    batch_loss + weighted_loss
+                    if isinstance(batch_loss, torch.Tensor)
+                    else weighted_loss
+                )
+                batch_weight_total = (
+                    batch_weight_total + sample_weight
+                    if isinstance(batch_weight_total, torch.Tensor)
+                    else sample_weight
+                )
                 for name, value in loss_components.items():
-                    batch_loss_components[name] = batch_loss_components.get(name, 0.0) + value
+                    batch_loss_components[name] = (
+                        batch_loss_components.get(name, 0.0)
+                        + sample_weight * value
+                    )
         
         if batch_loss is not None:
-            batch_loss = batch_loss / batch_size
+            batch_loss = batch_loss / batch_weight_total.clamp(min=1e-12)
             batch_loss_components = {
-                name: value / batch_size for name, value in batch_loss_components.items()
+                name: value / batch_weight_total.clamp(min=1e-12)
+                for name, value in batch_loss_components.items()
             }
             grad_scaler.scale(batch_loss).backward()
             if config.get('grad_clip', True):
@@ -1780,19 +1843,32 @@ def build_walk_forward_folds(df, num_folds, validation_months, purge_days):
 
 def configure_model_for_stage(model, stage):
     """冻结非当前阶段参数，并避免冻结主干的 dropout 改变候选集合。"""
-    valid_stages = {'ranking', 'allocation', 'exposure'}
+    valid_stages = set(TRAINING_STAGES)
     if stage not in valid_stages:
         raise ValueError(f'未知训练阶段: {stage}')
     allocation_prefixes = ('allocation_head.',)
     exposure_prefixes = (
         'exposure_market_encoder.',
         'exposure_head.',
+        'exposure_regime_penalty_raw',
+        'exposure_risk_penalty_raw',
+    )
+    risk_prefixes = (
+        'risk_1d_head.',
+        'risk_3d_head.',
+        'regime_market_encoder.',
+        'regime_gate_head.',
     )
     for name, parameter in model.named_parameters():
         is_allocation = name.startswith(allocation_prefixes)
         is_exposure = name.startswith(exposure_prefixes)
+        is_risk = name.startswith(risk_prefixes)
         if stage == 'ranking':
-            parameter.requires_grad = not (is_allocation or is_exposure)
+            parameter.requires_grad = not (
+                is_allocation or is_exposure or is_risk
+            )
+        elif stage == 'risk':
+            parameter.requires_grad = is_risk
         elif stage == 'allocation':
             parameter.requires_grad = is_allocation
         else:
@@ -1810,8 +1886,20 @@ def set_model_stage_mode(model, stage, training):
         model.train()
         model.allocation_head.eval()
         model.exposure_head.eval()
+        if hasattr(model, 'risk_1d_head'):
+            model.risk_1d_head.eval()
+            model.risk_3d_head.eval()
+        if hasattr(model, 'regime_market_encoder'):
+            model.regime_market_encoder.eval()
+            model.regime_gate_head.eval()
         if hasattr(model, 'exposure_market_encoder'):
             model.exposure_market_encoder.eval()
+    elif stage == 'risk':
+        model.eval()
+        model.risk_1d_head.train()
+        model.risk_3d_head.train()
+        model.regime_market_encoder.train()
+        model.regime_gate_head.train()
     elif stage == 'allocation':
         model.eval()
         model.allocation_head.train()
@@ -1941,6 +2029,11 @@ def stage_settings(stage):
             'patience': config['patience'],
             'checkpoint_metric': 'top5_return_plus_rank_ic',
         },
+        'risk': {
+            'max_epochs': 12,
+            'patience': 4,
+            'checkpoint_metric': 'negative_eval_loss',
+        },
         'allocation': {
             'max_epochs': 12,
             'patience': 4,
@@ -2022,10 +2115,13 @@ def fit_training_stage(
                 scheduler.get_last_lr()[0],
                 global_step=epoch,
             )
-        current_score = calculate_checkpoint_score(
-            eval_metrics,
-            settings['checkpoint_metric'],
-        )
+        if settings['checkpoint_metric'] == 'negative_eval_loss':
+            current_score = -float(eval_loss)
+        else:
+            current_score = calculate_checkpoint_score(
+                eval_metrics,
+                settings['checkpoint_metric'],
+            )
         location = (
             f'Fold {fold_number} '
             if fold_number is not None
@@ -2058,6 +2154,7 @@ def fit_training_stage(
         'epochs_ran': epochs_ran,
         'checkpoint_metric': settings['checkpoint_metric'],
         'checkpoint_score': float(best_score),
+        'steps_per_epoch': len(train_loader),
     }
 
 
@@ -2158,7 +2255,7 @@ def train_one_fold(
     )
     stage_results = {}
     checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
-    for stage in ('ranking', 'allocation', 'exposure'):
+    for stage in TRAINING_STAGES:
         stage_results[stage] = fit_training_stage(
             model,
             train_loader,
@@ -2278,7 +2375,7 @@ def load_completed_fold_artifacts(output_dir, fold, base_seed):
         )
     if not all(
         stage in result.get('stage_training', {})
-        for stage in ('ranking', 'allocation', 'exposure')
+        for stage in TRAINING_STAGES
     ):
         raise ValueError(f'第 {fold_number} 折恢复产物缺少阶段训练结果')
     predictions = joblib.load(artifact_paths['predictions'])
@@ -2321,14 +2418,14 @@ def train_final_model(
     stage_epochs,
     base_seed,
 ):
-    """按三折中位数依次完成 Ranking、Allocation、Exposure 全量重训。"""
+    """按各折最佳更新步数依次完成四阶段全量重训。"""
     set_seed(base_seed + 1000)
     final_dir = os.path.join(output_dir, 'full_train')
     os.makedirs(final_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=os.path.join(final_dir, 'log'))
     train_loader = build_data_loader(train_dataset, True, device)
     model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
-    stages = ('ranking', 'allocation', 'exposure')
+    stages = TRAINING_STAGES
     first_stage_index = 0
     if resume_training_enabled():
         for stage_index, stage in reversed(list(enumerate(stages))):
@@ -2419,9 +2516,9 @@ def train_final_model(
         'base_seed': int(base_seed),
         'stage_epochs': {
             stage: int(stage_epochs[stage])
-            for stage in ('ranking', 'allocation', 'exposure')
+            for stage in TRAINING_STAGES
         },
-        'epoch_selection': 'per_stage_median_across_fold_checkpoints',
+        'epoch_selection': 'per_stage_median_optimizer_updates',
         'train_end': pd.Timestamp(train_end).strftime('%Y-%m-%d'),
         'ranking_samples': len(train_dataset),
         'identity_gate': float(
@@ -2596,6 +2693,16 @@ def main():
             'selection_risk_gamma_grid',
             [0.0],
         ),
+        risk_score_penalty_grid=config.get(
+            'risk_score_penalty_grid',
+            [0.0],
+        ),
+        risk_1d_blend=float(config.get('risk_1d_blend', 0.40)),
+        risk_3d_blend=float(config.get('risk_3d_blend', 0.60)),
+        correlation_exposure_gamma_grid=config.get(
+            'correlation_exposure_gamma_grid',
+            [0.0],
+        ),
         selection_candidate_k=int(config.get(
             'selection_candidate_k',
             20,
@@ -2617,12 +2724,22 @@ def main():
                 'allocation_temperature',
                 1.0,
             ),
-            allocation_blend=1.0,
-            disagreement_gamma=0.0,
-            selection_risk_gamma=0.0,
+            allocation_blend=float(policy['allocation_blend']),
+            disagreement_gamma=float(policy['disagreement_gamma']),
+            selection_risk_gamma=float(policy['selection_risk_gamma']),
             selection_candidate_k=int(config.get(
                 'selection_candidate_k',
                 20,
+            )),
+            risk_score_penalty=float(policy.get(
+                'risk_score_penalty',
+                0.0,
+            )),
+            risk_1d_blend=float(config.get('risk_1d_blend', 0.40)),
+            risk_3d_blend=float(config.get('risk_3d_blend', 0.60)),
+            correlation_exposure_gamma=float(policy.get(
+                'correlation_exposure_gamma',
+                0.0,
             )),
             fixed_exposure_baseline=float(config.get(
                 'fixed_exposure_baseline',
@@ -2697,34 +2814,47 @@ def main():
         if key != 'applicable'
     )
 
+    full_train_dataset, full_train_end = prepare_full_training_dataset(
+        full_data=full_data,
+        features=features,
+        output_dir=output_dir,
+    )
+    full_steps_per_epoch = max(
+        1,
+        int(np.ceil(len(full_train_dataset) / config['batch_size'])),
+    )
     stage_epochs = {}
     stage_epoch_selection = {}
-    for stage in ('ranking', 'allocation', 'exposure'):
-        median_epoch = int(np.median([
-            result['stage_training'][stage]['best_epoch']
+    for stage in TRAINING_STAGES:
+        fold_best_updates = [
+            int(result['stage_training'][stage]['best_epoch'])
+            * int(result['stage_training'][stage]['steps_per_epoch'])
             for result in fold_results
-        ]))
+        ]
+        median_updates = int(np.median(fold_best_updates))
+        update_matched_epochs = max(
+            1,
+            int(np.ceil(median_updates / full_steps_per_epoch)),
+        )
         minimum_epoch = int(config.get(
             f'{stage}_min_final_epochs',
-            config.get('min_final_epochs', 1) if stage == 'ranking' else 3,
+            1,
         ))
         maximum_epoch = stage_settings(stage)['max_epochs']
         if not 1 <= minimum_epoch <= maximum_epoch:
             raise ValueError(f'{stage}_min_final_epochs 超出阶段训练范围')
         stage_epochs[stage] = min(
             maximum_epoch,
-            max(minimum_epoch, median_epoch),
+            max(minimum_epoch, update_matched_epochs),
         )
         stage_epoch_selection[stage] = {
-            'median_best_epoch': median_epoch,
+            'fold_best_updates': fold_best_updates,
+            'median_best_updates': median_updates,
+            'full_steps_per_epoch': full_steps_per_epoch,
+            'update_matched_epochs': update_matched_epochs,
             'min_final_epochs': minimum_epoch,
             'final_epochs': stage_epochs[stage],
         }
-    full_train_dataset, full_train_end = prepare_full_training_dataset(
-        full_data=full_data,
-        features=features,
-        output_dir=output_dir,
-    )
     full_training = []
     model_paths = []
     for base_seed in ensemble_seeds:
@@ -2770,6 +2900,16 @@ def main():
         'num_folds': len(folds),
         'evaluation_stride': int(config.get('evaluation_stride', 5)),
         'ensemble_seeds': ensemble_seeds,
+        'allocation_blend': float(policy['allocation_blend']),
+        'selection_risk_gamma': float(policy['selection_risk_gamma']),
+        'risk_score_penalty': float(policy.get(
+            'risk_score_penalty',
+            0.0,
+        )),
+        'correlation_exposure_gamma': float(policy.get(
+            'correlation_exposure_gamma',
+            0.0,
+        )),
         'mean_top5_return': ensemble_metrics['mean_top5_return'],
         'worst_fold_top5_return': ensemble_metrics[
             'worst_fold_top5_return'
@@ -2842,7 +2982,7 @@ def main():
         'full_training': {
             'stage_epochs': stage_epochs,
             'epoch_selection': (
-                'per_stage_median_across_all_fold_checkpoints'
+                'per_stage_median_optimizer_updates_across_folds'
             ),
             'num_fold_checkpoints': len(fold_results),
             'stage_epoch_selection': stage_epoch_selection,

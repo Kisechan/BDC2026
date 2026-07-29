@@ -247,12 +247,42 @@ class StockTransformer(nn.Module):
         self.exposure_portfolio_summary_enabled = bool(
             config.get('exposure_portfolio_summary_enabled', False)
         )
+        self.monotonic_exposure_enabled = bool(
+            config.get('monotonic_exposure_enabled', False)
+        )
         if self.exposure_portfolio_summary_enabled:
             if not self.risk_heads_enabled or not self.regime_gate_enabled:
                 raise ValueError(
                     'Exposure组合摘要需要启用风险头和市场状态门控'
                 )
-            exposure_input_dim += 5
+            # 单调模式下，压力和风险不再直接进入自由 MLP，只保留分数离散度。
+            exposure_input_dim += (
+                1 if self.monotonic_exposure_enabled else 5
+            )
+        if self.monotonic_exposure_enabled:
+            if not self.risk_heads_enabled or not self.regime_gate_enabled:
+                raise ValueError('单调 Exposure 需要风险头和市场状态门控')
+
+            def inverse_softplus(value, name):
+                value = float(value)
+                if value <= 0:
+                    raise ValueError(f'{name} 必须大于 0')
+                return math.log(math.expm1(value))
+
+            self.exposure_regime_penalty_raw = nn.Parameter(torch.tensor(
+                inverse_softplus(
+                    config.get('exposure_regime_penalty_init', 0.25),
+                    'exposure_regime_penalty_init',
+                ),
+                dtype=torch.float32,
+            ))
+            self.exposure_risk_penalty_raw = nn.Parameter(torch.tensor(
+                inverse_softplus(
+                    config.get('exposure_risk_penalty_init', 0.25),
+                    'exposure_risk_penalty_init',
+                ),
+                dtype=torch.float32,
+            ))
         self.exposure_head = nn.Sequential(
             nn.Linear(exposure_input_dim, config['d_model'] // 4),
             nn.ReLU(),
@@ -387,7 +417,11 @@ class StockTransformer(nn.Module):
             ).squeeze(-1)
 
         output = raw_score_output
-        if self.risk_heads_enabled and self.regime_gate_enabled:
+        if (
+            self.risk_heads_enabled
+            and self.regime_gate_enabled
+            and not self.config.get('oof_risk_penalty_enabled', False)
+        ):
             output = (
                 self._masked_cross_sectional_zscore(
                     raw_score_output,
@@ -433,7 +467,13 @@ class StockTransformer(nn.Module):
                     [pooled_market_features, market_hidden[-1]],
                     dim=-1,
                 )
-            if self.exposure_portfolio_summary_enabled:
+            selected_combined_risk_mean = exposure_features.new_zeros(
+                batch_size
+            )
+            if (
+                self.exposure_portfolio_summary_enabled
+                or self.monotonic_exposure_enabled
+            ):
                 top_k = min(5, num_stocks)
                 selection_scores = output.float()
                 if stock_mask is not None:
@@ -456,21 +496,41 @@ class StockTransformer(nn.Module):
                     1,
                     top_indices,
                 )
-                selected_scores = selection_scores.gather(1, top_indices)
-                portfolio_summary = torch.stack([
-                    regime_gate.float(),
-                    selected_risk_1d.mean(dim=1),
-                    selected_risk_3d.mean(dim=1),
-                    selected_combined_risk.max(dim=1).values,
-                    selected_scores.std(dim=1, unbiased=False),
-                ], dim=1)
-                exposure_features = torch.cat(
-                    [exposure_features, portfolio_summary],
-                    dim=-1,
+                selected_combined_risk_mean = selected_combined_risk.mean(
+                    dim=1
                 )
-            raw_exposure = torch.sigmoid(
-                self.exposure_head(exposure_features)
+                selected_scores = selection_scores.gather(1, top_indices)
+                if self.exposure_portfolio_summary_enabled:
+                    if self.monotonic_exposure_enabled:
+                        portfolio_summary = selected_scores.std(
+                            dim=1,
+                            unbiased=False,
+                        ).unsqueeze(1)
+                    else:
+                        portfolio_summary = torch.stack([
+                            regime_gate.float(),
+                            selected_risk_1d.mean(dim=1),
+                            selected_risk_3d.mean(dim=1),
+                            selected_combined_risk.max(dim=1).values,
+                            selected_scores.std(dim=1, unbiased=False),
+                        ], dim=1)
+                    exposure_features = torch.cat(
+                        [exposure_features, portfolio_summary],
+                        dim=-1,
+                    )
+            exposure_logit = self.exposure_head(
+                exposure_features
             ).squeeze(-1)
+            base_exposure_probability = torch.sigmoid(exposure_logit)
+            if self.monotonic_exposure_enabled:
+                exposure_logit = (
+                    exposure_logit
+                    - F.softplus(self.exposure_regime_penalty_raw)
+                    * regime_gate.float()
+                    - F.softplus(self.exposure_risk_penalty_raw)
+                    * selected_combined_risk_mean
+                )
+            raw_exposure = torch.sigmoid(exposure_logit)
             exposure = self.min_exposure + (
                 self.max_exposure - self.min_exposure
             ) * raw_exposure
@@ -491,6 +551,15 @@ class StockTransformer(nn.Module):
                     'risk_3d_logits': risk_3d_logits,
                     'combined_risk': combined_risk,
                     'regime_gate': regime_gate,
+                    'exposure_base_probability': base_exposure_probability,
+                    'exposure_regime_penalty': (
+                        F.softplus(self.exposure_regime_penalty_raw)
+                        if self.monotonic_exposure_enabled else None
+                    ),
+                    'exposure_risk_penalty': (
+                        F.softplus(self.exposure_risk_penalty_raw)
+                        if self.monotonic_exposure_enabled else None
+                    ),
                 },
             )
         return output, return_output, allocation_output, exposure

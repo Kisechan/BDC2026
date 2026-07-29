@@ -522,6 +522,20 @@ def main():
 				'identity_gate': float(
 					model.identity_gate_value().detach().float().cpu().item()
 				),
+				'exposure_base_probability': float(
+					auxiliary_output['exposure_base_probability']
+					.squeeze(0).float().cpu().item()
+				),
+				'exposure_regime_penalty': (
+					float(auxiliary_output['exposure_regime_penalty'].item())
+					if auxiliary_output['exposure_regime_penalty'] is not None
+					else None
+				),
+				'exposure_risk_penalty': (
+					float(auxiliary_output['exposure_risk_penalty'].item())
+					if auxiliary_output['exposure_risk_penalty'] is not None
+					else None
+				),
 				'top5': [sequence_stock_ids[index] for index in model_top],
 				'top5_risk_1d': [
 					float(risk_1d_probabilities[index])
@@ -559,6 +573,21 @@ def main():
 		selection_candidate_k=int(policy.get(
 			'selection_candidate_k',
 			20,
+		)),
+		risk_probability_matrix=(
+			float(trained_config.get('risk_1d_blend', 0.40))
+			* np.stack(model_risk_1d)
+			+ float(trained_config.get('risk_3d_blend', 0.60))
+			* np.stack(model_risk_3d)
+		),
+		regime_gates=np.asarray(model_regime_gates),
+		risk_score_penalty=float(policy.get(
+			'risk_score_penalty',
+			0.0,
+		)),
+		correlation_exposure_gamma=float(policy.get(
+			'correlation_exposure_gamma',
+			0.0,
 		)),
 		top_k=int(policy.get('top_k', 5)),
 	)
@@ -599,6 +628,14 @@ def main():
 				'selection_candidate_k',
 				20,
 			)),
+			'risk_score_penalty': float(policy.get(
+				'risk_score_penalty',
+				0.0,
+			)),
+			'correlation_exposure_gamma': float(policy.get(
+				'correlation_exposure_gamma',
+				0.0,
+			)),
 			'min_exposure': float(policy['min_exposure']),
 			'max_exposure': float(policy['max_exposure']),
 		},
@@ -607,7 +644,10 @@ def main():
 			'top5': top5,
 			'raw_top5': [
 				sequence_stock_ids[index]
-				for index in portfolio['raw_top_indices']
+				for index in portfolio.get(
+					'unadjusted_top_indices',
+					portfolio['raw_top_indices'],
+				)
 			],
 			'selection_details': [
 				{
@@ -681,10 +721,18 @@ def main():
 		f'市场压力门控: {float(np.median(model_regime_gates)):.6f}'
 	)
 	print(
+		f'OOF 风险分数惩罚: '
+		f'{float(policy.get("risk_score_penalty", 0.0)):.4f}'
+	)
+	print(
 		f'风险选择 gamma/相关性: '
 		f'{float(policy.get("selection_risk_gamma", 0.0)):.4f} / '
 		f'{portfolio["mean_positive_correlation"]:.4f} '
 		f'(原始 {portfolio["raw_mean_positive_correlation"]:.4f})'
+	)
+	print(
+		f'相关性降仓 gamma: '
+		f'{float(policy.get("correlation_exposure_gamma", 0.0)):.4f}'
 	)
 	print(f'分歧调整前仓位: {portfolio["base_exposure"]:.12f}')
 	print(f'提交权重和: {weight_sum:.12f}')

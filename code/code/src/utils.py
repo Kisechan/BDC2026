@@ -1114,6 +1114,10 @@ def build_ensemble_portfolio(
     selection_risk_context=None,
     selection_risk_gamma=0.0,
     selection_candidate_k=20,
+    risk_probability_matrix=None,
+    regime_gates=None,
+    risk_score_penalty=0.0,
+    correlation_exposure_gamma=0.0,
     top_k=5,
 ):
     """用 rank ensemble 选股，并按模型分歧将仓位向最低仓位收缩。"""
@@ -1135,16 +1139,51 @@ def build_ensemble_portfolio(
         raise ValueError('集成模型输出包含 NaN 或无穷值')
     if not 0.0 <= min_exposure < max_exposure < 1.0:
         raise ValueError('仓位范围必须满足 0 <= min_exposure < max_exposure < 1')
-    if allocation_temperature <= 0 or disagreement_gamma < 0:
+    if (
+        allocation_temperature <= 0
+        or disagreement_gamma < 0
+        or risk_score_penalty < 0
+        or correlation_exposure_gamma < 0
+    ):
         raise ValueError('temperature 必须大于 0，gamma 不能为负')
     if not 0.0 <= allocation_blend <= 1.0:
         raise ValueError('allocation_blend 必须位于 [0, 1]')
 
-    percentile_matrix = np.stack(
+    raw_percentile_matrix = np.stack(
         [percentile_ranks(scores) for scores in score_matrix],
         axis=0,
     )
+    percentile_matrix = raw_percentile_matrix
+    if risk_score_penalty > 0:
+        risk_probability_matrix = np.asarray(
+            risk_probability_matrix,
+            dtype=np.float64,
+        )
+        regime_gates = np.asarray(regime_gates, dtype=np.float64).reshape(-1)
+        if risk_probability_matrix.shape != score_matrix.shape:
+            raise ValueError('风险概率矩阵与排名分数矩阵形状不一致')
+        if regime_gates.shape != (num_models,):
+            raise ValueError('每个模型必须提供一个市场压力门控值')
+        if not (
+            np.isfinite(risk_probability_matrix).all()
+            and np.isfinite(regime_gates).all()
+        ):
+            raise ValueError('风险概率或市场压力包含 NaN/无穷值')
+        risk_percentile_matrix = np.stack([
+            percentile_ranks(probabilities)
+            for probabilities in risk_probability_matrix
+        ])
+        percentile_matrix = (
+            raw_percentile_matrix
+            - risk_score_penalty
+            * np.clip(regime_gates, 0.0, 1.0)[:, None]
+            * risk_percentile_matrix
+        )
     ensemble_scores = percentile_matrix.mean(axis=0)
+    raw_ensemble_scores = raw_percentile_matrix.mean(axis=0)
+    unadjusted_top_indices = np.lexsort(
+        (np.arange(num_stocks), -raw_ensemble_scores)
+    )[:top_k]
     if selection_risk_context is None:
         if selection_risk_gamma != 0.0:
             raise ValueError('非零 selection_risk_gamma 需要风险上下文')
@@ -1191,6 +1230,12 @@ def build_ensemble_portfolio(
     adjusted_exposure = min_exposure + (
         base_exposure - min_exposure
     ) * np.exp(-disagreement_gamma * mean_disagreement)
+    adjusted_exposure = min_exposure + (
+        adjusted_exposure - min_exposure
+    ) * np.exp(
+        -correlation_exposure_gamma
+        * risk_selection['mean_positive_correlation']
+    )
     adjusted_exposure = float(
         np.clip(adjusted_exposure, min_exposure, max_exposure)
     )
@@ -1206,12 +1251,19 @@ def build_ensemble_portfolio(
         'positions': positions,
         'relative_weights': relative_weights,
         'ensemble_scores': ensemble_scores,
+        'raw_ensemble_scores': raw_ensemble_scores,
         'percentile_matrix': percentile_matrix,
+        'raw_percentile_matrix': raw_percentile_matrix,
         'selected_disagreement': selected_disagreement,
         'mean_disagreement': mean_disagreement,
         'base_exposure': base_exposure,
         'exposure': adjusted_exposure,
         'raw_top_indices': risk_selection['raw_top_indices'],
+        'unadjusted_top_indices': unadjusted_top_indices,
+        'risk_score_penalty': float(risk_score_penalty),
+        'correlation_exposure_gamma': float(
+            correlation_exposure_gamma
+        ),
         'selected_raw_ranks': risk_selection['selected_raw_ranks'],
         'selected_reversal_risk': risk_selection['reversal_risk'],
         'selected_correlation_risk': risk_selection['correlation_risk'],
@@ -1393,6 +1445,10 @@ def summarize_ensemble_days(
     disagreement_gamma,
     selection_risk_gamma=0.0,
     selection_candidate_k=20,
+    risk_score_penalty=0.0,
+    risk_1d_blend=0.40,
+    risk_3d_blend=0.60,
+    correlation_exposure_gamma=0.0,
     fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
     top_k=5,
@@ -1401,6 +1457,10 @@ def summarize_ensemble_days(
     """计算 OOF ensemble 的收益分解、下行风险和 Rank IC。"""
     daily = []
     for day in ensemble_days:
+        combined_risk_probabilities = (
+            risk_1d_blend * day['risk_1d_probabilities']
+            + risk_3d_blend * day['risk_3d_probabilities']
+        )
         portfolio = build_ensemble_portfolio(
             day['scores'],
             day['allocation_logits'],
@@ -1413,6 +1473,10 @@ def summarize_ensemble_days(
             selection_risk_context=day.get('selection_risk_context'),
             selection_risk_gamma=selection_risk_gamma,
             selection_candidate_k=selection_candidate_k,
+            risk_probability_matrix=combined_risk_probabilities,
+            regime_gates=day['regime_gates'],
+            risk_score_penalty=risk_score_penalty,
+            correlation_exposure_gamma=correlation_exposure_gamma,
             top_k=top_k,
         )
         selected = portfolio['top_indices']
@@ -1489,6 +1553,10 @@ def summarize_ensemble_days(
             ],
             'mean_reversal_risk': float(
                 np.mean(portfolio['selected_reversal_risk'])
+            ),
+            'risk_score_penalty': float(risk_score_penalty),
+            'correlation_exposure_gamma': float(
+                correlation_exposure_gamma
             ),
             'rank_ic': float(rank_ic) if np.isfinite(rank_ic) else 0.0,
         })
@@ -1607,6 +1675,8 @@ def summarize_ensemble_days(
             'raw_mean_positive_correlation'
         ),
         'mean_reversal_risk': mean('mean_reversal_risk'),
+        'risk_score_penalty': float(risk_score_penalty),
+        'correlation_exposure_gamma': float(correlation_exposure_gamma),
         'worst_fold_weighted_portfolio_return': float(min(
             row['mean_weighted_portfolio_return'] for row in fold_summaries
         )),
@@ -1635,6 +1705,10 @@ def calibrate_ensemble_policy(
     allocation_blend_grid,
     disagreement_gamma_grid,
     selection_risk_gamma_grid=(0.0,),
+    risk_score_penalty_grid=(0.0,),
+    risk_1d_blend=0.40,
+    risk_3d_blend=0.60,
+    correlation_exposure_gamma_grid=(0.0,),
     selection_candidate_k=20,
     fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
@@ -1645,25 +1719,41 @@ def calibrate_ensemble_policy(
     for allocation_blend in allocation_blend_grid:
         for disagreement_gamma in disagreement_gamma_grid:
             for selection_risk_gamma in selection_risk_gamma_grid:
-                metrics = summarize_ensemble_days(
-                    ensemble_days,
-                    min_exposure=min_exposure,
-                    max_exposure=max_exposure,
-                    allocation_temperature=allocation_temperature,
-                    allocation_blend=float(allocation_blend),
-                    disagreement_gamma=float(disagreement_gamma),
-                    selection_risk_gamma=float(selection_risk_gamma),
-                    selection_candidate_k=selection_candidate_k,
-                    fixed_exposure_baseline=fixed_exposure_baseline,
-                    downside_weight=downside_weight,
-                    top_k=top_k,
-                )
-                candidates.append({
-                    'allocation_blend': float(allocation_blend),
-                    'disagreement_gamma': float(disagreement_gamma),
-                    'selection_risk_gamma': float(selection_risk_gamma),
-                    'metrics': metrics,
-                })
+                for risk_score_penalty in risk_score_penalty_grid:
+                    for correlation_exposure_gamma in (
+                        correlation_exposure_gamma_grid
+                    ):
+                        metrics = summarize_ensemble_days(
+                            ensemble_days,
+                            min_exposure=min_exposure,
+                            max_exposure=max_exposure,
+                            allocation_temperature=allocation_temperature,
+                            allocation_blend=float(allocation_blend),
+                            disagreement_gamma=float(disagreement_gamma),
+                            selection_risk_gamma=float(selection_risk_gamma),
+                            selection_candidate_k=selection_candidate_k,
+                            risk_score_penalty=float(risk_score_penalty),
+                            risk_1d_blend=risk_1d_blend,
+                            risk_3d_blend=risk_3d_blend,
+                            correlation_exposure_gamma=float(
+                                correlation_exposure_gamma
+                            ),
+                            fixed_exposure_baseline=fixed_exposure_baseline,
+                            downside_weight=downside_weight,
+                            top_k=top_k,
+                        )
+                        candidates.append({
+                            'allocation_blend': float(allocation_blend),
+                            'disagreement_gamma': float(disagreement_gamma),
+                            'selection_risk_gamma': float(
+                                selection_risk_gamma
+                            ),
+                            'risk_score_penalty': float(risk_score_penalty),
+                            'correlation_exposure_gamma': float(
+                                correlation_exposure_gamma
+                            ),
+                            'metrics': metrics,
+                        })
     if not candidates:
         raise ValueError('ensemble policy 搜索网格不能为空')
     best = max(
@@ -1674,6 +1764,8 @@ def calibrate_ensemble_policy(
             -candidate['metrics']['downside_deviation'],
             -candidate['disagreement_gamma'],
             -candidate['selection_risk_gamma'],
+            -candidate['risk_score_penalty'],
+            -candidate['correlation_exposure_gamma'],
             -abs(candidate['allocation_blend'] - 0.5),
         ),
     )
@@ -1686,6 +1778,12 @@ def calibrate_ensemble_policy(
         disagreement_gamma=best['disagreement_gamma'],
         selection_risk_gamma=best['selection_risk_gamma'],
         selection_candidate_k=selection_candidate_k,
+        risk_score_penalty=best['risk_score_penalty'],
+        risk_1d_blend=risk_1d_blend,
+        risk_3d_blend=risk_3d_blend,
+        correlation_exposure_gamma=best[
+            'correlation_exposure_gamma'
+        ],
         fixed_exposure_baseline=fixed_exposure_baseline,
         downside_weight=downside_weight,
         top_k=top_k,
@@ -1695,6 +1793,12 @@ def calibrate_ensemble_policy(
         'allocation_blend': best['allocation_blend'],
         'disagreement_gamma': best['disagreement_gamma'],
         'selection_risk_gamma': best['selection_risk_gamma'],
+        'risk_score_penalty': best['risk_score_penalty'],
+        'risk_1d_blend': float(risk_1d_blend),
+        'risk_3d_blend': float(risk_3d_blend),
+        'correlation_exposure_gamma': best[
+            'correlation_exposure_gamma'
+        ],
         'selection_candidate_k': int(selection_candidate_k),
         'fixed_exposure_baseline': float(fixed_exposure_baseline),
         'min_exposure': float(min_exposure),
