@@ -16,12 +16,12 @@
 2. 做单股量价特征工程，并增加短期反转、下行波动和市场压力特征；
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
 4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
-5. Ranking阶段优化平滑Listwise、收益差加权LambdaRank@5、Rank IC、原始收益
-   回归、1/3日风险头和市场状态门控；
+5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
+   回归；随后冻结Ranking主干，独立训练1/3日风险头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存三组 OOF 输出并标定
-   Allocation 与等权的混合比例，以及反转/相关性风险惩罚；
-7. 每折依次训练 Ranking、Allocation、Exposure；三折后分别取各阶段最佳 epoch
-   中位数进行三阶段全量重训。
+   Allocation 与等权的混合比例、风险分数惩罚，以及反转/相关性风险惩罚；
+7. 每折依次训练 Ranking、Risk/Regime、Allocation、Exposure；三折后把各阶段
+   最佳optimizer更新步数中位数换算成全量epoch，进行四阶段全量重训。
 
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
@@ -44,7 +44,8 @@
 - 单种子/可选多种子模式、周频验证与 OOF 策略网格（`seed`、
   `ensemble_enabled`、`ensemble_seeds`、`evaluation_stride`、
   `allocation_blend_grid`、`disagreement_gamma_grid`、
-  `selection_risk_gamma_grid`）；
+  `selection_risk_gamma_grid`、`risk_score_penalty_grid`、
+  `correlation_exposure_gamma_grid`）；
 - CUDA AMP、TF32、fused AdamW、pinned memory 和 non-blocking 传输开关；
 - 数据路径和输出路径（默认输出到 `output/`）。
 
@@ -58,12 +59,13 @@
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
 - `score_head` 与 `return_head`：分别输出5日Alpha分数和原始收益预测；
 - `risk_1d_head`、`risk_3d_head`：预测短期软下跌概率；
-- 独立 `regime_market_encoder`：用市场压力序列生成状态门控，并只在压力状态下
-  加强短期风险惩罚；
+- 独立 `regime_market_encoder`：用市场压力序列生成状态门控；风险强度不再固定
+  写入模型分数，而是仅通过OOF网格校准；
 - `allocation_head`：输出相对仓位 logits，训练监督覆盖预测 Top-20，最终只在
   风险感知 Top-5 中重新 softmax；
-- `exposure_head`：将股票池聚合表示、13维市场序列及稳定的Top-5风险摘要拼接，输出
-  `[0.20, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
+- `exposure_head`：将股票池聚合表示、13维市场序列及Top-5分数离散度拼接，并通过
+  正系数单调扣减市场压力和Top-5风险，输出`[0.20, 0.999999]`内的总股票仓位；
+  现金恒为`1-exposure`。
 
 输入包含特征张量、股票索引和有效股票 mask；模型返回排序分数、预测收益、
 相对仓位 logits 三个 `[batch, num_stocks]` 张量，以及一个 `[batch]` 总仓位张量。
@@ -109,8 +111,9 @@
 	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
 	- 默认固定随机种子42完成三折训练；checkpoint 只使用从验证期末向前每隔
 	  5 个交易日抽取的非重叠日期；
-	- 三折完成后分别选择 Ranking、Allocation、Exposure 的最终轮数，重新拟合
-	  全量 scaler 并按相同顺序训练最终模型；
+	- 五年Ranking样本按504个交易日半衰期加权，降低过旧市场阶段的影响；
+	- 三折完成后按最佳更新步数选择 Ranking、Risk、Allocation、Exposure 的最终
+	  轮数，重新拟合全量 scaler 并按相同顺序训练最终模型；
 	- 将 `ensemble_enabled=True` 可恢复三种子 × 三折及三个全量模型的稳健性实验；
 	- 当前使用 `learning_rate=3e-5`、`patience=12`、`id_dropout=0.2`、
 	  `embedding_dropout=0.1` 和 ID 门控，降低股票代码记忆风险。
@@ -121,14 +124,15 @@
 	- 将整数排名转成排名百分位，用 `listwise_temperature` 平滑目标分布，并通过 `listwise_weight` 控制 Listwise 尺度；
 	- LambdaRank只处理预测Top-20、真实Top-20和20只困难负样本，按
 	  `ΔNDCG@5 × 真实收益差` 加权；
-	- Ranking阶段同时训练Rank IC、收益回归、1/3日风险BCE和状态门控BCE；
+	- Ranking阶段只训练Rank IC、收益回归及排序目标；风险BCE和状态门控BCE在
+	  冻结Ranking主干后独立训练，避免多任务负迁移；
 	- 对真实Top-k样本施加更高权重。
 	- TensorBoard分别记录各加权损失分量与ID门控正则，便于检查目标是否失衡；
 	- `allocation_loss` 监督 ranking head 当前 Top-20 内的相对仓位分布，目标收益
 	  先裁剪至 `[-10%, 10%]`；
 	- `exposure_loss` 使用 Top-5 收益、全市场收益和 Top-5 下行波动构造软目标，
 	  并以 BCE 训练总仓位。
-	- Allocation阶段冻结整个Ranking主干；Exposure阶段冻结Ranking与Allocation，
+	- Allocation阶段冻结Ranking与Risk；Exposure阶段冻结Ranking与Allocation，
 	  避免两个弱辅助目标反向破坏选股表示。
 - 评估指标：`calculate_ranking_metrics()`
 	- 计算等权 Top-5 收益、动态权重组合收益、总仓位、现金、最大单股仓位、Rank IC、回归 MAE 和原有归一化指标；
@@ -137,8 +141,8 @@
 	  及模型排名分歧；
 	- 每折最佳 checkpoint 额外执行真实 ID、全 UNK 和固定置换 ID 评估，报告分数
 	  相关性、Top-5 重合率及收益变化。
-	- Ranking、Allocation、Exposure分别使用 `Top-5+0.2×Rank IC`、同仓位
-	  Allocation增益和风险调整组合收益选择checkpoint。
+	- Ranking、Risk、Allocation、Exposure分别使用`Top-5+0.2×Rank IC`、负验证
+	  损失、同仓位Allocation增益和风险调整组合收益选择checkpoint。
 
 训练产物：
 - `seed_42/fold_N/`：默认三组 checkpoint、scaler、指标、日志与 OOF 输出；
@@ -151,7 +155,7 @@
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
 当前模型输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_regime_lambdarank_staged_v3_5y/`。
+`model/60_158+39_reduced25_relmarket12_risk15_regime_lambdarank_staged_v4_riskisolated_decay5y/`。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
@@ -160,7 +164,8 @@
 3. 从模型目录加载训练时 `config.json` 和全量 `scaler.pkl`，源码参数漂移只报告、不参与模型构造；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
-5. 从排名前20名候选中按 OOF 选择的反转/相关性惩罚贪心选择 Top-5。集成模式会
+5. 先按OOF选择的短期风险分数惩罚调整Ranking百分位，再从前20名候选中按OOF
+   选择的反转/相关性惩罚贪心选择Top-5。集成模式会
    平均各模型 Allocation 分布，并可按模型排名分歧将总仓位向0.20收缩，输出到
    `result.csv`：
 	 - `stock_id`
