@@ -86,6 +86,10 @@ def optimizer_parameters_with_grad(optimizer):
     ]
 
 
+def resume_training_enabled():
+    return os.environ.get('RESUME_TRAINING', '0') == '1'
+
+
 feature_cloums_map = {
     '39': ['开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅','sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv','volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',  'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'],
 
@@ -2239,6 +2243,48 @@ def train_one_fold(
     return result, oof_predictions
 
 
+def load_completed_fold_artifacts(output_dir, fold, base_seed):
+    """加载并校验已完整写盘的单折结果；文件不全时返回 None。"""
+    fold_number = int(fold['fold'])
+    fold_dir = os.path.join(output_dir, f'fold_{fold_number}')
+    artifact_paths = {
+        'metrics': os.path.join(fold_dir, 'metrics.json'),
+        'predictions': os.path.join(fold_dir, 'oof_predictions.joblib'),
+        'model': os.path.join(fold_dir, 'best_model.pth'),
+        'scaler': os.path.join(fold_dir, 'scaler.pkl'),
+    }
+    if not all(os.path.isfile(path) for path in artifact_paths.values()):
+        return None
+
+    with open(artifact_paths['metrics'], encoding='utf-8') as file:
+        result = json.load(file)
+    expected_metadata = {
+        'base_seed': int(base_seed),
+        'fold': fold_number,
+        'train_end': fold['train_end'].strftime('%Y-%m-%d'),
+        'purge_start': fold['purge_start'].strftime('%Y-%m-%d'),
+        'purge_end': fold['purge_end'].strftime('%Y-%m-%d'),
+        'val_start': fold['val_start'].strftime('%Y-%m-%d'),
+        'val_end': fold['val_end'].strftime('%Y-%m-%d'),
+    }
+    mismatches = {
+        name: (result.get(name), expected)
+        for name, expected in expected_metadata.items()
+        if result.get(name) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            f'第 {fold_number} 折恢复产物与当前切分不一致: {mismatches}'
+        )
+    if not all(
+        stage in result.get('stage_training', {})
+        for stage in ('ranking', 'allocation', 'exposure')
+    ):
+        raise ValueError(f'第 {fold_number} 折恢复产物缺少阶段训练结果')
+    predictions = joblib.load(artifact_paths['predictions'])
+    return result, predictions
+
+
 def prepare_full_training_dataset(full_data, features, output_dir):
     """全量 scaler 与排序数据集只构建一次，供已启用的随机种子共享。"""
     train_data = full_data.copy()
@@ -2282,12 +2328,43 @@ def train_final_model(
     writer = SummaryWriter(log_dir=os.path.join(final_dir, 'log'))
     train_loader = build_data_loader(train_dataset, True, device)
     model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
+    stages = ('ranking', 'allocation', 'exposure')
+    first_stage_index = 0
+    if resume_training_enabled():
+        for stage_index, stage in reversed(list(enumerate(stages))):
+            stage_checkpoint_path = os.path.join(
+                final_dir,
+                f'checkpoint_after_{stage}.pth',
+            )
+            if not os.path.isfile(stage_checkpoint_path):
+                continue
+            checkpoint = torch.load(
+                stage_checkpoint_path,
+                map_location=device,
+            )
+            expected_stage_epochs = {
+                name: int(stage_epochs[name])
+                for name in stages
+            }
+            if (
+                checkpoint.get('base_seed') != int(base_seed)
+                or checkpoint.get('completed_stage') != stage
+                or checkpoint.get('stage_epochs') != expected_stage_epochs
+                or checkpoint.get('config') != config
+            ):
+                raise ValueError(
+                    f'全量训练恢复点与当前配置不一致: {stage_checkpoint_path}'
+                )
+            model.load_state_dict(checkpoint['model_state_dict'])
+            first_stage_index = stage_index + 1
+            print(f'恢复全量训练阶段完成点: {stage_checkpoint_path}')
+            break
 
     print(
         f"\n========== Seed {base_seed} full-data retraining: "
         f"{stage_epochs} =========="
     )
-    for stage in ('ranking', 'allocation', 'exposure'):
+    for stage in stages[first_stage_index:]:
         num_epochs = int(stage_epochs[stage])
         criterion, optimizer = build_training_components(
             model,
@@ -2323,6 +2400,19 @@ def train_final_model(
                 f"loss={train_loss:.4f}, "
                 f"id_gate={model.identity_gate_value().detach().item():.4f}"
             )
+        torch.save(
+            {
+                'model_state_dict': model.state_dict(),
+                'base_seed': int(base_seed),
+                'completed_stage': stage,
+                'stage_epochs': {
+                    name: int(stage_epochs[name])
+                    for name in stages
+                },
+                'config': config,
+            },
+            os.path.join(final_dir, f'checkpoint_after_{stage}.pth'),
+        )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
     metadata = {
@@ -2361,7 +2451,15 @@ def main():
     set_seed(ensemble_seeds[0])
     output_dir = config['output_dir']
     os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as file:
+    config_path = os.path.join(output_dir, 'config.json')
+    if resume_training_enabled() and os.path.isfile(config_path):
+        with open(config_path, encoding='utf-8') as file:
+            existing_config = json.load(file)
+        if existing_config != config:
+            raise ValueError(
+                'RESUME_TRAINING=1 但训练目录中的 config.json 与当前配置不同'
+            )
+    with open(config_path, 'w', encoding='utf-8') as file:
         json.dump(config, file, indent=4, ensure_ascii=False)
 
     if torch.cuda.is_available():
@@ -2435,15 +2533,29 @@ def main():
         seed_dir = os.path.join(output_dir, f'seed_{base_seed}')
         os.makedirs(seed_dir, exist_ok=True)
         for fold in folds:
-            result, predictions = train_one_fold(
-                full_data=full_data,
-                features=features,
-                fold=fold,
-                num_stocks=len(stockid2idx),
-                device=device,
-                output_dir=seed_dir,
-                base_seed=base_seed,
-            )
+            completed_fold = None
+            if resume_training_enabled():
+                completed_fold = load_completed_fold_artifacts(
+                    seed_dir,
+                    fold,
+                    base_seed,
+                )
+            if completed_fold is None:
+                result, predictions = train_one_fold(
+                    full_data=full_data,
+                    features=features,
+                    fold=fold,
+                    num_stocks=len(stockid2idx),
+                    device=device,
+                    output_dir=seed_dir,
+                    base_seed=base_seed,
+                )
+            else:
+                result, predictions = completed_fold
+                print(
+                    f"复用 Seed {base_seed} Fold {fold['fold']} "
+                    '已完成产物'
+                )
             fold_results.append(result)
             oof_records[int(fold['fold'])][base_seed] = predictions
 
