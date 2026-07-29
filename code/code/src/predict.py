@@ -240,7 +240,21 @@ def make_serialization_safe_positions(portfolio, runtime_config):
 
 def compare_runtime_configs(saved_config, live_config):
 	"""报告源码配置与训练快照漂移；推理始终以训练快照为准。"""
-	ignored_keys = {'output_dir'}
+	ignored_keys = {
+		'output_dir',
+		'policy_only_experiment',
+		'policy_only_source_dir',
+		'policy_output_dir',
+		'artifact_source_dir',
+		'source_training_config',
+		'policy_simplicity_tolerance',
+		'module_min_positive_fold_fraction',
+		'cluster_max_raw_rank',
+		'cluster_cap_grid',
+		'minimum_allocation_deployment_blend',
+		'minimum_exposure_deployment_blend',
+		'cluster_cap_enabled',
+	}
 	return {
 		key: {
 			'trained': saved_config.get(key),
@@ -254,23 +268,43 @@ def compare_runtime_configs(saved_config, live_config):
 
 def main():
 	output_dir = config['output_dir']
-	trained_config_path = os.path.join(output_dir, 'config.json')
+	strategy_config_path = os.path.join(output_dir, 'config.json')
 	policy_path = os.path.join(output_dir, 'ensemble_policy.json')
-	stock_mapping_path = os.path.join(output_dir, 'stockid2idx.json')
 	output_path = os.path.join('./output/', 'result.csv')
 	diagnostics_path = os.path.join('./output/', 'prediction_diagnostics.json')
 
 	for path, description in [
-		(trained_config_path, '训练配置快照'),
+		(strategy_config_path, '策略配置快照'),
 		(policy_path, 'ensemble 策略'),
+	]:
+		if not os.path.exists(path):
+			raise FileNotFoundError(f'未找到{description}: {path}')
+	with open(strategy_config_path, 'r', encoding='utf-8') as f:
+		strategy_config = json.load(f)
+	with open(policy_path, 'r', encoding='utf-8') as f:
+		policy = json.load(f)
+	artifact_source = policy.get('artifact_source_dir', '.')
+	artifact_source_dir = (
+		artifact_source
+		if os.path.isabs(artifact_source)
+		else os.path.normpath(os.path.join(output_dir, artifact_source))
+	)
+	trained_config_path = os.path.join(
+		artifact_source_dir,
+		policy.get('config_path', 'config.json'),
+	)
+	stock_mapping_path = os.path.join(
+		artifact_source_dir,
+		'stockid2idx.json',
+	)
+	for path, description in [
+		(trained_config_path, '训练配置快照'),
 		(stock_mapping_path, '股票 ID 映射'),
 	]:
 		if not os.path.exists(path):
 			raise FileNotFoundError(f'未找到{description}: {path}')
 	with open(trained_config_path, 'r', encoding='utf-8') as f:
 		trained_config = json.load(f)
-	with open(policy_path, 'r', encoding='utf-8') as f:
-		policy = json.load(f)
 	for key in ('min_exposure', 'max_exposure'):
 		if not np.isclose(
 			float(policy[key]),
@@ -290,13 +324,13 @@ def main():
 		print('警告: OOF ensemble 未满足全部 promotion criteria，请结合报告判断是否提交。')
 
 	scaler_path = os.path.join(
-		output_dir,
+		artifact_source_dir,
 		policy.get('scaler_path', 'scaler.pkl'),
 	)
 	if not os.path.exists(scaler_path):
 		raise FileNotFoundError(f'未找到 Scaler: {scaler_path}')
 	model_paths = [
-		os.path.join(output_dir, relative_path)
+		os.path.join(artifact_source_dir, relative_path)
 		for relative_path in policy.get('model_paths', [])
 	]
 	ensemble_enabled = bool(policy.get(
@@ -641,6 +675,7 @@ def main():
 			'max_stocks_per_cluster',
 			trained_config.get('selection_max_stocks_per_cluster', 2),
 		)),
+		cluster_max_raw_rank=policy.get('cluster_max_raw_rank'),
 		risk_probability_matrix=(
 			risk_blends[0] * np.stack(model_risk_1d)
 			+ risk_blends[1] * np.stack(model_risk_3d)
@@ -690,6 +725,7 @@ def main():
 	diagnostics = {
 		'prediction_date': latest_date.strftime('%Y-%m-%d'),
 		'num_ranked_stocks': len(sequence_stock_ids),
+		'artifact_source_dir': artifact_source_dir,
 		'config_drift': config_drift,
 		'promotion_criteria': policy.get('promotion_criteria', {}),
 		'policy': {
@@ -733,6 +769,9 @@ def main():
 					2,
 				),
 			)),
+			'cluster_max_raw_rank': policy.get(
+				'cluster_max_raw_rank'
+			),
 			'risk_blends': {
 				'1d': float(risk_blends[0]),
 				'3d': float(risk_blends[1]),
@@ -881,6 +920,15 @@ def main():
 			),
 			'candidate_pool_expanded': bool(
 				portfolio['candidate_pool_expanded']
+			),
+			'cluster_constraint_applied': bool(
+				portfolio['cluster_constraint_applied']
+			),
+			'cluster_constraint_skipped': bool(
+				portfolio['cluster_constraint_skipped']
+			),
+			'max_selected_raw_rank': int(
+				portfolio['max_selected_raw_rank']
 			),
 			'head_base_exposure': float(
 				portfolio['head_base_exposure']

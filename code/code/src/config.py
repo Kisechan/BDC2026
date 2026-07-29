@@ -2,7 +2,8 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
+experiment_name = 'nested_oof_modulegated_policy_v7'
+artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
@@ -103,11 +104,18 @@ config = {
     'selection_candidate_k': 30,
     'selection_risk_lookback': 60,
     'selection_correlation_lookbacks': [20, 60],
-    'cluster_cap_enabled': True,
+    'cluster_cap_enabled': False,
+    'cluster_cap_grid': [False, True],
     'cluster_correlation_threshold': 0.60,
     'max_stocks_per_cluster': 2,
+    'cluster_max_raw_rank': 10,
     'nested_oof_enabled': True,
     'ensemble_downside_weight': 0.5,
+    'policy_only_experiment': True,
+    'policy_simplicity_tolerance': 0.001,
+    'module_min_positive_fold_fraction': 2 / 3,
+    'minimum_allocation_deployment_blend': 0.25,
+    'minimum_exposure_deployment_blend': 0.25,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
@@ -168,6 +176,12 @@ config = {
     'deterministic_training': True,
 
     'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
+    'policy_output_dir': (
+        f'./model/{sequence_length}_{feature_num}_{experiment_name}'
+    ),
+    'policy_only_source_dir': (
+        f'./model/{sequence_length}_{feature_num}_{artifact_experiment_name}'
+    ),
     # 五年历史数据与原三年数据隔离存放，避免覆盖已有实验的切分文件。
     'data_path': './data_5y',
 }

@@ -23,11 +23,23 @@ from utils import create_ranking_dataset_vectorized
 from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
 from utils import cross_fit_ensemble_policy, evaluate_ensemble_policy
+from utils import cross_fit_module_gated_policy
 import joblib
 import os
 import json
 import multiprocessing as mp
 import random
+
+
+def policy_only_enabled():
+    return os.environ.get('POLICY_ONLY', '0').strip().lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
+    }
+
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -2975,7 +2987,456 @@ def train_final_model(
     return metadata
 
 
+def build_policy_calibration_kwargs(runtime_config, ensemble_enabled):
+    """集中生成策略校准参数，确保训练后校准与策略重放一致。"""
+    return dict(
+        min_exposure=runtime_config['min_exposure'],
+        max_exposure=runtime_config['max_exposure'],
+        allocation_temperature=runtime_config.get(
+            'allocation_temperature',
+            1.0,
+        ),
+        allocation_blend_grid=runtime_config.get(
+            'allocation_blend_grid',
+            [0.25, 0.5, 0.75, 1.0],
+        ),
+        disagreement_gamma_grid=(
+            runtime_config.get(
+                'disagreement_gamma_grid',
+                [0.0, 2.0, 4.0, 8.0],
+            )
+            if ensemble_enabled else [0.0]
+        ),
+        selection_risk_gamma_grid=runtime_config.get(
+            'selection_risk_gamma_grid',
+            [0.0],
+        ),
+        risk_score_penalty_grid=runtime_config.get(
+            'risk_score_penalty_grid',
+            [0.0],
+        ),
+        risk_1d_blend=float(runtime_config.get('risk_1d_blend', 0.40)),
+        risk_3d_blend=float(runtime_config.get('risk_3d_blend', 0.60)),
+        risk_5d_blend=float(runtime_config.get('risk_5d_blend', 0.0)),
+        tail_5d_blend=float(runtime_config.get('tail_5d_blend', 0.0)),
+        correlation_exposure_gamma_grid=runtime_config.get(
+            'correlation_exposure_gamma_grid',
+            [0.0],
+        ),
+        exposure_head_blend_grid=runtime_config.get(
+            'exposure_head_blend_grid',
+            [0.25, 0.50, 0.75, 1.0],
+        ),
+        selection_candidate_k=int(runtime_config.get(
+            'selection_candidate_k',
+            20,
+        )),
+        correlation_lookbacks=runtime_config.get(
+            'selection_correlation_lookbacks',
+            [20],
+        ),
+        cluster_correlation_threshold=float(runtime_config.get(
+            'cluster_correlation_threshold',
+            0.60,
+        )),
+        max_stocks_per_cluster=int(runtime_config.get(
+            'max_stocks_per_cluster',
+            2,
+        )),
+        cluster_max_raw_rank=int(runtime_config.get(
+            'cluster_max_raw_rank',
+            10,
+        )),
+        tail_5d_threshold=float(runtime_config.get(
+            'tail_5d_threshold',
+            -0.03,
+        )),
+        fixed_exposure_baseline=float(runtime_config.get(
+            'fixed_exposure_baseline',
+            0.6231689453125,
+        )),
+        downside_weight=float(runtime_config.get(
+            'ensemble_downside_weight',
+            0.5,
+        )),
+        top_k=5,
+        policy_simplicity_tolerance=float(runtime_config.get(
+            'policy_simplicity_tolerance',
+            0.001,
+        )),
+        module_min_positive_fold_fraction=float(runtime_config.get(
+            'module_min_positive_fold_fraction',
+            2 / 3,
+        )),
+        cluster_cap_grid=runtime_config.get(
+            'cluster_cap_grid',
+            [False, True],
+        ),
+        minimum_allocation_blend=float(runtime_config.get(
+            'minimum_allocation_deployment_blend',
+            0.25,
+        )),
+        minimum_exposure_blend=float(runtime_config.get(
+            'minimum_exposure_deployment_blend',
+            0.25,
+        )),
+    )
+
+
+def _compact_policy(policy, include_metrics=True):
+    fields = (
+        'allocation_blend',
+        'disagreement_gamma',
+        'selection_risk_gamma',
+        'risk_score_penalty',
+        'risk_1d_blend',
+        'risk_3d_blend',
+        'risk_5d_blend',
+        'tail_5d_blend',
+        'correlation_exposure_gamma',
+        'exposure_head_blend',
+        'selection_candidate_k',
+        'correlation_lookbacks',
+        'cluster_cap_enabled',
+        'cluster_correlation_threshold',
+        'max_stocks_per_cluster',
+        'cluster_max_raw_rank',
+        'tail_5d_threshold',
+        'fixed_exposure_baseline',
+        'min_exposure',
+        'max_exposure',
+        'allocation_temperature',
+        'top_k',
+        'downside_weight',
+        'selection_metric',
+    )
+    compact = {
+        field: policy[field] for field in fields if field in policy
+    }
+    if include_metrics and 'oof_metrics' in policy:
+        compact['oof_metrics'] = {
+            key: value
+            for key, value in policy['oof_metrics'].items()
+            if key != 'daily'
+        }
+    return compact
+
+
+def run_policy_only():
+    """复用既有 OOF 与模型产物，仅重放并部署策略层。"""
+    source_dir = os.path.abspath(config['policy_only_source_dir'])
+    output_dir = os.path.abspath(config['policy_output_dir'])
+    if source_dir == output_dir:
+        raise ValueError('策略输出目录必须与模型产物来源目录不同')
+    required_source_files = (
+        'config.json',
+        'ensemble_policy.json',
+        'cross_validation_summary.json',
+        'scaler.pkl',
+        'stockid2idx.json',
+    )
+    missing = [
+        name for name in required_source_files
+        if not os.path.isfile(os.path.join(source_dir, name))
+    ]
+    if missing:
+        raise FileNotFoundError(f'策略来源目录缺少产物: {missing}')
+    os.makedirs(output_dir, exist_ok=True)
+    with open(
+        os.path.join(source_dir, 'config.json'),
+        encoding='utf-8',
+    ) as file:
+        source_config = json.load(file)
+    with open(
+        os.path.join(source_dir, 'ensemble_policy.json'),
+        encoding='utf-8',
+    ) as file:
+        source_policy = json.load(file)
+    with open(
+        os.path.join(source_dir, 'cross_validation_summary.json'),
+        encoding='utf-8',
+    ) as file:
+        source_summary = json.load(file)
+    ensemble_seeds = [
+        int(seed) for seed in source_policy.get('ensemble_seeds', [42])
+    ]
+    ensemble_enabled = bool(source_policy.get(
+        'ensemble_enabled',
+        len(ensemble_seeds) > 1,
+    ))
+    fold_ids = sorted({
+        int(row['fold']) for row in source_summary.get('folds', [])
+    })
+    if len(fold_ids) < 3:
+        raise ValueError('策略重放需要来源目录中完整的至少三折 OOF')
+    print(
+        'POLICY_ONLY=1: 跳过特征工程、三折训练和全量重训；'
+        f'从 {source_dir} 加载 {len(fold_ids)} 折 OOF'
+    )
+    ensemble_days = []
+    for fold in tqdm(
+        fold_ids,
+        desc='加载并对齐 OOF',
+        unit='折',
+        dynamic_ncols=True,
+    ):
+        records_by_model = []
+        for seed in ensemble_seeds:
+            prediction_path = os.path.join(
+                source_dir,
+                f'seed_{seed}',
+                f'fold_{fold}',
+                'oof_predictions.joblib',
+            )
+            if not os.path.isfile(prediction_path):
+                raise FileNotFoundError(
+                    f'缺少 Seed {seed} Fold {fold} OOF: '
+                    f'{prediction_path}'
+                )
+            records_by_model.append(joblib.load(prediction_path))
+        ensemble_days.extend(align_oof_prediction_records(
+            records_by_model,
+            fold,
+        ))
+    calibration_kwargs = build_policy_calibration_kwargs(
+        config,
+        ensemble_enabled,
+    )
+    replay = cross_fit_module_gated_policy(
+        ensemble_days,
+        **calibration_kwargs,
+    )
+    cross_metrics = replay['metrics']
+    candidate_policy = replay['all_oof_candidate_policy']
+    robust_policy = replay['robust_deployment_policy']
+    artifact_source_dir = os.path.relpath(source_dir, output_dir)
+    policy = dict(robust_policy)
+    policy.update({
+        'ensemble_enabled': ensemble_enabled,
+        'mode': source_policy.get('mode', 'single_model'),
+        'policy_role': 'robust_module_gated_deployment_policy',
+        'promotion_metric_source': 'cross_fitted_oof',
+        'ensemble_seeds': ensemble_seeds,
+        'model_paths': source_policy['model_paths'],
+        'scaler_path': source_policy.get('scaler_path', 'scaler.pkl'),
+        'config_path': source_policy.get('config_path', 'config.json'),
+        'selection_risk_lookback': int(source_policy.get(
+            'selection_risk_lookback',
+            source_config.get('selection_risk_lookback', 20),
+        )),
+        'artifact_source_dir': artifact_source_dir,
+        'module_eligibility': replay['module_eligibility'],
+        'module_alternative_reports': candidate_policy.get(
+            'module_alternative_reports',
+            {},
+        ),
+        'module_fallbacks': {
+            'risk_score': 0.0,
+            'reversal': 0.0,
+            'correlation_cluster': False,
+            'allocation': 0.25,
+            'exposure_head': 0.25,
+            'correlation_exposure': 0.0,
+        },
+        'cross_fitted_policy': {
+            key: value for key, value in replay.items()
+            if key not in (
+                'all_oof_candidate_policy',
+                'robust_deployment_policy',
+            )
+        },
+        'all_oof_candidate_policy': _compact_policy(candidate_policy),
+        'robust_deployment_policy': _compact_policy(robust_policy),
+    })
+    enabled_modules_valid = all(
+        details.get('eligible', False)
+        for module, details in replay['module_eligibility'].items()
+        if policy.get({
+            'risk_score': 'risk_score_penalty',
+            'reversal': 'selection_risk_gamma',
+            'correlation_cluster': 'cluster_cap_enabled',
+            'allocation': 'allocation_blend',
+            'exposure_head': 'exposure_head_blend',
+            'correlation_exposure': 'correlation_exposure_gamma',
+        }[module]) != policy['module_fallbacks'][module]
+    )
+    cluster_report = replay['module_eligibility']['correlation_cluster']
+    promotion_criteria = {
+        'applicable': True,
+        'mean_weighted_return': bool(
+            cross_metrics['mean_weighted_portfolio_return'] > 0.003115
+        ),
+        'worst_fold_weighted_return': bool(
+            cross_metrics['worst_fold_weighted_portfolio_return'] > 0.001785
+        ),
+        'mean_top5_return': bool(
+            cross_metrics['mean_top5_return'] > 0.006746
+        ),
+        'mean_rank_ic': bool(cross_metrics['mean_rank_ic'] >= 0.0514),
+        'enabled_modules_pass_gates': bool(enabled_modules_valid),
+        'cluster_selection_not_harmful': bool(
+            not policy['cluster_cap_enabled']
+            or cluster_report.get('mean_paired_contribution', 0.0) >= 0.0
+        ),
+        'allocation_minimum_retained': bool(
+            policy['allocation_blend'] >= 0.25
+        ),
+        'exposure_minimum_retained': bool(
+            policy['exposure_head_blend'] >= 0.25
+        ),
+    }
+    promotion_criteria['passed'] = all(
+        value for key, value in promotion_criteria.items()
+        if key != 'applicable'
+    )
+    policy['promotion_criteria'] = promotion_criteria
+    runtime_config = dict(config)
+    runtime_config['artifact_source_dir'] = artifact_source_dir
+    runtime_config['source_training_config'] = os.path.join(
+        artifact_source_dir,
+        source_policy.get('config_path', 'config.json'),
+    )
+    with open(
+        os.path.join(output_dir, 'config.json'),
+        'w',
+        encoding='utf-8',
+    ) as file:
+        json.dump(runtime_config, file, indent=2, ensure_ascii=False)
+    with open(
+        os.path.join(output_dir, 'ensemble_policy.json'),
+        'w',
+        encoding='utf-8',
+    ) as file:
+        json.dump(policy, file, indent=2, ensure_ascii=False)
+
+    robust_metrics = robust_policy['oof_metrics']
+    summary = {
+        'training_mode': 'policy_only_module_gated_replay',
+        'artifact_source_dir': artifact_source_dir,
+        'num_folds': len(fold_ids),
+        'evaluation_stride': int(source_config.get(
+            'evaluation_stride',
+            5,
+        )),
+        'ensemble_seeds': ensemble_seeds,
+        'allocation_blend': float(policy['allocation_blend']),
+        'selection_risk_gamma': float(policy['selection_risk_gamma']),
+        'risk_score_penalty': float(policy['risk_score_penalty']),
+        'cluster_cap_enabled': bool(policy['cluster_cap_enabled']),
+        'correlation_exposure_gamma': float(
+            policy['correlation_exposure_gamma']
+        ),
+        'exposure_head_blend': float(policy['exposure_head_blend']),
+        **{
+            key: cross_metrics[key] for key in (
+                'mean_top5_return',
+                'worst_fold_top5_return',
+                'mean_weighted_portfolio_return',
+                'worst_fold_weighted_portfolio_return',
+                'p10_weighted_portfolio_return',
+                'std_weighted_portfolio_return',
+                'positive_rate',
+                'mean_gross_exposure',
+                'mean_cash_weight',
+                'mean_rank_ic',
+                'worst_rank_ic',
+                'mean_model_disagreement',
+                'mean_allocation_contribution',
+                'mean_exposure_contribution',
+                'mean_positive_correlation',
+                'raw_mean_positive_correlation',
+                'mean_diversification_return_contribution',
+                'cluster_constraint_application_rate',
+                'cluster_constraint_skip_rate',
+                'max_selected_raw_rank',
+            )
+        },
+        'weighted_portfolio_positive_rate': cross_metrics['positive_rate'],
+        'original_ranking_baseline': candidate_policy.get(
+            'stage_reports',
+            {},
+        ).get(
+            'ranking',
+            {},
+        ).get(
+            'baseline_metrics',
+            {},
+        ),
+        'module_eligibility': replay['module_eligibility'],
+        'module_alternative_reports': candidate_policy.get(
+            'module_alternative_reports',
+            {},
+        ),
+        'cross_fitted_oof': {
+            key: value for key, value in replay.items()
+            if key not in (
+                'all_oof_candidate_policy',
+                'robust_deployment_policy',
+            )
+        },
+        'ensemble_oof': {
+            key: value for key, value in cross_metrics.items()
+            if key != 'daily'
+        },
+        'all_oof_candidate_policy': _compact_policy(candidate_policy),
+        'robust_deployment_policy': _compact_policy(robust_policy),
+        'deployment_oof': {
+            key: value for key, value in robust_metrics.items()
+            if key != 'daily'
+        },
+        'deployment_policy': _compact_policy(robust_policy, False),
+        'promotion_criteria': promotion_criteria,
+        'folds': source_summary.get('folds', []),
+        'full_training': {
+            'reused': True,
+            'artifact_source_dir': artifact_source_dir,
+            'source_full_training': source_summary.get('full_training', {}),
+        },
+    }
+    for optional_key in (
+        'mean_tail_5d_brier',
+        'mean_selected_tail_5d',
+        'combined_risk_return_spearman',
+        'regime_return_spearman',
+        'regime_market_return_spearman',
+        'regime_tail_share_spearman',
+        'mean_effective_candidate_k',
+        'max_effective_candidate_k',
+        'candidate_pool_expansion_rate',
+        'mean_reversal_risk',
+    ):
+        if optional_key in cross_metrics:
+            summary[optional_key] = cross_metrics[optional_key]
+    with open(
+        os.path.join(output_dir, 'cross_validation_summary.json'),
+        'w',
+        encoding='utf-8',
+    ) as file:
+        json.dump(summary, file, indent=2, ensure_ascii=False)
+    print('\n========== POLICY_ONLY strategy replay summary ==========')
+    print(json.dumps({
+        'mean_top5_return': summary['mean_top5_return'],
+        'mean_weighted_portfolio_return': (
+            summary['mean_weighted_portfolio_return']
+        ),
+        'worst_fold_weighted_portfolio_return': (
+            summary['worst_fold_weighted_portfolio_return']
+        ),
+        'mean_rank_ic': summary['mean_rank_ic'],
+        'robust_deployment_policy': summary['deployment_policy'],
+        'promotion_criteria': promotion_criteria,
+    }, indent=2, ensure_ascii=False))
+    return summary['mean_weighted_portfolio_return']
+
+
 def main():
+    if policy_only_enabled():
+        return run_policy_only()
+    if config.get('policy_only_experiment', False):
+        raise ValueError(
+            '当前配置是策略重放实验，不允许重新训练；'
+            '请使用 POLICY_ONLY=1 ./train.sh'
+        )
     configured_ensemble_seeds = [int(seed) for seed in config.get(
         'ensemble_seeds',
         [42, 142, 242],
@@ -3545,7 +4006,12 @@ if __name__ == "__main__":
     # 多进程保护
     mp.set_start_method('spawn', force=True)
     best_score = main()
+    completion_label = (
+        '策略重放完成'
+        if policy_only_enabled()
+        else '训练完成'
+    )
     print(
-        f"\n########## 训练完成！OOF 平均组合收益: "
+        f"\n########## {completion_label}！OOF 平均组合收益: "
         f"{best_score:.6f} ##########"
     )
