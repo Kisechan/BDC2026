@@ -105,6 +105,101 @@ def get_stock_history(bs_code, start_date, end_date):
     return df
 
 
+def get_stock_industry_snapshot(snapshot_date, stock_codes):
+    """获取指定日期可见的行业分类，并限制到当前训练股票池。"""
+    rs = bs.query_stock_industry(date=snapshot_date)
+    if rs.error_code != '0':
+        raise RuntimeError(
+            f"获取 {snapshot_date} 行业分类失败: {rs.error_msg}"
+        )
+    rows = []
+    while (rs.error_code == '0') & rs.next():
+        rows.append(rs.get_row_data())
+    snapshot = pd.DataFrame(rows, columns=rs.fields)
+    required = {'code', 'industry', 'industryClassification'}
+    missing = required.difference(snapshot.columns)
+    if missing:
+        raise ValueError(f"行业接口缺少字段: {sorted(missing)}")
+    snapshot['stock_id'] = (
+        snapshot['code'].astype(str).str.extract(r'(\d{6})$')[0]
+    )
+    snapshot = snapshot[
+        snapshot['stock_id'].isin(set(stock_codes))
+    ].copy()
+    snapshot['effective_date'] = pd.Timestamp(
+        snapshot_date
+    ).strftime('%Y-%m-%d')
+    snapshot['industry'] = snapshot['industry'].fillna('').str.strip()
+    snapshot['industry_classification'] = (
+        snapshot['industryClassification'].fillna('').str.strip()
+    )
+    snapshot.loc[
+        snapshot['industry'].eq(''),
+        'industry',
+    ] = 'UNKNOWN'
+    return snapshot[[
+        'effective_date',
+        'stock_id',
+        'industry',
+        'industry_classification',
+    ]]
+
+
+def update_industry_history(
+    output_dir,
+    stock_codes,
+    start_date,
+    end_date,
+    extra_dates,
+):
+    """按年度和实验边界增量维护行业历史快照。"""
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    annual_dates = [
+        pd.Timestamp(year=year, month=12, day=31)
+        for year in range(start.year, end.year)
+    ]
+    requested_dates = {
+        date.strftime('%Y-%m-%d')
+        for date in [start, *annual_dates, end, *extra_dates]
+        if start <= date <= end
+    }
+    output_path = os.path.join(output_dir, 'stock_industry_history.csv')
+    if os.path.isfile(output_path):
+        existing = pd.read_csv(
+            output_path,
+            dtype={'stock_id': str},
+        )
+        existing['stock_id'] = existing['stock_id'].str.zfill(6)
+    else:
+        existing = pd.DataFrame(columns=[
+            'effective_date',
+            'stock_id',
+            'industry',
+            'industry_classification',
+        ])
+    completed_dates = set(existing['effective_date'].astype(str))
+    missing_dates = sorted(requested_dates.difference(completed_dates))
+    snapshots = [existing]
+    for snapshot_date in missing_dates:
+        print(f"获取行业分类快照: {snapshot_date}")
+        snapshots.append(get_stock_industry_snapshot(
+            snapshot_date,
+            stock_codes,
+        ))
+    history = pd.concat(snapshots, ignore_index=True)
+    history = history.drop_duplicates(
+        subset=['effective_date', 'stock_id'],
+        keep='last',
+    ).sort_values(['effective_date', 'stock_id'])
+    history.to_csv(output_path, index=False, encoding='utf-8-sig')
+    print(
+        f"行业分类已写入: {output_path} "
+        f"({history['effective_date'].nunique()} 个快照)"
+    )
+    return output_path
+
+
 def get_existing_stocks(output_path):
     """获取已经保存的股票代码列表"""
     if not os.path.exists(output_path):
@@ -235,6 +330,19 @@ def parse_args():
         default="./data",
         help="数据输出目录，默认 ./data",
     )
+    parser.add_argument(
+        "--industry-only",
+        action="store_true",
+        help="只增量获取行业快照，不下载日线行情",
+    )
+    parser.add_argument(
+        "--industry-snapshot-dates",
+        default="2026-01-06,2026-03-06,2026-05-06,2026-07-06",
+        help=(
+            "额外行业快照日期，逗号分隔 YYYY-MM-DD；默认覆盖三折 "
+            "train_end 与全量训练截止日"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -267,6 +375,27 @@ def main():
         # 保存成分股列表
         hs300_list_path = os.path.join(save_dir, "hs300_stock_list.csv")
         hs300_df.to_csv(hs300_list_path, index=False, encoding='utf-8-sig')
+        pure_stock_codes = (
+            hs300_df['code']
+            .str.extract(r'(\d{6})$')[0]
+            .dropna()
+            .str.zfill(6)
+            .tolist()
+        )
+        extra_industry_dates = [
+            pd.Timestamp(value.strip())
+            for value in args.industry_snapshot_dates.split(',')
+            if value.strip()
+        ]
+        update_industry_history(
+            save_dir,
+            pure_stock_codes,
+            start_date,
+            end_date,
+            extra_industry_dates,
+        )
+        if args.industry_only:
+            return
         
         # 读取现有数据（用于增量合并）
         existing_df = None

@@ -15,6 +15,7 @@ from utils import add_relative_market_features
 from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import extract_selection_risk_context
+from utils import attach_industry_indices_asof, load_industry_history
 from utils import (
 	MARKET_PRESSURE_FEATURES,
 	RELATIVE_MARKET_FEATURES,
@@ -427,6 +428,63 @@ def main():
 		sequence_stock_indices
 	).unsqueeze(0).to(device)
 	stock_mask = torch.ones_like(stock_index_tensor, dtype=torch.float32)
+	industry_indices_np = np.zeros(
+		len(sequence_stock_ids),
+		dtype=np.int64,
+	)
+	industry_features_required = bool(
+		trained_config.get('exposure_industry_summary_enabled', False)
+		or policy.get('industry_penalty', 0.0) > 0.0
+	)
+	industry2idx = {'UNKNOWN': 0}
+	if industry_features_required:
+		industry_mapping_path = os.path.join(
+			artifact_source_dir,
+			'industry2idx.json',
+		)
+		if not os.path.isfile(industry_mapping_path):
+			raise FileNotFoundError(
+				'行业感知模型缺少 industry2idx.json: '
+				f'{industry_mapping_path}'
+			)
+		with open(industry_mapping_path, encoding='utf-8') as file:
+			industry2idx = json.load(file)
+		industry_history = load_industry_history(
+			trained_config.get(
+				'industry_history_path',
+				os.path.join(
+					trained_config['data_path'],
+					'stock_industry_history.csv',
+				),
+			)
+		)
+		inference_panel = pd.DataFrame({
+			'股票代码': sequence_stock_ids,
+			'日期': latest_date,
+		})
+		inference_panel, industry_coverage = attach_industry_indices_asof(
+			inference_panel,
+			industry_history,
+			industry2idx,
+			minimum_coverage=float(trained_config.get(
+				'minimum_industry_coverage',
+				0.95,
+			)),
+		)
+		industry_indices_np = inference_panel[
+			'industry_index'
+		].to_numpy(dtype=np.int64)
+	else:
+		industry_coverage = 0.0
+	idx2industry = {
+		int(index): industry
+		for industry, index in industry2idx.items()
+	}
+	industry_index_tensor = torch.as_tensor(
+		industry_indices_np,
+		dtype=torch.long,
+		device=device,
+	).unsqueeze(0)
 	model_scores = []
 	model_allocations = []
 	model_exposures = []
@@ -461,12 +519,13 @@ def main():
 						and trained_config.get('amp_enabled', True)
 					),
 				):
-					return model(
-						x,
-						indices,
-						stock_mask,
-						return_aux=return_aux,
-					)
+						return model(
+							x,
+							indices,
+							stock_mask,
+							industry_indices=industry_index_tensor,
+							return_aux=return_aux,
+						)
 
 			(
 				score_output,
@@ -676,6 +735,12 @@ def main():
 			trained_config.get('selection_max_stocks_per_cluster', 2),
 		)),
 		cluster_max_raw_rank=policy.get('cluster_max_raw_rank'),
+		industry_indices=industry_indices_np,
+		industry_penalty=float(policy.get('industry_penalty', 0.0)),
+		soft_correlation_penalty=float(policy.get(
+			'soft_correlation_penalty',
+			0.0,
+		)),
 		risk_probability_matrix=(
 			risk_blends[0] * np.stack(model_risk_1d)
 			+ risk_blends[1] * np.stack(model_risk_3d)
@@ -782,6 +847,18 @@ def main():
 				'risk_score_penalty',
 				0.0,
 			)),
+			'risk_blend_profile': policy.get(
+				'risk_blend_profile',
+				'configured_default',
+			),
+			'industry_penalty': float(policy.get(
+				'industry_penalty',
+				0.0,
+			)),
+			'soft_correlation_penalty': float(policy.get(
+				'soft_correlation_penalty',
+				0.0,
+			)),
 			'correlation_exposure_gamma': float(policy.get(
 				'correlation_exposure_gamma',
 				0.0,
@@ -799,6 +876,15 @@ def main():
 		},
 		'models': model_diagnostics,
 		'ensemble': {
+			'industry_coverage': float(industry_coverage),
+			'industry_hhi': float(portfolio['industry_hhi']),
+			'raw_industry_hhi': float(portfolio['raw_industry_hhi']),
+			'max_industry_share': float(
+				portfolio['max_industry_share']
+			),
+			'raw_max_industry_share': float(
+				portfolio['raw_max_industry_share']
+			),
 			'top5': top5,
 			'raw_top5': [
 				sequence_stock_ids[index]
@@ -809,8 +895,13 @@ def main():
 				for index in portfolio['unadjusted_top_indices']
 			],
 			'selection_details': [
-				{
-					'stock_id': sequence_stock_ids[index],
+					{
+						'stock_id': sequence_stock_ids[index],
+						'industry_index': int(industry_indices_np[index]),
+						'industry': idx2industry.get(
+							int(industry_indices_np[index]),
+							'UNKNOWN',
+						),
 					'selected_rank': selected_rank,
 					'raw_rank': int(
 						portfolio['selected_raw_ranks'][selected_rank - 1]

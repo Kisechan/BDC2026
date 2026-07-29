@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'nested_oof_forward_policy_v7_1'
+experiment_name = 'industryalpha_softconcentration_v8'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -55,6 +55,7 @@ config = {
     'exposure_market_encoder_enabled': True,
     'exposure_market_hidden_size': 16,
     'exposure_portfolio_summary_enabled': True,
+    'exposure_industry_summary_enabled': True,
     # 原5个市场状态 + 新增8个市场压力特征。
     'market_state_feature_indices': [
         173, 174, 175, 176, 177,
@@ -71,6 +72,16 @@ config = {
     'risk_penalty_scale': 0.0,
     'oof_risk_penalty_enabled': True,
     'risk_score_penalty_grid': [0.0, 0.05, 0.10, 0.15, 0.25],
+    'risk_blend_profiles': [
+        {
+            'name': 'off',
+            'weights': [0.0, 0.0, 0.0, 1.0],
+            'force_zero_penalty': True,
+        },
+        {'name': 'tail_only', 'weights': [0.0, 0.0, 0.0, 1.0]},
+        {'name': 'risk3d_tail', 'weights': [0.0, 0.5, 0.0, 0.5]},
+        {'name': 'current_four_head', 'weights': [0.15, 0.20, 0.30, 0.35]},
+    ],
     'risk_1d_target_temperature': 0.01,
     'risk_3d_target_temperature': 0.02,
     'risk_5d_target_temperature': 0.03,
@@ -97,22 +108,24 @@ config = {
     'max_exposure': 0.999999,
     'allocation_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
     'disagreement_gamma_grid': [0.0, 2.0, 4.0, 8.0],
-    'selection_risk_gamma_grid': [0.0, 0.05, 0.10, 0.20],
+    'selection_risk_gamma_grid': [0.0],
+    'industry_penalty_grid': [0.0, 0.02, 0.05, 0.10],
+    'soft_correlation_penalty_grid': [0.0, 0.02, 0.05],
     'correlation_exposure_gamma_grid': [0.0, 0.5, 1.0, 2.0],
     # Exposure Head 必须保留；OOF 只校准其相对固定基线的占比。
     'exposure_head_blend_grid': [0.25, 0.50, 0.75, 1.0],
-    'selection_candidate_k': 30,
+    'selection_candidate_k': 10,
     'selection_risk_lookback': 60,
     'selection_correlation_lookbacks': [20, 60],
     'cluster_cap_enabled': False,
-    'cluster_cap_grid': [False, True],
+    'cluster_cap_grid': [False],
     'cluster_correlation_threshold': 0.60,
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
     'nested_oof_enabled': True,
     # 策略层纯收益优先，但保留较轻的下行波动惩罚。
     'ensemble_downside_weight': 0.25,
-    'policy_only_experiment': True,
+    'policy_only_experiment': False,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
     'forward_module_max_fold_loss': 0.0025,
@@ -123,6 +136,7 @@ config = {
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
     'pairwise_weight': 0.3, # 降低 LambdaRank@5 对排序主目标的支配
+    'industry_residual_ranking_weight': 0.15,
     'lambdarank_candidate_k': 20,
     'lambdarank_hard_negative_k': 20,
     'lambdarank_return_gap_scale': 0.02,
@@ -137,7 +151,7 @@ config = {
     'ranking_max_epochs': 50,
     'ranking_patience': 12,
     'ranking_checkpoint_metric': 'top5_return_plus_rank_ic',
-    'ranking_min_final_epochs': 1,
+    'ranking_min_final_epochs': 5,
     'risk_learning_rate': 1e-4,
     'risk_max_epochs': 12,
     'risk_patience': 4,
@@ -169,6 +183,27 @@ config = {
     'promotion_min_exposure_std': 0.01,
     'promotion_min_regime_gate_std': 0.01,
     'fixed_exposure_baseline': 0.6231689453125,
+    'minimum_industry_coverage': 0.95,
+    'industry_history_path': './data_5y/stock_industry_history.csv',
+    'promotion_top5_improvement': 0.002,
+    'promotion_weighted_improvement': 0.0015,
+    'promotion_max_p10_regression': 0.005,
+    'promotion_rank_ic_floor': 0.05,
+    'promotion_baseline_summary_path': (
+        './model/'
+        '60_158+39_reduced25_relmarket12_risk15_'
+        'nested_oof_forward_policy_v7_1/'
+        'cross_validation_summary.json'
+    ),
+    # v6 OOF 由 v1.16.1 严格前向协议得到的同日期基准；报告文件缺失时
+    # 使用该不可调常量，避免在新模型结果已知后重选基准。
+    'promotion_baseline_metrics': {
+        'mean_top5_return': 0.030811785085279552,
+        'mean_weighted_portfolio_return': 0.019047056756601472,
+        'worst_fold_weighted_portfolio_return': 0.010087486479274804,
+        'p10_weighted_portfolio_return': -0.02625382433758098,
+        'mean_rank_ic': 0.05995907442662079,
+    },
 
     # 保持损失为 FP32，仅对 Transformer 前向启用 AMP。
     'amp_enabled': True,

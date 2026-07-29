@@ -287,6 +287,9 @@ class StockTransformer(nn.Module):
         self.exposure_portfolio_summary_enabled = bool(
             config.get('exposure_portfolio_summary_enabled', False)
         )
+        self.exposure_industry_summary_enabled = bool(
+            config.get('exposure_industry_summary_enabled', False)
+        )
         self.monotonic_exposure_enabled = bool(
             config.get('monotonic_exposure_enabled', False)
         )
@@ -299,6 +302,8 @@ class StockTransformer(nn.Module):
             exposure_input_dim += (
                 1 if self.monotonic_exposure_enabled else 5
             )
+        if self.exposure_industry_summary_enabled:
+            exposure_input_dim += 2
         if self.monotonic_exposure_enabled:
             if not self.risk_heads_enabled or not self.regime_gate_enabled:
                 raise ValueError('单调 Exposure 需要风险头和市场状态门控')
@@ -438,6 +443,7 @@ class StockTransformer(nn.Module):
         stock_mask=None,
         regime_sequence=None,
         market_sequence=None,
+        industry_indices=None,
         return_aux=False,
     ):
         """从排序主干表示运行各预测头；支持冻结主干缓存。"""
@@ -552,8 +558,12 @@ class StockTransformer(nn.Module):
             if (
                 self.exposure_portfolio_summary_enabled
                 or self.monotonic_exposure_enabled
+                or self.exposure_industry_summary_enabled
             ):
-                top_k = min(5, num_stocks)
+                top_k = min(
+                    10 if self.exposure_industry_summary_enabled else 5,
+                    num_stocks,
+                )
                 selection_scores = output.float()
                 if stock_mask is not None:
                     selection_scores = selection_scores.masked_fill(
@@ -565,20 +575,24 @@ class StockTransformer(nn.Module):
                     top_k,
                     dim=1,
                 ).indices
+                risk_top_indices = top_indices[:, :min(5, top_k)]
                 selected_risk_1d = torch.sigmoid(
                     risk_1d_logits.float()
-                ).gather(1, top_indices)
+                ).gather(1, risk_top_indices)
                 selected_risk_3d = torch.sigmoid(
                     risk_3d_logits.float()
-                ).gather(1, top_indices)
+                ).gather(1, risk_top_indices)
                 selected_combined_risk = combined_risk.float().gather(
                     1,
-                    top_indices,
+                    risk_top_indices,
                 )
                 selected_combined_risk_mean = selected_combined_risk.mean(
                     dim=1
                 )
-                selected_scores = selection_scores.gather(1, top_indices)
+                selected_scores = selection_scores.gather(
+                    1,
+                    risk_top_indices,
+                )
                 if self.exposure_portfolio_summary_enabled:
                     if self.monotonic_exposure_enabled:
                         portfolio_summary = selected_scores.std(
@@ -597,6 +611,38 @@ class StockTransformer(nn.Module):
                         [exposure_features, portfolio_summary],
                         dim=-1,
                     )
+                if self.exposure_industry_summary_enabled:
+                    if industry_indices is None:
+                        raise ValueError(
+                            'Exposure行业摘要缺少 industry_indices'
+                        )
+                    selected_industries = industry_indices.gather(
+                        1,
+                        top_indices,
+                    )
+                    industry_summaries = []
+                    for row in selected_industries:
+                        known = row[row > 0]
+                        if known.numel() == 0:
+                            industry_summaries.append(
+                                exposure_features.new_zeros(2)
+                            )
+                            continue
+                        counts = torch.unique(
+                            known,
+                            return_counts=True,
+                        )[1].to(exposure_features.dtype)
+                        # UNKNOWN 不形成行业桶，但占据 Top-10 分母，和
+                        # 策略层的集中度定义保持一致。
+                        shares = counts / float(top_k)
+                        industry_summaries.append(torch.stack([
+                            shares.square().sum(),
+                            shares.max(),
+                        ]))
+                    exposure_features = torch.cat([
+                        exposure_features,
+                        torch.stack(industry_summaries),
+                    ], dim=-1)
             exposure_logit = self.exposure_head(
                 exposure_features
             ).squeeze(-1)
@@ -651,6 +697,7 @@ class StockTransformer(nn.Module):
         regime_sequence=None,
         market_sequence=None,
         stock_mask=None,
+        industry_indices=None,
         return_aux=False,
     ):
         return self._forward_heads(
@@ -658,10 +705,18 @@ class StockTransformer(nn.Module):
             stock_mask=stock_mask,
             regime_sequence=regime_sequence,
             market_sequence=market_sequence,
+            industry_indices=industry_indices,
             return_aux=return_aux,
         )
 
-    def forward(self, src, stock_indices, stock_mask=None, return_aux=False):
+    def forward(
+        self,
+        src,
+        stock_indices,
+        stock_mask=None,
+        industry_indices=None,
+        return_aux=False,
+    ):
         ranking_features, regime_sequence, market_sequence = self.encode_backbone(
             src, stock_indices, stock_mask,
         )
@@ -670,5 +725,6 @@ class StockTransformer(nn.Module):
             stock_mask=stock_mask,
             regime_sequence=regime_sequence,
             market_sequence=market_sequence,
+            industry_indices=industry_indices,
             return_aux=return_aux,
         )

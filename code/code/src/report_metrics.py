@@ -31,8 +31,11 @@ def print_cross_validation() -> None:
     seeds = summary.get("ensemble_seeds", [])
     cross_fitted = summary.get("cross_fitted_oof", {})
     validation_label = (
-        "嵌套交叉拟合 OOF"
-        if cross_fitted.get("method") != "disabled"
+        "严格前向 OOF"
+        if cross_fitted.get("method")
+        == "strict_forward_historical_folds_only"
+        else "嵌套交叉拟合 OOF"
+        if cross_fitted.get("method") not in {None, "disabled"}
         else "OOF"
     )
     if len(seeds) > 1:
@@ -144,6 +147,18 @@ def print_cross_validation() -> None:
                 f"{float(summary['cluster_constraint_skip_rate']):.2%} / "
                 f"{int(summary['max_selected_raw_rank'])}"
             )
+    if "mean_industry_hhi" in summary:
+        print(
+            "原始/软选择后行业 HHI、最大行业占比: "
+            f"{float(summary['mean_raw_industry_hhi']):.4f} / "
+            f"{float(summary['mean_industry_hhi']):.4f}, "
+            f"{float(summary['mean_raw_max_industry_share']):.2%} / "
+            f"{float(summary['mean_max_industry_share']):.2%}"
+        )
+        print(
+            "Allocation 同仓位行业 HHI 变化: "
+            f"{float(summary['mean_allocation_industry_hhi_change']):+.4f}"
+        )
     if "risk_score_penalty" in summary:
         print(
             "OOF Allocation混合/Exposure混合/风险分数惩罚/"
@@ -154,8 +169,14 @@ def print_cross_validation() -> None:
             f"{float(summary.get('selection_risk_gamma', 0.0)):.2f} / "
             f"{float(summary.get('correlation_exposure_gamma', 0.0)):.2f}"
         )
+        print(
+            "风险方案/行业软惩罚/相关性软惩罚: "
+            f"{summary.get('risk_blend_profile', 'configured_default')} / "
+            f"{float(summary.get('industry_penalty', 0.0)):.2f} / "
+            f"{float(summary.get('soft_correlation_penalty', 0.0)):.2f}"
+        )
     if cross_fitted.get("fold_policies"):
-        print("嵌套 OOF 留出折策略:")
+        print("严格前向 OOF 留出折策略:")
         for row in cross_fitted["fold_policies"]:
             selected = row["policy"]
             print(
@@ -165,6 +186,9 @@ def print_cross_validation() -> None:
                 f"Exposure={float(selected['exposure_head_blend']):.2f}, "
                 f"Risk={float(selected['risk_score_penalty']):.2f}, "
                 f"Reversal={float(selected['selection_risk_gamma']):.2f}, "
+                f"Industry={float(selected.get('industry_penalty', 0.0)):.2f}, "
+                f"SoftCorr="
+                f"{float(selected.get('soft_correlation_penalty', 0.0)):.2f}, "
                 f"CorrExposure="
                 f"{float(selected['correlation_exposure_gamma']):.2f}"
             )
@@ -192,6 +216,8 @@ def print_cross_validation() -> None:
                 "risk_score_penalty",
                 "selection_risk_gamma",
                 "cluster_cap_enabled",
+                "industry_penalty",
+                "soft_correlation_penalty",
                 "allocation_blend",
                 "exposure_head_blend",
                 "correlation_exposure_gamma",
@@ -211,6 +237,10 @@ def print_cross_validation() -> None:
                 f"Exposure={float(deployment['exposure_head_blend']):.2f}, "
                 f"Risk={float(deployment['risk_score_penalty']):.2f}, "
                 f"Reversal={float(deployment['selection_risk_gamma']):.2f}, "
+                f"Industry="
+                f"{float(deployment.get('industry_penalty', 0.0)):.2f}, "
+                f"SoftCorr="
+                f"{float(deployment.get('soft_correlation_penalty', 0.0)):.2f}, "
                 f"CorrExposure="
                 f"{float(deployment['correlation_exposure_gamma']):.2f}"
             )
