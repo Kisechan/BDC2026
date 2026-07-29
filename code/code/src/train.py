@@ -12,7 +12,13 @@ from config import config
 from model import StockTransformer
 from utils import add_relative_market_features
 from utils import engineer_features_39, engineer_features_158plus39
-from utils import RELATIVE_MARKET_FEATURES, RELATIVE_MARKET_FEATURE_SET
+from utils import (
+    MARKET_PRESSURE_FEATURES,
+    RELATIVE_MARKET_FEATURES,
+    RELATIVE_MARKET_FEATURE_SET,
+    RISK_MARKET_FEATURES,
+    RISK_MARKET_FEATURE_SET,
+)
 from utils import create_ranking_dataset_vectorized
 from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
@@ -86,14 +92,22 @@ feature_cloums_map[RELATIVE_MARKET_FEATURE_SET] = [
     *RELATIVE_MARKET_FEATURES,
 ]
 feature_engineer_func_map[RELATIVE_MARKET_FEATURE_SET] = engineer_features_158plus39
+feature_cloums_map[RISK_MARKET_FEATURE_SET] = [
+    *feature_cloums_map[RELATIVE_MARKET_FEATURE_SET],
+    *RISK_MARKET_FEATURES,
+]
+feature_engineer_func_map[RISK_MARKET_FEATURE_SET] = engineer_features_158plus39
 assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
 assert len(feature_cloums_map[RELATIVE_MARKET_FEATURE_SET]) == 178
+assert len(feature_cloums_map[RISK_MARKET_FEATURE_SET]) == 193
 
 
 def _build_label_and_clean(processed, drop_small_open=True):
     """统一构建标签并清洗无效样本。"""
     processed['open_t1'] = processed.groupby('股票代码')['开盘'].shift(-1)
+    processed['open_t2'] = processed.groupby('股票代码')['开盘'].shift(-2)
+    processed['open_t4'] = processed.groupby('股票代码')['开盘'].shift(-4)
     processed['open_t5'] = processed.groupby('股票代码')['开盘'].shift(-5)
 
     # 过滤无效开盘价，避免收益率极端爆炸
@@ -101,9 +115,80 @@ def _build_label_and_clean(processed, drop_small_open=True):
         processed = processed[processed['open_t1'] > 1e-4]
 
     processed['label'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
-    processed = processed.dropna(subset=['label'])
+    processed['return_1d_target'] = (
+        (processed['open_t2'] - processed['open_t1'])
+        / (processed['open_t1'] + 1e-12)
+    )
+    processed['return_3d_target'] = (
+        (processed['open_t4'] - processed['open_t1'])
+        / (processed['open_t1'] + 1e-12)
+    )
+    risk_1d_temperature = float(config.get('risk_1d_target_temperature', 0.01))
+    risk_3d_temperature = float(config.get('risk_3d_target_temperature', 0.02))
+    processed['risk_1d_target'] = 1.0 / (
+        1.0 + np.exp(np.clip(
+            processed['return_1d_target'] / risk_1d_temperature,
+            -30.0,
+            30.0,
+        ))
+    )
+    processed['risk_3d_target'] = 1.0 / (
+        1.0 + np.exp(np.clip(
+            processed['return_3d_target'] / risk_3d_temperature,
+            -30.0,
+            30.0,
+        ))
+    )
+    processed = processed.dropna(subset=[
+        'label',
+        'risk_1d_target',
+        'risk_3d_target',
+    ])
 
-    processed.drop(columns=['open_t1', 'open_t5'], inplace=True)
+    if 'cs_return_60_pct' in processed.columns:
+        dates = processed['日期']
+        top_momentum_return = (
+            processed['label']
+            .where(processed['cs_return_60_pct'] >= 0.8)
+            .groupby(dates)
+            .transform('mean')
+        )
+        bottom_momentum_return = (
+            processed['label']
+            .where(processed['cs_return_60_pct'] <= 0.2)
+            .groupby(dates)
+            .transform('mean')
+        )
+        momentum_factor_return = (
+            top_momentum_return - bottom_momentum_return
+        ).fillna(0.0)
+    else:
+        momentum_factor_return = pd.Series(
+            0.0,
+            index=processed.index,
+        )
+    market_future_return = processed['label'].groupby(
+        processed['日期']
+    ).transform('mean')
+    stress_signal = -(
+        0.6 * momentum_factor_return
+        + 0.4 * market_future_return
+    )
+    regime_temperature = float(
+        config.get('regime_target_temperature', 0.02)
+    )
+    processed['regime_target'] = 1.0 / (
+        1.0 + np.exp(np.clip(
+            -stress_signal / regime_temperature,
+            -30.0,
+            30.0,
+        ))
+    )
+
+    processed.drop(
+        columns=['open_t1', 'open_t2', 'open_t4', 'open_t5'],
+        inplace=True,
+    )
     return processed
 
 
@@ -127,7 +212,10 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
         processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc=desc))
 
     processed = pd.concat(processed_list).reset_index(drop=True)
-    if config['feature_num'] == RELATIVE_MARKET_FEATURE_SET:
+    if config['feature_num'] in {
+        RELATIVE_MARKET_FEATURE_SET,
+        RISK_MARKET_FEATURE_SET,
+    }:
         processed = add_relative_market_features(processed)
 
     # 映射股票索引，并剔除映射失败样本
@@ -167,7 +255,13 @@ class WeightedRankingLoss(nn.Module):
                  exposure_selected_return_weight=0.70,
                  exposure_market_return_weight=0.30,
                  exposure_downside_weight=0.25,
-                 id_gate_regularization=0.0):
+                 id_gate_regularization=0.0,
+                 lambdarank_candidate_k=20,
+                 lambdarank_hard_negative_k=20,
+                 lambdarank_return_gap_scale=0.02,
+                 risk_1d_weight=0.0,
+                 risk_3d_weight=0.0,
+                 regime_weight=0.0):
         super(WeightedRankingLoss, self).__init__()
         if listwise_temperature <= 0:
             raise ValueError('listwise_temperature 必须大于 0')
@@ -195,6 +289,16 @@ class WeightedRankingLoss(nn.Module):
         )
         self.exposure_downside_weight = float(exposure_downside_weight)
         self.id_gate_regularization = float(id_gate_regularization)
+        self.lambdarank_candidate_k = int(lambdarank_candidate_k)
+        self.lambdarank_hard_negative_k = int(
+            lambdarank_hard_negative_k
+        )
+        self.lambdarank_return_gap_scale = float(
+            lambdarank_return_gap_scale
+        )
+        self.risk_1d_weight = float(risk_1d_weight)
+        self.risk_3d_weight = float(risk_3d_weight)
+        self.regime_weight = float(regime_weight)
         self.min_exposure = min_exposure
         self.max_exposure = max_exposure
         if min(
@@ -216,6 +320,18 @@ class WeightedRankingLoss(nn.Module):
             self.id_gate_regularization,
         ) < 0:
             raise ValueError('Exposure 与 ID gate 损失权重不能为负')
+        if (
+            self.lambdarank_candidate_k < self.k
+            or self.lambdarank_hard_negative_k < 0
+            or self.lambdarank_return_gap_scale <= 0
+        ):
+            raise ValueError('LambdaRank候选数量或收益差尺度不合法')
+        if min(
+            self.risk_1d_weight,
+            self.risk_3d_weight,
+            self.regime_weight,
+        ) < 0:
+            raise ValueError('风险头和状态门控损失权重不能为负')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -238,31 +354,127 @@ class WeightedRankingLoss(nn.Module):
         )
         return -(weighted_target_probs * log_pred_probs).sum(dim=1).mean()
 
-    def pairwise_loss(self, y_pred, y_true, weights):
-        """加权的Pairwise损失"""
-        batch_size, num_items = y_pred.size()
-        
-        pred_diff = y_pred.unsqueeze(2) - y_pred.unsqueeze(1)
-        true_diff = y_true.unsqueeze(2) - y_true.unsqueeze(1)
-        
-        # 只考虑真实标签不同的项目对
-        mask = (true_diff != 0).float()
-        
-        # 创建权重矩阵
-        # 如果一对(i, j)中，i或j是关键样本，则权重更高
-        weight_matrix = weights.unsqueeze(2) + weights.unsqueeze(1)
-        # weight_matrix = torch.where(weight_matrix > 2.0, self.weight_factor, 1.0)
-        
-        pairwise_loss = F.softplus(-pred_diff * torch.sign(true_diff))
-        
-        # 应用mask和权重
-        weighted_loss = pairwise_loss * mask * weight_matrix
-        
-        # 按有效权重和归一化，使 Top-k 权重只改变相对重要性而不改变整体尺度。
-        weight_sum = (mask * weight_matrix).sum(dim=[1, 2]).clamp(min=1e-12)
-        loss = (weighted_loss.sum(dim=[1, 2]) / weight_sum).mean()
-        
-        return loss
+    def lambda_rank_loss(self, y_pred, y_true, raw_returns, weights):
+        """以收益差和交换后的 ΔNDCG@5 加权困难候选股票对。"""
+        day_losses = []
+        for batch_index in range(y_pred.size(0)):
+            scores = y_pred[batch_index]
+            relevance = y_true[batch_index]
+            returns = raw_returns[batch_index]
+            num_items = scores.numel()
+            candidate_k = min(self.lambdarank_candidate_k, num_items)
+            hard_negative_k = min(
+                self.lambdarank_hard_negative_k,
+                max(0, num_items - candidate_k),
+            )
+            predicted_order = torch.argsort(
+                scores.detach(),
+                descending=True,
+                stable=True,
+            )
+            true_order = torch.argsort(
+                relevance.detach(),
+                descending=True,
+                stable=True,
+            )
+            candidate_indices = torch.unique(torch.cat([
+                predicted_order[:candidate_k],
+                true_order[:candidate_k],
+                predicted_order[
+                    candidate_k:candidate_k + hard_negative_k
+                ],
+            ]))
+            if candidate_indices.numel() < 2:
+                day_losses.append(scores.sum() * 0.0)
+                continue
+
+            predicted_positions = torch.empty(
+                num_items,
+                dtype=torch.long,
+                device=scores.device,
+            )
+            predicted_positions[predicted_order] = torch.arange(
+                num_items,
+                device=scores.device,
+            )
+            relevance_min = relevance.min()
+            relevance_range = (
+                relevance.max() - relevance_min
+            ).clamp(min=1e-12)
+            normalized_relevance = (
+                relevance - relevance_min
+            ) / relevance_range
+            gains = torch.pow(2.0, normalized_relevance) - 1.0
+            cutoff = min(self.k, num_items)
+            ideal_discounts = 1.0 / torch.log2(
+                torch.arange(
+                    cutoff,
+                    device=scores.device,
+                    dtype=scores.dtype,
+                ) + 2.0
+            )
+            ideal_dcg = (
+                gains[true_order[:cutoff]] * ideal_discounts
+            ).sum().clamp(min=1e-12)
+
+            local_scores = scores[candidate_indices]
+            local_returns = returns[candidate_indices]
+            local_gains = gains[candidate_indices]
+            local_positions = predicted_positions[candidate_indices]
+            local_discounts = torch.where(
+                local_positions < cutoff,
+                1.0 / torch.log2(
+                    local_positions.to(scores.dtype) + 2.0
+                ),
+                torch.zeros_like(local_positions, dtype=scores.dtype),
+            )
+            score_difference = (
+                local_scores[:, None] - local_scores[None, :]
+            )
+            return_difference = (
+                local_returns[:, None] - local_returns[None, :]
+            )
+            delta_ndcg = (
+                (local_gains[:, None] - local_gains[None, :]).abs()
+                * (
+                    local_discounts[:, None]
+                    - local_discounts[None, :]
+                ).abs()
+                / ideal_dcg
+            )
+            return_gap_weight = (
+                return_difference.abs()
+                / self.lambdarank_return_gap_scale
+            ).clamp(min=0.25, max=4.0)
+            local_top_weight = weights[
+                batch_index,
+                candidate_indices,
+            ]
+            pair_weight = (
+                delta_ndcg
+                * return_gap_weight
+                * (
+                    local_top_weight[:, None]
+                    + local_top_weight[None, :]
+                )
+                * 0.5
+            )
+            valid_pairs = torch.triu(
+                return_difference.ne(0),
+                diagonal=1,
+            )
+            pair_weight = pair_weight * valid_pairs
+            weight_sum = pair_weight.sum()
+            if weight_sum <= 1e-12:
+                day_losses.append(scores.sum() * 0.0)
+                continue
+            pair_loss = F.softplus(
+                -score_difference * torch.sign(return_difference)
+            )
+            day_losses.append(
+                (pair_loss * pair_weight).sum() / weight_sum
+            )
+        return torch.stack(day_losses).mean()
 
     def rank_ic_loss(self, y_pred, y_true):
         """用预测分数与真实排名的 Pearson 相关性近似优化 Spearman Rank IC。"""
@@ -350,6 +562,13 @@ class WeightedRankingLoss(nn.Module):
         allocation_logits,
         exposure,
         identity_gate=None,
+        risk_1d_logits=None,
+        risk_3d_logits=None,
+        regime_gate=None,
+        risk_1d_targets=None,
+        risk_3d_targets=None,
+        regime_targets=None,
+        stage='joint',
         return_components=False,
     ):
         """
@@ -367,35 +586,88 @@ class WeightedRankingLoss(nn.Module):
         for i in range(batch_size):
             weights[i, top_indices[i]] = self.weight_factor
             
-        # 3. 计算加权损失
-        listwise = self.listwise_loss(y_pred, y_true, weights)
-        pairwise = self.pairwise_loss(y_pred, y_true, weights)
-        rank_ic = self.rank_ic_loss(y_pred, y_true)
-        regression = F.smooth_l1_loss(
-            predicted_returns,
-            raw_returns,
-            beta=self.regression_beta,
-        )
-        allocation, exposure_loss = self.allocation_and_exposure_loss(
-            y_pred,
-            allocation_logits,
-            exposure,
-            raw_returns,
-        )
-        
-        # 排序为主任务，原始收益回归为辅助任务。
-        components = {
-            'listwise_loss': self.listwise_weight * listwise,
-            'pairwise_loss': self.pairwise_weight * pairwise,
-            'ic_loss': self.ic_weight * rank_ic,
-            'regression_loss': self.regression_weight * regression,
-            'allocation_loss': self.allocation_weight * allocation,
-            'exposure_loss': self.exposure_weight * exposure_loss,
-        }
-        if identity_gate is not None and self.id_gate_regularization > 0:
+        components = {}
+        if stage in {'ranking', 'joint'}:
+            listwise = self.listwise_loss(y_pred, y_true, weights)
+            lambdarank = self.lambda_rank_loss(
+                y_pred,
+                y_true,
+                raw_returns,
+                weights,
+            )
+            rank_ic = self.rank_ic_loss(y_pred, y_true)
+            regression = F.smooth_l1_loss(
+                predicted_returns,
+                raw_returns,
+                beta=self.regression_beta,
+            )
+            components.update({
+                'listwise_loss': self.listwise_weight * listwise,
+                'lambdarank_loss': self.pairwise_weight * lambdarank,
+                'ic_loss': self.ic_weight * rank_ic,
+                'regression_loss': self.regression_weight * regression,
+            })
+            if (
+                risk_1d_logits is not None
+                and risk_1d_targets is not None
+                and self.risk_1d_weight > 0
+            ):
+                components['risk_1d_loss'] = (
+                    self.risk_1d_weight
+                    * F.binary_cross_entropy_with_logits(
+                        risk_1d_logits,
+                        risk_1d_targets,
+                    )
+                )
+            if (
+                risk_3d_logits is not None
+                and risk_3d_targets is not None
+                and self.risk_3d_weight > 0
+            ):
+                components['risk_3d_loss'] = (
+                    self.risk_3d_weight
+                    * F.binary_cross_entropy_with_logits(
+                        risk_3d_logits,
+                        risk_3d_targets,
+                    )
+                )
+            if (
+                regime_gate is not None
+                and regime_targets is not None
+                and self.regime_weight > 0
+            ):
+                components['regime_loss'] = (
+                    self.regime_weight
+                    * F.binary_cross_entropy(
+                        regime_gate.reshape(-1),
+                        regime_targets.mean(dim=1),
+                    )
+                )
+        if stage in {'allocation', 'exposure', 'joint'}:
+            allocation, exposure_loss = self.allocation_and_exposure_loss(
+                y_pred,
+                allocation_logits,
+                exposure,
+                raw_returns,
+            )
+            if stage in {'allocation', 'joint'}:
+                components['allocation_loss'] = (
+                    self.allocation_weight * allocation
+                )
+            if stage in {'exposure', 'joint'}:
+                components['exposure_loss'] = (
+                    self.exposure_weight * exposure_loss
+                )
+        if (
+            stage in {'ranking', 'joint'}
+            and identity_gate is not None
+            and self.id_gate_regularization > 0
+        ):
             components['id_gate_regularization'] = (
                 self.id_gate_regularization * identity_gate.square()
             )
+        if not components:
+            raise ValueError(f'训练阶段没有启用损失项: {stage}')
         total_loss = sum(components.values())
         if return_components:
             return total_loss, components
@@ -574,18 +846,39 @@ class RankingDataset(torch.utils.data.Dataset):
         relevance_scores,
         stock_indices,
         prediction_dates,
+        risk_1d_targets=None,
+        risk_3d_targets=None,
+        regime_targets=None,
     ):
         self.sequences = sequences
         self.targets = targets
         self.relevance_scores = relevance_scores
         self.stock_indices = stock_indices
         self.prediction_dates = prediction_dates
+        self.risk_1d_targets = (
+            risk_1d_targets
+            if risk_1d_targets is not None
+            else [np.full_like(target, 0.5) for target in targets]
+        )
+        self.risk_3d_targets = (
+            risk_3d_targets
+            if risk_3d_targets is not None
+            else [np.full_like(target, 0.5) for target in targets]
+        )
+        self.regime_targets = (
+            regime_targets
+            if regime_targets is not None
+            else [np.full_like(target, 0.5) for target in targets]
+        )
         lengths = {
             len(sequences),
             len(targets),
             len(relevance_scores),
             len(stock_indices),
             len(prediction_dates),
+            len(self.risk_1d_targets),
+            len(self.risk_3d_targets),
+            len(self.regime_targets),
         }
         if len(lengths) != 1:
             raise ValueError('排序数据集各字段长度不一致')
@@ -596,19 +889,44 @@ class RankingDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return {
             'sequences': torch.from_numpy(
-                np.asarray(self.sequences[idx], dtype=np.float32)
+                np.array(self.sequences[idx], dtype=np.float32, copy=True)
             ),
             'targets': torch.from_numpy(
-                np.asarray(self.targets[idx], dtype=np.float32)
+                np.array(self.targets[idx], dtype=np.float32, copy=True)
             ),
             'relevance': torch.from_numpy(
-                np.asarray(self.relevance_scores[idx], dtype=np.int64)
+                np.array(
+                    self.relevance_scores[idx],
+                    dtype=np.int64,
+                    copy=True,
+                )
             ),
             'stock_indices': torch.as_tensor(
                 self.stock_indices[idx],
                 dtype=torch.long,
             ),
             'prediction_date': self.prediction_dates[idx],
+            'risk_1d_targets': torch.from_numpy(
+                np.array(
+                    self.risk_1d_targets[idx],
+                    dtype=np.float32,
+                    copy=True,
+                )
+            ),
+            'risk_3d_targets': torch.from_numpy(
+                np.array(
+                    self.risk_3d_targets[idx],
+                    dtype=np.float32,
+                    copy=True,
+                )
+            ),
+            'regime_targets': torch.from_numpy(
+                np.array(
+                    self.regime_targets[idx],
+                    dtype=np.float32,
+                    copy=True,
+                )
+            ),
         }
 
 def collate_fn(batch):
@@ -617,6 +935,9 @@ def collate_fn(batch):
     targets = [item['targets'] for item in batch]
     relevance = [item['relevance'] for item in batch]
     stock_indices = [item['stock_indices'] for item in batch]
+    risk_1d_targets = [item['risk_1d_targets'] for item in batch]
+    risk_3d_targets = [item['risk_3d_targets'] for item in batch]
+    regime_targets = [item['regime_targets'] for item in batch]
     prediction_dates = [item['prediction_date'] for item in batch]
     
     # 找到最大股票数量
@@ -627,9 +948,28 @@ def collate_fn(batch):
     padded_targets = []
     padded_relevance = []
     padded_stock_indices = []
+    padded_risk_1d_targets = []
+    padded_risk_3d_targets = []
+    padded_regime_targets = []
     masks = []
     
-    for seq, tgt, rel, stock_idx in zip(sequences, targets, relevance, stock_indices):
+    for (
+        seq,
+        tgt,
+        rel,
+        stock_idx,
+        risk_1d,
+        risk_3d,
+        regime,
+    ) in zip(
+        sequences,
+        targets,
+        relevance,
+        stock_indices,
+        risk_1d_targets,
+        risk_3d_targets,
+        regime_targets,
+    ):
         num_stocks = seq.size(0)
         seq_len = seq.size(1)
         feature_dim = seq.size(2)
@@ -641,11 +981,15 @@ def collate_fn(batch):
             tgt_pad = torch.zeros(pad_size)
             rel_pad = torch.zeros(pad_size, dtype=torch.long)
             stock_pad = torch.zeros(pad_size, dtype=torch.long)
+            risk_target_pad = torch.full((pad_size,), 0.5)
             
             seq = torch.cat([seq, seq_pad], dim=0)
             tgt = torch.cat([tgt, tgt_pad], dim=0)
             rel = torch.cat([rel, rel_pad], dim=0)
             stock_idx = torch.cat([stock_idx, stock_pad], dim=0)
+            risk_1d = torch.cat([risk_1d, risk_target_pad], dim=0)
+            risk_3d = torch.cat([risk_3d, risk_target_pad], dim=0)
+            regime = torch.cat([regime, risk_target_pad], dim=0)
         
         # 创建mask标记有效位置
         mask = torch.ones(max_stocks)
@@ -655,6 +999,9 @@ def collate_fn(batch):
         padded_targets.append(tgt)
         padded_relevance.append(rel)
         padded_stock_indices.append(stock_idx)
+        padded_risk_1d_targets.append(risk_1d)
+        padded_risk_3d_targets.append(risk_3d)
+        padded_regime_targets.append(regime)
         masks.append(mask)
     
     return {
@@ -663,6 +1010,9 @@ def collate_fn(batch):
         'relevance': torch.stack(padded_relevance),      # [batch, max_stocks]
         'stock_indices': torch.stack(padded_stock_indices),  # [batch, max_stocks]
         'masks': torch.stack(masks),                     # [batch, max_stocks]
+        'risk_1d_targets': torch.stack(padded_risk_1d_targets),
+        'risk_3d_targets': torch.stack(padded_risk_3d_targets),
+        'regime_targets': torch.stack(padded_regime_targets),
         'prediction_dates': prediction_dates,
     }
 
@@ -712,8 +1062,9 @@ def train_ranking_model(
     epoch,
     writer,
     grad_scaler,
+    stage='ranking',
 ):
-    model.train()
+    set_model_stage_mode(model, stage, training=True)
     total_loss = 0
     total_loss_components = {}
     local_step = 0
@@ -724,6 +1075,18 @@ def train_ranking_model(
         relevance = move_batch_tensor(batch['relevance'], device)
         stock_indices = move_batch_tensor(batch['stock_indices'], device)
         masks = move_batch_tensor(batch['masks'], device)
+        risk_1d_targets = move_batch_tensor(
+            batch['risk_1d_targets'],
+            device,
+        )
+        risk_3d_targets = move_batch_tensor(
+            batch['risk_3d_targets'],
+            device,
+        )
+        regime_targets = move_batch_tensor(
+            batch['regime_targets'],
+            device,
+        )
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -733,10 +1096,17 @@ def train_ranking_model(
             dtype=torch.float16,
             enabled=use_amp(device),
         ):
-            outputs, return_outputs, allocation_outputs, exposures = model(
+            (
+                outputs,
+                return_outputs,
+                allocation_outputs,
+                exposures,
+                auxiliary_outputs,
+            ) = model(
                 sequences,
                 stock_indices,
                 masks,
+                return_aux=True,
             )
         outputs = outputs.float()
         return_outputs = return_outputs.float()
@@ -771,6 +1141,9 @@ def train_ranking_model(
             valid_return_pred = masked_return_outputs[i][valid_indices]
             valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
             valid_raw_return = masked_targets[i][valid_indices]
+            valid_risk_1d_targets = risk_1d_targets[i][valid_indices]
+            valid_risk_3d_targets = risk_3d_targets[i][valid_indices]
+            valid_regime_targets = regime_targets[i][valid_indices]
             
             if len(valid_pred) > 1:
                 # 直接使用预处理好的相关性得分，无需重新计算
@@ -782,6 +1155,29 @@ def train_ranking_model(
                     valid_allocation_logits.unsqueeze(0),
                     exposures[i].reshape(1),
                     identity_gate=model.identity_gate_value(),
+                    risk_1d_logits=(
+                        auxiliary_outputs['risk_1d_logits'][
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0)
+                        if auxiliary_outputs['risk_1d_logits'] is not None
+                        else None
+                    ),
+                    risk_3d_logits=(
+                        auxiliary_outputs['risk_3d_logits'][
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0)
+                        if auxiliary_outputs['risk_3d_logits'] is not None
+                        else None
+                    ),
+                    regime_gate=auxiliary_outputs['regime_gate'][
+                        i
+                    ].reshape(1),
+                    risk_1d_targets=valid_risk_1d_targets.unsqueeze(0),
+                    risk_3d_targets=valid_risk_3d_targets.unsqueeze(0),
+                    regime_targets=valid_regime_targets.unsqueeze(0),
+                    stage=stage,
                     return_components=True,
                 )
                 batch_loss = batch_loss + loss if isinstance(batch_loss, torch.Tensor) else loss
@@ -798,7 +1194,11 @@ def train_ranking_model(
                 grad_scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
                 if writer:
-                    writer.add_scalar('train/grad_norm', grad_norm, global_step=epoch*len(dataloader)+local_step)
+                    writer.add_scalar(
+                        f'{stage}/train/grad_norm',
+                        grad_norm,
+                        global_step=epoch * len(dataloader) + local_step,
+                    )
             grad_scaler.step(optimizer)
             grad_scaler.update()
             
@@ -808,10 +1208,14 @@ def train_ranking_model(
             
             local_step += 1
             if writer:
-                writer.add_scalar('train/loss', batch_loss.item(), global_step=epoch*len(dataloader)+local_step)
+                writer.add_scalar(
+                    f'{stage}/train/loss',
+                    batch_loss.item(),
+                    global_step=epoch * len(dataloader) + local_step,
+                )
                 for name, value in batch_loss_components.items():
                     writer.add_scalar(
-                        f'train/{name}',
+                        f'{stage}/train/{name}',
                         value.item(),
                         global_step=epoch*len(dataloader)+local_step,
                     )
@@ -837,8 +1241,9 @@ def evaluate_ranking_model(
     return_predictions=False,
     selection_risk_feature_names=None,
     selection_risk_scaler=None,
+    stage='ranking',
 ):
-    model.eval()
+    set_model_stage_mode(model, stage, training=False)
     total_loss = 0
     num_batches = 0
     metric_records = []
@@ -850,16 +1255,35 @@ def evaluate_ranking_model(
             targets = move_batch_tensor(batch['targets'], device)
             stock_indices = move_batch_tensor(batch['stock_indices'], device)
             masks = move_batch_tensor(batch['masks'], device)
+            risk_1d_targets = move_batch_tensor(
+                batch['risk_1d_targets'],
+                device,
+            )
+            risk_3d_targets = move_batch_tensor(
+                batch['risk_3d_targets'],
+                device,
+            )
+            regime_targets = move_batch_tensor(
+                batch['regime_targets'],
+                device,
+            )
             
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16,
                 enabled=use_amp(device),
             ):
-                outputs, return_outputs, allocation_outputs, exposures = model(
+                (
+                    outputs,
+                    return_outputs,
+                    allocation_outputs,
+                    exposures,
+                    auxiliary_outputs,
+                ) = model(
                     sequences,
                     stock_indices,
                     masks,
+                    return_aux=True,
                 )
             outputs = outputs.float()
             return_outputs = return_outputs.float()
@@ -905,6 +1329,42 @@ def evaluate_ranking_model(
                         valid_allocation_logits.unsqueeze(0),
                         exposures[i].reshape(1),
                         identity_gate=model.identity_gate_value(),
+                        risk_1d_logits=(
+                            auxiliary_outputs['risk_1d_logits'][
+                                i,
+                                valid_indices,
+                            ].unsqueeze(0)
+                            if auxiliary_outputs[
+                                'risk_1d_logits'
+                            ] is not None
+                            else None
+                        ),
+                        risk_3d_logits=(
+                            auxiliary_outputs['risk_3d_logits'][
+                                i,
+                                valid_indices,
+                            ].unsqueeze(0)
+                            if auxiliary_outputs[
+                                'risk_3d_logits'
+                            ] is not None
+                            else None
+                        ),
+                        regime_gate=auxiliary_outputs['regime_gate'][
+                            i
+                        ].reshape(1),
+                        risk_1d_targets=risk_1d_targets[
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0),
+                        risk_3d_targets=risk_3d_targets[
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0),
+                        regime_targets=regime_targets[
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0),
+                        stage=stage,
                     )
                     batch_loss = batch_loss + loss if batch_loss is not None else loss
             
@@ -953,6 +1413,47 @@ def evaluate_ranking_model(
                             .detach().cpu().numpy()
                         ),
                         'exposure': float(exposures[i].item()),
+                        'regime_gate': float(
+                            auxiliary_outputs['regime_gate'][i].item()
+                        ),
+                        'risk_1d_probabilities': (
+                            torch.sigmoid(
+                                auxiliary_outputs['risk_1d_logits'][
+                                    i,
+                                    valid_indices,
+                                ]
+                            ).detach().cpu().numpy()
+                            if auxiliary_outputs[
+                                'risk_1d_logits'
+                            ] is not None
+                            else np.full(valid_indices.numel(), 0.5)
+                        ),
+                        'risk_3d_probabilities': (
+                            torch.sigmoid(
+                                auxiliary_outputs['risk_3d_logits'][
+                                    i,
+                                    valid_indices,
+                                ]
+                            ).detach().cpu().numpy()
+                            if auxiliary_outputs[
+                                'risk_3d_logits'
+                            ] is not None
+                            else np.full(valid_indices.numel(), 0.5)
+                        ),
+                        'risk_1d_targets': risk_1d_targets[
+                            i,
+                            valid_indices,
+                        ].detach().cpu().numpy(),
+                        'risk_3d_targets': risk_3d_targets[
+                            i,
+                            valid_indices,
+                        ].detach().cpu().numpy(),
+                        'regime_target': float(
+                            regime_targets[
+                                i,
+                                valid_indices,
+                            ].mean().item()
+                        ),
                     }
                     if (
                         selection_risk_feature_names is not None
@@ -977,9 +1478,17 @@ def evaluate_ranking_model(
     total_metrics = summarize_ranking_metric_records(metric_records)
     
     if writer:
-        writer.add_scalar('eval/loss', avg_loss, global_step=epoch)
+        writer.add_scalar(
+            f'{stage}/eval/loss',
+            avg_loss,
+            global_step=epoch,
+        )
         for k, v in total_metrics.items():
-            writer.add_scalar(f'eval/{k}', v, global_step=epoch)
+            writer.add_scalar(
+                f'{stage}/eval/{k}',
+                v,
+                global_step=epoch,
+            )
     
     if return_predictions:
         return avg_loss, total_metrics, prediction_records
@@ -1239,7 +1748,51 @@ def build_walk_forward_folds(df, num_folds, validation_months, purge_days):
 
     return folds
 
-def build_training_components(model):
+def configure_model_for_stage(model, stage):
+    """冻结非当前阶段参数，并避免冻结主干的 dropout 改变候选集合。"""
+    valid_stages = {'ranking', 'allocation', 'exposure'}
+    if stage not in valid_stages:
+        raise ValueError(f'未知训练阶段: {stage}')
+    allocation_prefixes = ('allocation_head.',)
+    exposure_prefixes = (
+        'exposure_market_encoder.',
+        'exposure_head.',
+    )
+    for name, parameter in model.named_parameters():
+        is_allocation = name.startswith(allocation_prefixes)
+        is_exposure = name.startswith(exposure_prefixes)
+        if stage == 'ranking':
+            parameter.requires_grad = not (is_allocation or is_exposure)
+        elif stage == 'allocation':
+            parameter.requires_grad = is_allocation
+        else:
+            parameter.requires_grad = is_exposure
+
+
+def set_model_stage_mode(model, stage, training):
+    if not training:
+        model.eval()
+        return
+    if stage == 'ranking':
+        model.train()
+        model.allocation_head.eval()
+        model.exposure_head.eval()
+        if hasattr(model, 'exposure_market_encoder'):
+            model.exposure_market_encoder.eval()
+    elif stage == 'allocation':
+        model.eval()
+        model.allocation_head.train()
+    elif stage == 'exposure':
+        model.eval()
+        model.exposure_head.train()
+        if hasattr(model, 'exposure_market_encoder'):
+            model.exposure_market_encoder.train()
+    else:
+        raise ValueError(f'未知训练阶段: {stage}')
+
+
+def build_training_components(model, stage='ranking'):
+    configure_model_for_stage(model, stage)
     criterion = WeightedRankingLoss(
         k=5,
         listwise_temperature=config.get('listwise_temperature', 0.2),
@@ -1267,12 +1820,26 @@ def build_training_components(model):
         ),
         exposure_downside_weight=config.get('exposure_downside_weight', 0.25),
         id_gate_regularization=config.get('id_gate_regularization', 0.0),
+        lambdarank_candidate_k=config.get('lambdarank_candidate_k', 20),
+        lambdarank_hard_negative_k=config.get(
+            'lambdarank_hard_negative_k',
+            20,
+        ),
+        lambdarank_return_gap_scale=config.get(
+            'lambdarank_return_gap_scale',
+            0.02,
+        ),
+        risk_1d_weight=config.get('risk_1d_weight', 0.0),
+        risk_3d_weight=config.get('risk_3d_weight', 0.0),
+        regime_weight=config.get('regime_weight', 0.0),
         min_exposure=config.get('min_exposure', 0.80),
         max_exposure=config.get('max_exposure', 0.999999),
     )
     regular_parameters = []
     no_decay_parameters = []
     for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
         if name == 'identity_gate_logit':
             no_decay_parameters.append(parameter)
         else:
@@ -1287,7 +1854,10 @@ def build_training_components(model):
             'weight_decay': 0.0,
         })
     optimizer_kwargs = {
-        'lr': config['learning_rate'],
+        'lr': float(config.get(
+            f'{stage}_learning_rate',
+            config['learning_rate'],
+        )),
     }
     if (
         next(model.parameters()).is_cuda
@@ -1320,7 +1890,142 @@ def calculate_checkpoint_score(metrics, checkpoint_metric):
             metrics.get('weighted_portfolio_return', 0.0)
             + config.get('checkpoint_rank_ic_weight', 0.2) * metrics.get('rank_ic', 0.0)
         )
+    if checkpoint_metric == 'allocation_contribution':
+        return metrics.get('allocation_contribution', 0.0)
+    if checkpoint_metric == 'weighted_portfolio_risk_adjusted':
+        return (
+            metrics.get('weighted_portfolio_return', 0.0)
+            - config.get('ensemble_downside_weight', 0.5)
+            * metrics.get('weighted_portfolio_downside_deviation', 0.0)
+        )
     return metrics.get(checkpoint_metric, 0.0)
+
+
+def stage_settings(stage):
+    defaults = {
+        'ranking': {
+            'max_epochs': config['max_epochs'],
+            'patience': config['patience'],
+            'checkpoint_metric': 'top5_return_plus_rank_ic',
+        },
+        'allocation': {
+            'max_epochs': 12,
+            'patience': 4,
+            'checkpoint_metric': 'allocation_contribution',
+        },
+        'exposure': {
+            'max_epochs': 12,
+            'patience': 4,
+            'checkpoint_metric': 'weighted_portfolio_risk_adjusted',
+        },
+    }
+    settings = defaults[stage]
+    return {
+        'max_epochs': int(config.get(
+            f'{stage}_max_epochs',
+            settings['max_epochs'],
+        )),
+        'patience': int(config.get(
+            f'{stage}_patience',
+            settings['patience'],
+        )),
+        'checkpoint_metric': config.get(
+            f'{stage}_checkpoint_metric',
+            settings['checkpoint_metric'],
+        ),
+    }
+
+
+def fit_training_stage(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    writer,
+    stage,
+    checkpoint_path,
+    fold_number=None,
+):
+    """训练单一阶段并恢复该阶段最佳完整模型状态。"""
+    settings = stage_settings(stage)
+    criterion, optimizer = build_training_components(model, stage=stage)
+    grad_scaler = create_grad_scaler(device)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0,
+        end_factor=0.2,
+        total_iters=settings['max_epochs'],
+    )
+    best_score = -float('inf')
+    best_epoch = -1
+    epochs_without_improvement = 0
+    epochs_ran = 0
+    for epoch in range(settings['max_epochs']):
+        epochs_ran = epoch + 1
+        train_loss, train_metrics = train_ranking_model(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
+            writer,
+            grad_scaler,
+            stage=stage,
+        )
+        eval_loss, eval_metrics = evaluate_ranking_model(
+            model,
+            val_loader,
+            criterion,
+            device,
+            writer,
+            epoch,
+            stage=stage,
+        )
+        scheduler.step()
+        if writer:
+            writer.add_scalar(
+                f'{stage}/learning_rate',
+                scheduler.get_last_lr()[0],
+                global_step=epoch,
+            )
+        current_score = calculate_checkpoint_score(
+            eval_metrics,
+            settings['checkpoint_metric'],
+        )
+        location = (
+            f'Fold {fold_number} '
+            if fold_number is not None
+            else 'Full train '
+        )
+        print(
+            f"{location}{stage} Epoch {epoch + 1}: "
+            f"train_loss={train_loss:.4f}, eval_loss={eval_loss:.4f}, "
+            f"top5={eval_metrics.get('top5_return', 0.0):.6f}, "
+            f"rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}, "
+            f"allocation_gain={eval_metrics.get('allocation_contribution', 0.0):.6f}, "
+            f"weighted={eval_metrics.get('weighted_portfolio_return', 0.0):.6f}, "
+            f"checkpoint={current_score:.6f}"
+        )
+        if current_score > best_score:
+            best_score = current_score
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), checkpoint_path)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= settings['patience']:
+                break
+    if best_epoch < 1:
+        raise RuntimeError(f'{stage}阶段没有产生有效checkpoint')
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    return {
+        'stage': stage,
+        'best_epoch': best_epoch,
+        'epochs_ran': epochs_ran,
+        'checkpoint_metric': settings['checkpoint_metric'],
+        'checkpoint_score': float(best_score),
+    }
 
 
 def summarize_identity_sensitivity(fold_results):
@@ -1409,22 +2114,6 @@ def train_one_fold(
     val_loader = build_data_loader(val_eval_dataset, False, device)
 
     model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
-    criterion, optimizer = build_training_components(model)
-    grad_scaler = create_grad_scaler(device)
-    max_epochs = config['max_epochs']
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0,
-        end_factor=0.2,
-        total_iters=max_epochs,
-    )
-
-    checkpoint_metric = config.get('checkpoint_metric', 'top5_return')
-    best_score = -float('inf')
-    best_epoch = -1
-    epochs_without_improvement = 0
-    epochs_ran = 0
-    checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
     print(
         f"\n========== Seed {base_seed} "
         f"Fold {fold_number}/{config['num_folds']} =========="
@@ -1434,53 +2123,30 @@ def train_one_fold(
         f"验证样本: {len(val_dataset)}; "
         f"非重叠验证日期: {len(val_eval_dataset)}"
     )
-
-    for epoch in range(max_epochs):
-        epochs_ran = epoch + 1
-        train_loss, train_metrics = train_ranking_model(
+    stage_results = {}
+    checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
+    for stage in ('ranking', 'allocation', 'exposure'):
+        stage_results[stage] = fit_training_stage(
             model,
             train_loader,
-            criterion,
-            optimizer,
+            val_loader,
             device,
-            epoch,
             writer,
-            grad_scaler,
-        )
-        eval_loss, eval_metrics = evaluate_ranking_model(
-            model, val_loader, criterion, device, writer, epoch
-        )
-        scheduler.step()
-        writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
-        current_score = calculate_checkpoint_score(eval_metrics, checkpoint_metric)
-        print(
-            f"Fold {fold_number} Epoch {epoch + 1}: "
-            f"train_loss={train_loss:.4f}, eval_loss={eval_loss:.4f}, "
-            f"val_top5={eval_metrics.get('top5_return', 0.0):.6f}, "
-            f"val_rank_ic={eval_metrics.get('rank_ic', 0.0):.4f}, "
-            f"val_weighted_return={eval_metrics.get('weighted_portfolio_return', 0.0):.6f}, "
-            f"val_exposure={eval_metrics.get('gross_exposure', 0.0):.4f}, "
-            f"id_gate={model.identity_gate_value().detach().item():.4f}, "
-            f"checkpoint_score={current_score:.6f}"
+            stage,
+            checkpoint_path,
+            fold_number=fold_number,
         )
 
-        if current_score > best_score:
-            best_score = current_score
-            best_epoch = epoch + 1
-            epochs_without_improvement = 0
-            torch.save(model.state_dict(), checkpoint_path)
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= config['patience']:
-                print(
-                    f"Fold {fold_number} early stopping: "
-                    f"{config['patience']} epochs without {checkpoint_metric} improvement"
-                )
-                break
-
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    criterion, _ = build_training_components(model, stage='exposure')
+    best_epoch = stage_results['ranking']['best_epoch']
     _, train_eval_metrics = evaluate_ranking_model(
-        model, train_eval_loader, criterion, device, None, best_epoch - 1
+        model,
+        train_eval_loader,
+        criterion,
+        device,
+        None,
+        best_epoch - 1,
+        stage='exposure',
     )
     _, val_eval_metrics, oof_predictions = evaluate_ranking_model(
         model,
@@ -1492,6 +2158,7 @@ def train_one_fold(
         return_predictions=True,
         selection_risk_feature_names=features,
         selection_risk_scaler=scaler,
+        stage='exposure',
     )
     id_sensitivity = evaluate_identity_sensitivity(
         model,
@@ -1515,9 +2182,10 @@ def train_one_fold(
         'val_start': fold['val_start'].strftime('%Y-%m-%d'),
         'val_end': fold['val_end'].strftime('%Y-%m-%d'),
         'best_epoch': best_epoch,
-        'epochs_ran': epochs_ran,
-        'checkpoint_metric': checkpoint_metric,
-        'checkpoint_score': float(best_score),
+        'epochs_ran': stage_results['ranking']['epochs_ran'],
+        'checkpoint_metric': stage_results['ranking']['checkpoint_metric'],
+        'checkpoint_score': stage_results['ranking']['checkpoint_score'],
+        'stage_training': stage_results,
         'evaluation_stride': evaluation_stride,
         'num_daily_validation_samples': len(val_dataset),
         'num_non_overlapping_validation_samples': len(val_eval_dataset),
@@ -1575,62 +2243,66 @@ def train_final_model(
     num_stocks,
     device,
     output_dir,
-    num_epochs,
-    median_best_epoch,
+    stage_epochs,
     base_seed,
 ):
-    """按统一 CV epoch 用一个随机种子完成全量重训。"""
+    """按三折中位数依次完成 Ranking、Allocation、Exposure 全量重训。"""
     set_seed(base_seed + 1000)
     final_dir = os.path.join(output_dir, 'full_train')
     os.makedirs(final_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=os.path.join(final_dir, 'log'))
     train_loader = build_data_loader(train_dataset, True, device)
     model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
-    criterion, optimizer = build_training_components(model)
-    grad_scaler = create_grad_scaler(device)
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0,
-        end_factor=0.2,
-        total_iters=num_epochs,
-    )
 
     print(
         f"\n========== Seed {base_seed} full-data retraining: "
-        f"{num_epochs} epochs =========="
+        f"{stage_epochs} =========="
     )
-    for epoch in range(num_epochs):
-        train_loss, train_metrics = train_ranking_model(
+    for stage in ('ranking', 'allocation', 'exposure'):
+        num_epochs = int(stage_epochs[stage])
+        criterion, optimizer = build_training_components(
             model,
-            train_loader,
-            criterion,
+            stage=stage,
+        )
+        grad_scaler = create_grad_scaler(device)
+        scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            device,
-            epoch,
-            writer,
-            grad_scaler,
+            start_factor=1.0,
+            end_factor=0.2,
+            total_iters=num_epochs,
         )
-        scheduler.step()
-        writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
-        print(
-            f"Full train Epoch {epoch + 1}/{num_epochs}: "
-            f"loss={train_loss:.4f}, "
-            f"listwise={train_metrics.get('listwise_loss', 0.0):.4f}, "
-            f"pairwise={train_metrics.get('pairwise_loss', 0.0):.4f}, "
-            f"ic_loss={train_metrics.get('ic_loss', 0.0):.4f}, "
-            f"regression={train_metrics.get('regression_loss', 0.0):.4f}, "
-            f"allocation={train_metrics.get('allocation_loss', 0.0):.4f}, "
-            f"exposure_loss={train_metrics.get('exposure_loss', 0.0):.4f}, "
-            f"id_gate={model.identity_gate_value().detach().item():.4f}"
-        )
+        for epoch in range(num_epochs):
+            train_loss, train_metrics = train_ranking_model(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                epoch,
+                writer,
+                grad_scaler,
+                stage=stage,
+            )
+            scheduler.step()
+            writer.add_scalar(
+                f'{stage}/learning_rate',
+                scheduler.get_last_lr()[0],
+                global_step=epoch,
+            )
+            print(
+                f"Full train {stage} Epoch {epoch + 1}/{num_epochs}: "
+                f"loss={train_loss:.4f}, "
+                f"id_gate={model.identity_gate_value().detach().item():.4f}"
+            )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
     metadata = {
         'base_seed': int(base_seed),
-        'epochs': num_epochs,
-        'epoch_selection': 'median_across_all_fold_checkpoints',
-        'median_best_epoch': median_best_epoch,
-        'min_final_epochs': config['min_final_epochs'],
+        'stage_epochs': {
+            stage: int(stage_epochs[stage])
+            for stage in ('ranking', 'allocation', 'exposure')
+        },
+        'epoch_selection': 'per_stage_median_across_fold_checkpoints',
         'train_end': pd.Timestamp(train_end).strftime('%Y-%m-%d'),
         'ranking_samples': len(train_dataset),
         'identity_gate': float(
@@ -1695,9 +2367,13 @@ def main():
     full_data, features = preprocess_data(full_df, is_train=True, stockid2idx=stockid2idx)
     full_data['日期'] = pd.to_datetime(full_data['日期'])
     if config.get('exposure_market_encoder_enabled', False):
+        market_feature_names = [
+            *RELATIVE_MARKET_FEATURES[-5:],
+            *MARKET_PRESSURE_FEATURES,
+        ]
         expected_market_indices = [
             features.index(name)
-            for name in RELATIVE_MARKET_FEATURES[-5:]
+            for name in market_feature_names
         ]
         configured_market_indices = [
             int(index)
@@ -1707,6 +2383,18 @@ def main():
             raise ValueError(
                 'market_state_feature_indices 与市场状态特征位置不一致: '
                 f'{configured_market_indices} != {expected_market_indices}'
+            )
+        configured_regime_indices = [
+            int(index)
+            for index in config.get(
+                'regime_market_feature_indices',
+                configured_market_indices,
+            )
+        ]
+        if configured_regime_indices != expected_market_indices:
+            raise ValueError(
+                'regime_market_feature_indices 与市场压力特征位置不一致: '
+                f'{configured_regime_indices} != {expected_market_indices}'
             )
 
     fold_results = []
@@ -1847,6 +2535,13 @@ def main():
             ensemble_metrics['exposure_std']
             >= config.get('promotion_min_exposure_std', 0.01)
         ),
+        'regime_gate_not_constant': bool(
+            ensemble_metrics['regime_gate_std']
+            >= config.get('promotion_min_regime_gate_std', 0.01)
+        ),
+        'regime_gate_direction': bool(
+            ensemble_metrics['regime_return_spearman'] < 0.0
+        ),
         'id_score_correlation': bool(
             unk_sensitivity.get('score_spearman', 0.0)
             >= config.get('promotion_id_score_correlation', 0.90)
@@ -1861,15 +2556,29 @@ def main():
         if key != 'applicable'
     )
 
-    # 所有已运行折 checkpoint 统一决定全量模型训练轮数。
-    median_best_epoch = int(np.median([result['best_epoch'] for result in fold_results]))
-    min_final_epochs = config.get('min_final_epochs', 1)
-    if not 1 <= min_final_epochs <= config['max_epochs']:
-        raise ValueError('min_final_epochs 必须位于 [1, max_epochs] 范围内')
-    final_epochs = min(
-        config['max_epochs'],
-        max(min_final_epochs, median_best_epoch),
-    )
+    stage_epochs = {}
+    stage_epoch_selection = {}
+    for stage in ('ranking', 'allocation', 'exposure'):
+        median_epoch = int(np.median([
+            result['stage_training'][stage]['best_epoch']
+            for result in fold_results
+        ]))
+        minimum_epoch = int(config.get(
+            f'{stage}_min_final_epochs',
+            config.get('min_final_epochs', 1) if stage == 'ranking' else 3,
+        ))
+        maximum_epoch = stage_settings(stage)['max_epochs']
+        if not 1 <= minimum_epoch <= maximum_epoch:
+            raise ValueError(f'{stage}_min_final_epochs 超出阶段训练范围')
+        stage_epochs[stage] = min(
+            maximum_epoch,
+            max(minimum_epoch, median_epoch),
+        )
+        stage_epoch_selection[stage] = {
+            'median_best_epoch': median_epoch,
+            'min_final_epochs': minimum_epoch,
+            'final_epochs': stage_epochs[stage],
+        }
     full_train_dataset, full_train_end = prepare_full_training_dataset(
         full_data=full_data,
         features=features,
@@ -1886,8 +2595,7 @@ def main():
             num_stocks=len(stockid2idx),
             device=device,
             output_dir=seed_dir,
-            num_epochs=final_epochs,
-            median_best_epoch=median_best_epoch,
+            stage_epochs=stage_epochs,
             base_seed=base_seed,
         ))
         model_paths.append(
@@ -1947,6 +2655,20 @@ def main():
         'mean_model_disagreement': ensemble_metrics[
             'mean_model_disagreement'
         ],
+        'mean_regime_gate': ensemble_metrics['mean_regime_gate'],
+        'regime_gate_std': ensemble_metrics['regime_gate_std'],
+        'mean_selected_risk_1d': ensemble_metrics[
+            'mean_selected_risk_1d'
+        ],
+        'mean_selected_risk_3d': ensemble_metrics[
+            'mean_selected_risk_3d'
+        ],
+        'mean_risk_1d_brier': ensemble_metrics['mean_risk_1d_brier'],
+        'mean_risk_3d_brier': ensemble_metrics['mean_risk_3d_brier'],
+        'mean_regime_brier': ensemble_metrics['mean_regime_brier'],
+        'regime_return_spearman': ensemble_metrics[
+            'regime_return_spearman'
+        ],
         'mean_allocation_contribution': ensemble_metrics[
             'mean_allocation_contribution'
         ],
@@ -1977,11 +2699,12 @@ def main():
         'promotion_criteria': promotion_criteria,
         'folds': fold_results,
         'full_training': {
-            'epochs': final_epochs,
-            'epoch_selection': 'median_across_all_fold_checkpoints',
+            'stage_epochs': stage_epochs,
+            'epoch_selection': (
+                'per_stage_median_across_all_fold_checkpoints'
+            ),
             'num_fold_checkpoints': len(fold_results),
-            'median_best_epoch': median_best_epoch,
-            'min_final_epochs': min_final_epochs,
+            'stage_epoch_selection': stage_epoch_selection,
             'models': full_training,
         },
     }
