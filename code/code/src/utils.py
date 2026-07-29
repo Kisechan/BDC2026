@@ -980,6 +980,53 @@ def _positive_correlation_matrix(return_history):
     return np.maximum(correlations, 0.0)
 
 
+def _multi_window_positive_correlation(return_history, lookbacks):
+    """取多个严格因果窗口正相关的逐元素最大值。"""
+    return_history = np.asarray(return_history, dtype=np.float64)
+    lookbacks = tuple(sorted({int(value) for value in lookbacks}))
+    if not lookbacks or lookbacks[0] < 2:
+        raise ValueError('相关性窗口必须至少包含一个不小于2的整数')
+    if lookbacks[-1] > return_history.shape[1]:
+        raise ValueError('相关性窗口超过可用收益历史')
+    return np.maximum.reduce([
+        _positive_correlation_matrix(return_history[:, -lookback:])
+        for lookback in lookbacks
+    ])
+
+
+def _candidate_correlation_clusters(
+    correlations,
+    candidate_indices,
+    threshold,
+):
+    """按阈值图的连通分量构造确定性的相关簇。"""
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError('相关簇阈值必须位于 [0, 1]')
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    cluster_by_index = np.full(correlations.shape[0], -1, dtype=np.int64)
+    unvisited = set(int(index) for index in candidate_indices)
+    cluster_id = 0
+    while unvisited:
+        start = min(unvisited)
+        stack = [start]
+        unvisited.remove(start)
+        members = []
+        while stack:
+            current = stack.pop()
+            members.append(current)
+            neighbours = [
+                index
+                for index in sorted(unvisited)
+                if correlations[current, index] >= threshold
+            ]
+            for index in neighbours:
+                unvisited.remove(index)
+                stack.append(index)
+        cluster_by_index[members] = cluster_id
+        cluster_id += 1
+    return cluster_by_index
+
+
 def _mean_pairwise_correlation(correlations, indices):
     indices = np.asarray(indices, dtype=np.int64)
     if indices.size < 2:
@@ -995,6 +1042,10 @@ def select_risk_aware_top_indices(
     return_history,
     risk_gamma=0.0,
     candidate_k=20,
+    correlation_lookbacks=None,
+    cluster_cap_enabled=False,
+    cluster_correlation_threshold=0.60,
+    max_stocks_per_cluster=2,
     top_k=5,
 ):
     """从排名候选中以反转风险和历史正相关惩罚贪心选择Top-k。"""
@@ -1015,6 +1066,8 @@ def select_risk_aware_top_indices(
     candidate_k = min(int(candidate_k), scores.size)
     if candidate_k < top_k:
         raise ValueError('selection_candidate_k 不能小于 Top-k')
+    if max_stocks_per_cluster < 1:
+        raise ValueError('max_stocks_per_cluster 必须大于0')
     if not (
         np.isfinite(scores).all()
         and np.isfinite(momentum_percentiles).all()
@@ -1030,9 +1083,19 @@ def select_risk_aware_top_indices(
         0.6 * np.maximum(cs60 - cs5, 0.0)
         + 0.4 * np.maximum(cs20 - cs5, 0.0)
     )
-    positive_correlations = _positive_correlation_matrix(return_history)
+    if correlation_lookbacks is None:
+        correlation_lookbacks = (return_history.shape[1],)
+    positive_correlations = _multi_window_positive_correlation(
+        return_history,
+        correlation_lookbacks,
+    )
+    cluster_by_index = _candidate_correlation_clusters(
+        positive_correlations,
+        candidate_indices,
+        cluster_correlation_threshold,
+    )
 
-    if risk_gamma == 0.0:
+    if risk_gamma == 0.0 and not cluster_cap_enabled:
         selected = raw_top_indices.tolist()
         selected_correlation_risks = [
             0.0 if position == 0 else float(
@@ -1043,12 +1106,20 @@ def select_risk_aware_top_indices(
     else:
         selected = []
         selected_correlation_risks = []
+        selected_cluster_counts = {}
         remaining = set(int(index) for index in candidate_indices)
         while len(selected) < top_k:
             best_index = None
             best_utility = -float('inf')
             best_correlation_risk = 0.0
             for index in sorted(remaining):
+                cluster_id = int(cluster_by_index[index])
+                if (
+                    cluster_cap_enabled
+                    and selected_cluster_counts.get(cluster_id, 0)
+                    >= max_stocks_per_cluster
+                ):
+                    continue
                 correlation_risk = (
                     0.0
                     if not selected
@@ -1075,8 +1146,17 @@ def select_risk_aware_top_indices(
                     best_index = index
                     best_utility = utility
                     best_correlation_risk = correlation_risk
+            if best_index is None:
+                raise ValueError(
+                    '相关簇硬约束下候选池不足，无法选满Top-k；'
+                    '请扩大候选池或调整聚类阈值'
+                )
             selected.append(best_index)
             selected_correlation_risks.append(best_correlation_risk)
+            best_cluster = int(cluster_by_index[best_index])
+            selected_cluster_counts[best_cluster] = (
+                selected_cluster_counts.get(best_cluster, 0) + 1
+            )
             remaining.remove(best_index)
 
     selected = np.asarray(selected, dtype=np.int64)
@@ -1091,6 +1171,12 @@ def select_risk_aware_top_indices(
             selected_correlation_risks,
             dtype=np.float64,
         ),
+        'cluster_ids': cluster_by_index[selected],
+        'raw_cluster_ids': cluster_by_index[raw_top_indices],
+        'num_candidate_clusters': int(
+            np.unique(cluster_by_index[candidate_indices]).size
+        ),
+        'cluster_cap_enabled': bool(cluster_cap_enabled),
         'mean_positive_correlation': _mean_pairwise_correlation(
             positive_correlations,
             selected,
@@ -1114,6 +1200,10 @@ def build_ensemble_portfolio(
     selection_risk_context=None,
     selection_risk_gamma=0.0,
     selection_candidate_k=20,
+    correlation_lookbacks=(20,),
+    cluster_cap_enabled=False,
+    cluster_correlation_threshold=0.60,
+    max_stocks_per_cluster=2,
     risk_probability_matrix=None,
     regime_gates=None,
     risk_score_penalty=0.0,
@@ -1189,8 +1279,8 @@ def build_ensemble_portfolio(
         (np.arange(num_stocks), -raw_ensemble_scores)
     )[:top_k]
     if selection_risk_context is None:
-        if selection_risk_gamma != 0.0:
-            raise ValueError('非零 selection_risk_gamma 需要风险上下文')
+        if selection_risk_gamma != 0.0 or cluster_cap_enabled:
+            raise ValueError('风险惩罚或相关簇约束需要风险上下文')
         raw_top_indices = np.lexsort(
             (np.arange(num_stocks), -ensemble_scores)
         )[:top_k]
@@ -1200,6 +1290,10 @@ def build_ensemble_portfolio(
             'selected_raw_ranks': np.arange(1, top_k + 1),
             'reversal_risk': np.zeros(top_k, dtype=np.float64),
             'correlation_risk': np.zeros(top_k, dtype=np.float64),
+            'cluster_ids': np.arange(top_k, dtype=np.int64),
+            'raw_cluster_ids': np.arange(top_k, dtype=np.int64),
+            'num_candidate_clusters': top_k,
+            'cluster_cap_enabled': False,
             'mean_positive_correlation': 0.0,
             'raw_mean_positive_correlation': 0.0,
         }
@@ -1210,6 +1304,10 @@ def build_ensemble_portfolio(
             selection_risk_context['return_history'],
             risk_gamma=selection_risk_gamma,
             candidate_k=selection_candidate_k,
+            correlation_lookbacks=correlation_lookbacks,
+            cluster_cap_enabled=cluster_cap_enabled,
+            cluster_correlation_threshold=cluster_correlation_threshold,
+            max_stocks_per_cluster=max_stocks_per_cluster,
             top_k=top_k,
         )
     top_indices = risk_selection['top_indices']
@@ -1284,6 +1382,12 @@ def build_ensemble_portfolio(
         'selected_raw_ranks': risk_selection['selected_raw_ranks'],
         'selected_reversal_risk': risk_selection['reversal_risk'],
         'selected_correlation_risk': risk_selection['correlation_risk'],
+        'selected_cluster_ids': risk_selection['cluster_ids'],
+        'raw_cluster_ids': risk_selection['raw_cluster_ids'],
+        'num_candidate_clusters': risk_selection[
+            'num_candidate_clusters'
+        ],
+        'cluster_cap_enabled': risk_selection['cluster_cap_enabled'],
         'mean_positive_correlation': risk_selection[
             'mean_positive_correlation'
         ],
@@ -1337,6 +1441,7 @@ def align_oof_prediction_records(records_by_model, fold):
                 'risk_1d_targets',
                 'risk_3d_targets',
                 'risk_5d_targets',
+                'tail_5d_targets',
             ):
                 if (
                     key in reference
@@ -1436,6 +1541,16 @@ def align_oof_prediction_records(records_by_model, fold):
                 )
                 for records in sorted_records
             ]),
+            'tail_5d_probabilities': np.stack([
+                np.asarray(
+                    records[day_idx].get(
+                        'tail_5d_probabilities',
+                        np.full(reference_stocks.size, 0.5),
+                    ),
+                    dtype=np.float64,
+                )
+                for records in sorted_records
+            ]),
             'risk_1d_targets': np.asarray(
                 reference.get(
                     'risk_1d_targets',
@@ -1454,6 +1569,13 @@ def align_oof_prediction_records(records_by_model, fold):
                 reference.get(
                     'risk_5d_targets',
                     np.full(reference_stocks.size, 0.5),
+                ),
+                dtype=np.float64,
+            ),
+            'tail_5d_targets': np.asarray(
+                reference.get(
+                    'tail_5d_targets',
+                    np.zeros(reference_stocks.size),
                 ),
                 dtype=np.float64,
             ),
@@ -1487,8 +1609,14 @@ def summarize_ensemble_days(
     risk_1d_blend=0.40,
     risk_3d_blend=0.60,
     risk_5d_blend=0.0,
+    tail_5d_blend=0.0,
     correlation_exposure_gamma=0.0,
     exposure_head_blend=1.0,
+    correlation_lookbacks=(20,),
+    cluster_cap_enabled=False,
+    cluster_correlation_threshold=0.60,
+    max_stocks_per_cluster=2,
+    tail_5d_threshold=-0.03,
     fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
     top_k=5,
@@ -1496,19 +1624,30 @@ def summarize_ensemble_days(
 ):
     """计算 OOF ensemble 的收益分解、下行风险和 Rank IC。"""
     risk_blends = np.asarray(
-        [risk_1d_blend, risk_3d_blend, risk_5d_blend],
+        [
+            risk_1d_blend,
+            risk_3d_blend,
+            risk_5d_blend,
+            tail_5d_blend,
+        ],
         dtype=np.float64,
     )
     if (risk_blends < 0).any() or risk_blends.sum() <= 0:
         raise ValueError('风险头混合权重必须非负且权重和大于0')
     risk_blends /= risk_blends.sum()
-    risk_1d_blend, risk_3d_blend, risk_5d_blend = risk_blends
+    (
+        risk_1d_blend,
+        risk_3d_blend,
+        risk_5d_blend,
+        tail_5d_blend,
+    ) = risk_blends
     daily = []
     for day in ensemble_days:
         combined_risk_probabilities = (
             risk_1d_blend * day['risk_1d_probabilities']
             + risk_3d_blend * day['risk_3d_probabilities']
             + risk_5d_blend * day['risk_5d_probabilities']
+            + tail_5d_blend * day['tail_5d_probabilities']
         )
         portfolio = build_ensemble_portfolio(
             day['scores'],
@@ -1522,6 +1661,10 @@ def summarize_ensemble_days(
             selection_risk_context=day.get('selection_risk_context'),
             selection_risk_gamma=selection_risk_gamma,
             selection_candidate_k=selection_candidate_k,
+            correlation_lookbacks=correlation_lookbacks,
+            cluster_cap_enabled=cluster_cap_enabled,
+            cluster_correlation_threshold=cluster_correlation_threshold,
+            max_stocks_per_cluster=max_stocks_per_cluster,
             risk_probability_matrix=combined_risk_probabilities,
             regime_gates=day['regime_gates'],
             risk_score_penalty=risk_score_penalty,
@@ -1535,11 +1678,23 @@ def summarize_ensemble_days(
         selected_risk_1d = day['risk_1d_probabilities'][:, selected].mean()
         selected_risk_3d = day['risk_3d_probabilities'][:, selected].mean()
         selected_risk_5d = day['risk_5d_probabilities'][:, selected].mean()
+        selected_tail_5d = day['tail_5d_probabilities'][:, selected].mean()
+        selected_combined_risk = combined_risk_probabilities[
+            :, selected
+        ].mean()
         mean_risk_1d_prediction = day['risk_1d_probabilities'].mean(axis=0)
         mean_risk_3d_prediction = day['risk_3d_probabilities'].mean(axis=0)
         mean_risk_5d_prediction = day['risk_5d_probabilities'].mean(axis=0)
+        mean_tail_5d_prediction = day['tail_5d_probabilities'].mean(axis=0)
         regime_prediction = float(np.median(day['regime_gates']))
         equal_full_return = float(selected_returns.mean())
+        raw_top5_return = float(
+            day['targets'][portfolio['raw_top_indices']].mean()
+        )
+        market_future_return = float(day['targets'].mean())
+        market_tail_share = float(
+            np.mean(day['targets'] <= tail_5d_threshold)
+        )
         allocation_only_return = float(
             np.dot(portfolio['relative_weights'], selected_returns)
         )
@@ -1561,6 +1716,12 @@ def summarize_ensemble_days(
             'fold': int(day['fold']),
             'prediction_date': day['prediction_date'],
             'top5_return': equal_full_return,
+            'raw_top5_return': raw_top5_return,
+            'diversification_return_contribution': (
+                equal_full_return - raw_top5_return
+            ),
+            'market_future_return': market_future_return,
+            'market_tail_share': market_tail_share,
             'equal_weight_at_exposure_return': (
                 equal_full_return * portfolio['exposure']
             ),
@@ -1586,6 +1747,8 @@ def summarize_ensemble_days(
             'selected_risk_1d': float(selected_risk_1d),
             'selected_risk_3d': float(selected_risk_3d),
             'selected_risk_5d': float(selected_risk_5d),
+            'selected_tail_5d': float(selected_tail_5d),
+            'selected_combined_risk': float(selected_combined_risk),
             'risk_1d_brier': float(np.mean(
                 (
                     mean_risk_1d_prediction
@@ -1604,6 +1767,12 @@ def summarize_ensemble_days(
                     - day['risk_5d_targets']
                 ) ** 2
             )),
+            'tail_5d_brier': float(np.mean(
+                (
+                    mean_tail_5d_prediction
+                    - day['tail_5d_targets']
+                ) ** 2
+            )),
             'regime_brier': float(
                 (regime_prediction - day['regime_target']) ** 2
             ),
@@ -1616,6 +1785,21 @@ def summarize_ensemble_days(
             'mean_reversal_risk': float(
                 np.mean(portfolio['selected_reversal_risk'])
             ),
+            'selected_cluster_ids': [
+                int(value) for value in portfolio['selected_cluster_ids']
+            ],
+            'raw_cluster_ids': [
+                int(value) for value in portfolio['raw_cluster_ids']
+            ],
+            'num_candidate_clusters': int(
+                portfolio['num_candidate_clusters']
+            ),
+            'max_selected_cluster_count': int(max(
+                np.unique(
+                    portfolio['selected_cluster_ids'],
+                    return_counts=True,
+                )[1]
+            )),
             'risk_score_penalty': float(risk_score_penalty),
             'correlation_exposure_gamma': float(
                 correlation_exposure_gamma
@@ -1646,6 +1830,18 @@ def summarize_ensemble_days(
     top5_returns = np.asarray([
         row['top5_return'] for row in daily
     ], dtype=np.float64)
+    market_future_returns = np.asarray([
+        row['market_future_return'] for row in daily
+    ], dtype=np.float64)
+    market_tail_shares = np.asarray([
+        row['market_tail_share'] for row in daily
+    ], dtype=np.float64)
+    selected_tail_risks = np.asarray([
+        row['selected_tail_5d'] for row in daily
+    ], dtype=np.float64)
+    selected_combined_risks = np.asarray([
+        row['selected_combined_risk'] for row in daily
+    ], dtype=np.float64)
     if regime_gates.std() < 1e-12 or top5_returns.std() < 1e-12:
         regime_return_correlation = 0.0
     else:
@@ -1660,6 +1856,12 @@ def summarize_ensemble_days(
             gross_exposures,
             top5_returns,
         ).statistic
+
+    def safe_spearman(left, right):
+        if left.std() < 1e-12 or right.std() < 1e-12:
+            return 0.0
+        value = spearmanr(left, right).statistic
+        return float(value) if np.isfinite(value) else 0.0
 
     def mean(key):
         return float(np.mean([row[key] for row in daily]))
@@ -1692,6 +1894,10 @@ def summarize_ensemble_days(
     summary = {
         'num_evaluation_dates': len(daily),
         'mean_top5_return': mean('top5_return'),
+        'mean_raw_top5_return': mean('raw_top5_return'),
+        'mean_diversification_return_contribution': mean(
+            'diversification_return_contribution'
+        ),
         'mean_equal_weight_at_exposure_return': mean(
             'equal_weight_at_exposure_return'
         ),
@@ -1715,14 +1921,33 @@ def summarize_ensemble_days(
         'mean_selected_risk_1d': mean('selected_risk_1d'),
         'mean_selected_risk_3d': mean('selected_risk_3d'),
         'mean_selected_risk_5d': mean('selected_risk_5d'),
+        'mean_selected_tail_5d': mean('selected_tail_5d'),
+        'mean_selected_combined_risk': mean('selected_combined_risk'),
         'mean_risk_1d_brier': mean('risk_1d_brier'),
         'mean_risk_3d_brier': mean('risk_3d_brier'),
         'mean_risk_5d_brier': mean('risk_5d_brier'),
+        'mean_tail_5d_brier': mean('tail_5d_brier'),
         'mean_regime_brier': mean('regime_brier'),
         'regime_return_spearman': float(
             regime_return_correlation
             if np.isfinite(regime_return_correlation)
             else 0.0
+        ),
+        'regime_market_return_spearman': safe_spearman(
+            regime_gates,
+            market_future_returns,
+        ),
+        'regime_tail_share_spearman': safe_spearman(
+            regime_gates,
+            market_tail_shares,
+        ),
+        'tail_risk_return_spearman': safe_spearman(
+            selected_tail_risks,
+            top5_returns,
+        ),
+        'combined_risk_return_spearman': safe_spearman(
+            selected_combined_risks,
+            top5_returns,
         ),
         'mean_allocation_contribution': mean('allocation_contribution'),
         'mean_allocation_at_exposure_contribution': mean(
@@ -1740,6 +1965,15 @@ def summarize_ensemble_days(
             'raw_mean_positive_correlation'
         ),
         'mean_reversal_risk': mean('mean_reversal_risk'),
+        'mean_candidate_clusters': mean('num_candidate_clusters'),
+        'max_selected_cluster_count': int(max(
+            row['max_selected_cluster_count'] for row in daily
+        )),
+        'cluster_cap_enabled': bool(cluster_cap_enabled),
+        'cluster_correlation_threshold': float(
+            cluster_correlation_threshold
+        ),
+        'max_stocks_per_cluster': int(max_stocks_per_cluster),
         'risk_score_penalty': float(risk_score_penalty),
         'correlation_exposure_gamma': float(correlation_exposure_gamma),
         'exposure_head_blend': float(exposure_head_blend),
@@ -1775,22 +2009,38 @@ def calibrate_ensemble_policy(
     risk_1d_blend=0.40,
     risk_3d_blend=0.60,
     risk_5d_blend=0.0,
+    tail_5d_blend=0.0,
     correlation_exposure_gamma_grid=(0.0,),
     exposure_head_blend_grid=(1.0,),
     selection_candidate_k=20,
+    correlation_lookbacks=(20,),
+    cluster_cap_enabled=False,
+    cluster_correlation_threshold=0.60,
+    max_stocks_per_cluster=2,
+    tail_5d_threshold=-0.03,
     fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
     top_k=5,
 ):
     """仅用 OOF 收益网格选择 allocation 混合与分歧降仓强度。"""
     risk_blends = np.asarray(
-        [risk_1d_blend, risk_3d_blend, risk_5d_blend],
+        [
+            risk_1d_blend,
+            risk_3d_blend,
+            risk_5d_blend,
+            tail_5d_blend,
+        ],
         dtype=np.float64,
     )
     if (risk_blends < 0).any() or risk_blends.sum() <= 0:
         raise ValueError('风险头混合权重必须非负且权重和大于0')
     risk_blends /= risk_blends.sum()
-    risk_1d_blend, risk_3d_blend, risk_5d_blend = risk_blends
+    (
+        risk_1d_blend,
+        risk_3d_blend,
+        risk_5d_blend,
+        tail_5d_blend,
+    ) = risk_blends
     candidates = []
     for allocation_blend in allocation_blend_grid:
         for disagreement_gamma in disagreement_gamma_grid:
@@ -1813,12 +2063,22 @@ def calibrate_ensemble_policy(
                                 risk_1d_blend=risk_1d_blend,
                                 risk_3d_blend=risk_3d_blend,
                                 risk_5d_blend=risk_5d_blend,
+                                tail_5d_blend=tail_5d_blend,
                                 correlation_exposure_gamma=float(
                                     correlation_exposure_gamma
                                 ),
                                 exposure_head_blend=float(
                                     exposure_head_blend
                                 ),
+                                correlation_lookbacks=correlation_lookbacks,
+                                cluster_cap_enabled=cluster_cap_enabled,
+                                cluster_correlation_threshold=(
+                                    cluster_correlation_threshold
+                                ),
+                                max_stocks_per_cluster=(
+                                    max_stocks_per_cluster
+                                ),
+                                tail_5d_threshold=tail_5d_threshold,
                                 fixed_exposure_baseline=(
                                     fixed_exposure_baseline
                                 ),
@@ -1873,10 +2133,16 @@ def calibrate_ensemble_policy(
         risk_1d_blend=risk_1d_blend,
         risk_3d_blend=risk_3d_blend,
         risk_5d_blend=risk_5d_blend,
+        tail_5d_blend=tail_5d_blend,
         correlation_exposure_gamma=best[
             'correlation_exposure_gamma'
         ],
         exposure_head_blend=best['exposure_head_blend'],
+        correlation_lookbacks=correlation_lookbacks,
+        cluster_cap_enabled=cluster_cap_enabled,
+        cluster_correlation_threshold=cluster_correlation_threshold,
+        max_stocks_per_cluster=max_stocks_per_cluster,
+        tail_5d_threshold=tail_5d_threshold,
         fixed_exposure_baseline=fixed_exposure_baseline,
         downside_weight=downside_weight,
         top_k=top_k,
@@ -1890,11 +2156,21 @@ def calibrate_ensemble_policy(
         'risk_1d_blend': float(risk_1d_blend),
         'risk_3d_blend': float(risk_3d_blend),
         'risk_5d_blend': float(risk_5d_blend),
+        'tail_5d_blend': float(tail_5d_blend),
         'correlation_exposure_gamma': best[
             'correlation_exposure_gamma'
         ],
         'exposure_head_blend': best['exposure_head_blend'],
         'selection_candidate_k': int(selection_candidate_k),
+        'correlation_lookbacks': [
+            int(value) for value in correlation_lookbacks
+        ],
+        'cluster_cap_enabled': bool(cluster_cap_enabled),
+        'cluster_correlation_threshold': float(
+            cluster_correlation_threshold
+        ),
+        'max_stocks_per_cluster': int(max_stocks_per_cluster),
+        'tail_5d_threshold': float(tail_5d_threshold),
         'fixed_exposure_baseline': float(fixed_exposure_baseline),
         'min_exposure': float(min_exposure),
         'max_exposure': float(max_exposure),
@@ -1904,4 +2180,324 @@ def calibrate_ensemble_policy(
         'selection_metric': 'mean_return_minus_downside_weight_times_deviation',
         'oof_metrics': best_metrics,
         'grid_results': candidates,
+    }
+
+
+def evaluate_ensemble_policy(ensemble_days, policy, include_daily=False):
+    """使用已经选定的策略评估一组未参与调参的 OOF 日期。"""
+    return summarize_ensemble_days(
+        ensemble_days,
+        min_exposure=policy['min_exposure'],
+        max_exposure=policy['max_exposure'],
+        allocation_temperature=policy['allocation_temperature'],
+        allocation_blend=policy['allocation_blend'],
+        disagreement_gamma=policy['disagreement_gamma'],
+        selection_risk_gamma=policy['selection_risk_gamma'],
+        selection_candidate_k=policy['selection_candidate_k'],
+        risk_score_penalty=policy['risk_score_penalty'],
+        risk_1d_blend=policy['risk_1d_blend'],
+        risk_3d_blend=policy['risk_3d_blend'],
+        risk_5d_blend=policy['risk_5d_blend'],
+        tail_5d_blend=policy.get('tail_5d_blend', 0.0),
+        correlation_exposure_gamma=policy[
+            'correlation_exposure_gamma'
+        ],
+        exposure_head_blend=policy['exposure_head_blend'],
+        correlation_lookbacks=policy.get(
+            'correlation_lookbacks',
+            [20],
+        ),
+        cluster_cap_enabled=policy.get('cluster_cap_enabled', False),
+        cluster_correlation_threshold=policy.get(
+            'cluster_correlation_threshold',
+            0.60,
+        ),
+        max_stocks_per_cluster=policy.get(
+            'max_stocks_per_cluster',
+            2,
+        ),
+        tail_5d_threshold=policy.get('tail_5d_threshold', -0.03),
+        fixed_exposure_baseline=policy['fixed_exposure_baseline'],
+        downside_weight=policy['downside_weight'],
+        top_k=policy['top_k'],
+        include_daily=include_daily,
+    )
+
+
+def _summarize_cross_fitted_daily(daily, downside_weight):
+    """汇总每折用独立策略得到的留出日记录。"""
+    if not daily:
+        raise ValueError('嵌套 OOF 没有留出评估记录')
+
+    def values(key):
+        return np.asarray([row[key] for row in daily], dtype=np.float64)
+
+    def mean(key):
+        return float(values(key).mean())
+
+    def safe_spearman(left_key, right_key):
+        left = values(left_key)
+        right = values(right_key)
+        if left.std() < 1e-12 or right.std() < 1e-12:
+            return 0.0
+        value = spearmanr(left, right).statistic
+        return float(value) if np.isfinite(value) else 0.0
+
+    weighted_returns = values('weighted_portfolio_return')
+    negative_returns = np.minimum(weighted_returns, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
+    fixed_returns = values('fixed_exposure_return')
+    fixed_downside = float(np.sqrt(np.mean(
+        np.minimum(fixed_returns, 0.0) ** 2
+    )))
+    fold_rows = {}
+    for row in daily:
+        fold_rows.setdefault(int(row['fold']), []).append(row)
+    folds = [{
+        'fold': fold,
+        'mean_top5_return': float(np.mean([
+            row['top5_return'] for row in rows
+        ])),
+        'mean_weighted_portfolio_return': float(np.mean([
+            row['weighted_portfolio_return'] for row in rows
+        ])),
+        'worst_weighted_portfolio_return': float(np.min([
+            row['weighted_portfolio_return'] for row in rows
+        ])),
+        'mean_rank_ic': float(np.mean([
+            row['rank_ic'] for row in rows
+        ])),
+        'positive_rate': float(np.mean([
+            row['weighted_portfolio_return'] > 0.0 for row in rows
+        ])),
+        'num_evaluation_dates': len(rows),
+    } for fold, rows in sorted(fold_rows.items())]
+    scalar_mean_keys = (
+        'top5_return',
+        'raw_top5_return',
+        'diversification_return_contribution',
+        'equal_weight_at_exposure_return',
+        'allocation_only_return',
+        'allocation_contribution',
+        'allocation_at_exposure_contribution',
+        'exposure_contribution',
+        'gross_exposure',
+        'head_gross_exposure',
+        'cash_weight',
+        'model_disagreement',
+        'regime_gate',
+        'selected_risk_1d',
+        'selected_risk_3d',
+        'selected_risk_5d',
+        'selected_tail_5d',
+        'selected_combined_risk',
+        'risk_1d_brier',
+        'risk_3d_brier',
+        'risk_5d_brier',
+        'tail_5d_brier',
+        'regime_brier',
+        'mean_positive_correlation',
+        'raw_mean_positive_correlation',
+        'mean_reversal_risk',
+        'num_candidate_clusters',
+        'rank_ic',
+    )
+    summary = {
+        f'mean_{key}': mean(key)
+        for key in scalar_mean_keys
+    }
+    summary.update({
+        'num_evaluation_dates': len(daily),
+        'mean_weighted_portfolio_return': float(
+            weighted_returns.mean()
+        ),
+        'worst_weighted_portfolio_return': float(
+            weighted_returns.min()
+        ),
+        'p10_weighted_portfolio_return': float(
+            np.quantile(weighted_returns, 0.10)
+        ),
+        'std_weighted_portfolio_return': float(
+            weighted_returns.std()
+        ),
+        'positive_rate': float(np.mean(weighted_returns > 0.0)),
+        'downside_deviation': downside_deviation,
+        'worst_rank_ic': float(values('rank_ic').min()),
+        'worst_fold_weighted_portfolio_return': float(min(
+            row['mean_weighted_portfolio_return'] for row in folds
+        )),
+        'worst_fold_top5_return': float(min(
+            row['mean_top5_return'] for row in folds
+        )),
+        'exposure_std': float(values('gross_exposure').std()),
+        'regime_gate_std': float(values('regime_gate').std()),
+        'regime_return_spearman': safe_spearman(
+            'regime_gate',
+            'top5_return',
+        ),
+        'regime_market_return_spearman': safe_spearman(
+            'regime_gate',
+            'market_future_return',
+        ),
+        'regime_tail_share_spearman': safe_spearman(
+            'regime_gate',
+            'market_tail_share',
+        ),
+        'exposure_return_spearman': safe_spearman(
+            'gross_exposure',
+            'top5_return',
+        ),
+        'tail_risk_return_spearman': safe_spearman(
+            'selected_tail_5d',
+            'top5_return',
+        ),
+        'combined_risk_return_spearman': safe_spearman(
+            'selected_combined_risk',
+            'top5_return',
+        ),
+        'max_selected_cluster_count': int(max(
+            row['max_selected_cluster_count'] for row in daily
+        )),
+        'policy_objective': float(
+            weighted_returns.mean()
+            - downside_weight * downside_deviation
+        ),
+        'fixed_exposure_policy_objective': float(
+            fixed_returns.mean() - downside_weight * fixed_downside
+        ),
+        'folds': folds,
+        'daily': daily,
+    })
+    # 与既有报告字段兼容。
+    aliases = {
+        'mean_top5_return': 'mean_top5_return',
+        'mean_raw_top5_return': 'mean_raw_top5_return',
+        'mean_rank_ic': 'mean_rank_ic',
+        'mean_gross_exposure': 'mean_gross_exposure',
+        'mean_head_gross_exposure': 'mean_head_gross_exposure',
+        'mean_cash_weight': 'mean_cash_weight',
+        'mean_model_disagreement': 'mean_model_disagreement',
+        'mean_regime_gate': 'mean_regime_gate',
+        'mean_selected_risk_1d': 'mean_selected_risk_1d',
+        'mean_selected_risk_3d': 'mean_selected_risk_3d',
+        'mean_selected_risk_5d': 'mean_selected_risk_5d',
+        'mean_selected_tail_5d': 'mean_selected_tail_5d',
+        'mean_selected_combined_risk': (
+            'mean_selected_combined_risk'
+        ),
+        'mean_risk_1d_brier': 'mean_risk_1d_brier',
+        'mean_risk_3d_brier': 'mean_risk_3d_brier',
+        'mean_risk_5d_brier': 'mean_risk_5d_brier',
+        'mean_tail_5d_brier': 'mean_tail_5d_brier',
+        'mean_regime_brier': 'mean_regime_brier',
+        'mean_allocation_contribution': (
+            'mean_allocation_contribution'
+        ),
+        'mean_allocation_at_exposure_contribution': (
+            'mean_allocation_at_exposure_contribution'
+        ),
+        'mean_exposure_contribution': 'mean_exposure_contribution',
+        'mean_positive_correlation': 'mean_mean_positive_correlation',
+        'raw_mean_positive_correlation': (
+            'mean_raw_mean_positive_correlation'
+        ),
+        'mean_reversal_risk': 'mean_mean_reversal_risk',
+        'mean_candidate_clusters': 'mean_num_candidate_clusters',
+        'mean_diversification_return_contribution': (
+            'mean_diversification_return_contribution'
+        ),
+    }
+    for public_name, generated_name in aliases.items():
+        summary[public_name] = summary[generated_name]
+    return summary
+
+
+def cross_fit_ensemble_policy(ensemble_days, **calibration_kwargs):
+    """两折选策略、一折留出评估，循环覆盖全部 OOF 折。"""
+    fold_ids = sorted({int(day['fold']) for day in ensemble_days})
+    if len(fold_ids) < 3:
+        raise ValueError('嵌套 OOF 至少需要三折')
+    held_out_daily = []
+    fold_policies = []
+    policy_fields = (
+        'allocation_blend',
+        'disagreement_gamma',
+        'selection_risk_gamma',
+        'risk_score_penalty',
+        'correlation_exposure_gamma',
+        'exposure_head_blend',
+    )
+    for held_out_fold in fold_ids:
+        calibration_days = [
+            day for day in ensemble_days
+            if int(day['fold']) != held_out_fold
+        ]
+        evaluation_days = [
+            day for day in ensemble_days
+            if int(day['fold']) == held_out_fold
+        ]
+        calibration_fold_ids = sorted({
+            int(day['fold']) for day in calibration_days
+        })
+        if held_out_fold in calibration_fold_ids:
+            raise AssertionError('留出折泄漏进策略校准数据')
+        calibration_dates = sorted({
+            day['prediction_date'] for day in calibration_days
+        })
+        evaluation_dates = sorted({
+            day['prediction_date'] for day in evaluation_days
+        })
+        if set(calibration_dates).intersection(evaluation_dates):
+            raise AssertionError('留出折预测日期泄漏进策略校准数据')
+        policy = calibrate_ensemble_policy(
+            calibration_days,
+            **calibration_kwargs,
+        )
+        held_metrics = evaluate_ensemble_policy(
+            evaluation_days,
+            policy,
+            include_daily=True,
+        )
+        held_out_daily.extend(held_metrics['daily'])
+        fold_policies.append({
+            'held_out_fold': held_out_fold,
+            'calibration_folds': calibration_fold_ids,
+            'calibration_dates': calibration_dates,
+            'evaluation_dates': evaluation_dates,
+            'policy': {
+                field: policy[field] for field in policy_fields
+            },
+            'held_out_metrics': {
+                key: value
+                for key, value in held_metrics.items()
+                if key != 'daily'
+            },
+        })
+    downside_weight = float(calibration_kwargs.get(
+        'downside_weight',
+        0.5,
+    ))
+    metrics = _summarize_cross_fitted_daily(
+        sorted(
+            held_out_daily,
+            key=lambda row: (row['prediction_date'], row['fold']),
+        ),
+        downside_weight,
+    )
+    stability = {
+        field: {
+            'values': [
+                row['policy'][field] for row in fold_policies
+            ],
+            'num_unique': len({
+                row['policy'][field] for row in fold_policies
+            }),
+        }
+        for field in policy_fields
+    }
+    return {
+        'method': 'two_folds_calibrate_one_fold_evaluate',
+        'metrics': metrics,
+        'fold_policies': fold_policies,
+        'policy_stability': stability,
     }
