@@ -159,11 +159,12 @@
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
 当前策略输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_modulegated_policy_v7/`。
+`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_forward_policy_v7_1/`。
 该目录不复制模型；`artifact_source_dir` 指向
 `nested_oof_diverse_tailregime_v6_decay5y` 的 checkpoint、scaler、股票映射和
-训练配置。`ensemble_policy.json` 同时保留交叉拟合策略、全 OOF 候选策略及经过
-跨折模块资格过滤的实际部署策略。
+训练配置。`ensemble_policy.json` 同时保留严格前向策略、全 OOF 候选策略及经过
+历史折模块资格过滤的实际部署策略。Fold 1 使用保守预热策略，Fold 2 只使用
+Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
@@ -223,7 +224,7 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 用既有 v6 OOF 重放 v7 策略（不会训练模型）
+3) 用既有 v6 OOF 重放 v7.1 严格前向策略（不会训练模型）
 
 ```
 POLICY_ONLY=1 ./train.sh
