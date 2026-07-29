@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'regime_lambdarank_staged_v5_tail5_exposureblend_decay5y'
+experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
@@ -61,9 +61,11 @@ config = {
     ],
     'risk_heads_enabled': True,
     'risk_5d_head_enabled': True,
-    'risk_1d_blend': 0.20,
-    'risk_3d_blend': 0.30,
-    'risk_5d_blend': 0.50,
+    'tail_5d_head_enabled': True,
+    'risk_1d_blend': 0.15,
+    'risk_3d_blend': 0.20,
+    'risk_5d_blend': 0.30,
+    'tail_5d_blend': 0.35,
     # 排序主干输出原始分数；风险惩罚强度只用 OOF 网格校准。
     'risk_penalty_scale': 0.0,
     'oof_risk_penalty_enabled': True,
@@ -74,13 +76,17 @@ config = {
     'risk_1d_weight': 0.10,
     'risk_3d_weight': 0.15,
     'risk_5d_weight': 0.20,
+    'tail_5d_weight': 0.20,
+    'tail_5d_threshold': -0.03,
     'regime_gate_enabled': True,
     'regime_market_hidden_size': 16,
     'regime_market_feature_indices': [
         173, 174, 175, 176, 177,
         185, 186, 187, 188, 189, 190, 191, 192,
     ],
-    'regime_target_temperature': 0.02,
+    'regime_market_return_temperature': 0.01,
+    'regime_tail_share_baseline': 0.20,
+    'regime_tail_share_temperature': 0.10,
     'regime_weight': 0.10,
     # 市场压力或已选股票风险升高时，Exposure 只能单调下降。
     'monotonic_exposure_enabled': True,
@@ -94,8 +100,13 @@ config = {
     'correlation_exposure_gamma_grid': [0.0, 0.5, 1.0, 2.0],
     # Exposure Head 必须保留；OOF 只校准其相对固定基线的占比。
     'exposure_head_blend_grid': [0.25, 0.50, 0.75, 1.0],
-    'selection_candidate_k': 20,
-    'selection_risk_lookback': 20,
+    'selection_candidate_k': 30,
+    'selection_risk_lookback': 60,
+    'selection_correlation_lookbacks': [20, 60],
+    'cluster_cap_enabled': True,
+    'cluster_correlation_threshold': 0.60,
+    'max_stocks_per_cluster': 2,
+    'nested_oof_enabled': True,
     'ensemble_downside_weight': 0.5,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,

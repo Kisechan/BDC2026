@@ -22,7 +22,7 @@ from utils import (
 from utils import create_ranking_dataset_vectorized
 from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
-from utils import summarize_ensemble_days
+from utils import cross_fit_ensemble_policy, evaluate_ensemble_policy
 import joblib
 import os
 import json
@@ -110,6 +110,7 @@ def dense_stage_loss(
         risk_1d_logits=auxiliary_outputs['risk_1d_logits'],
         risk_3d_logits=auxiliary_outputs['risk_3d_logits'],
         risk_5d_logits=auxiliary_outputs['risk_5d_logits'],
+        tail_5d_logits=auxiliary_outputs['tail_5d_logits'],
         regime_gate=auxiliary_outputs['regime_gate'],
         risk_1d_targets=risk_1d_targets,
         risk_3d_targets=risk_3d_targets,
@@ -214,44 +215,32 @@ def _build_label_and_clean(processed, drop_small_open=True):
         'risk_3d_target',
     ])
 
-    if 'cs_return_60_pct' in processed.columns:
-        dates = processed['日期']
-        top_momentum_return = (
-            processed['label']
-            .where(processed['cs_return_60_pct'] >= 0.8)
-            .groupby(dates)
-            .transform('mean')
-        )
-        bottom_momentum_return = (
-            processed['label']
-            .where(processed['cs_return_60_pct'] <= 0.2)
-            .groupby(dates)
-            .transform('mean')
-        )
-        momentum_factor_return = (
-            top_momentum_return - bottom_momentum_return
-        ).fillna(0.0)
-    else:
-        momentum_factor_return = pd.Series(
-            0.0,
-            index=processed.index,
-        )
-    market_future_return = processed['label'].groupby(
-        processed['日期']
-    ).transform('mean')
-    stress_signal = -(
-        0.6 * momentum_factor_return
-        + 0.4 * market_future_return
+    dates = processed['日期']
+    tail_threshold = float(config.get('tail_5d_threshold', -0.03))
+    market_future_return = processed['label'].groupby(dates).transform('mean')
+    market_tail_share = (
+        processed['label'].le(tail_threshold).groupby(dates).transform('mean')
     )
-    regime_temperature = float(
-        config.get('regime_target_temperature', 0.02)
+    market_return_temperature = float(
+        config.get('regime_market_return_temperature', 0.01)
+    )
+    tail_share_baseline = float(
+        config.get('regime_tail_share_baseline', 0.20)
+    )
+    tail_share_temperature = float(
+        config.get('regime_tail_share_temperature', 0.10)
+    )
+    if market_return_temperature <= 0 or tail_share_temperature <= 0:
+        raise ValueError('Regime目标 temperature 必须大于0')
+    regime_logit = (
+        0.60 * (-market_future_return / market_return_temperature)
+        + 0.40 * (
+            (market_tail_share - tail_share_baseline)
+            / tail_share_temperature
+        )
     )
     processed['regime_target'] = 1.0 / (
-        1.0 + np.exp(np.clip(
-            -stress_signal / regime_temperature,
-            -30.0,
-            30.0,
-        ))
+        1.0 + np.exp(np.clip(-regime_logit, -30.0, 30.0))
     )
 
     processed.drop(
@@ -332,6 +321,8 @@ class WeightedRankingLoss(nn.Module):
                  risk_3d_weight=0.0,
                  risk_5d_weight=0.0,
                  risk_5d_target_temperature=0.03,
+                 tail_5d_weight=0.0,
+                 tail_5d_threshold=-0.03,
                  regime_weight=0.0):
         super(WeightedRankingLoss, self).__init__()
         if listwise_temperature <= 0:
@@ -373,6 +364,8 @@ class WeightedRankingLoss(nn.Module):
         self.risk_5d_target_temperature = float(
             risk_5d_target_temperature
         )
+        self.tail_5d_weight = float(tail_5d_weight)
+        self.tail_5d_threshold = float(tail_5d_threshold)
         self.regime_weight = float(regime_weight)
         self.min_exposure = min_exposure
         self.max_exposure = max_exposure
@@ -405,11 +398,14 @@ class WeightedRankingLoss(nn.Module):
             self.risk_1d_weight,
             self.risk_3d_weight,
             self.risk_5d_weight,
+            self.tail_5d_weight,
             self.regime_weight,
         ) < 0:
             raise ValueError('风险头和状态门控损失权重不能为负')
         if self.risk_5d_target_temperature <= 0:
             raise ValueError('5日风险目标 temperature 必须大于0')
+        if self.tail_5d_threshold >= 0:
+            raise ValueError('5日尾部风险阈值必须小于0')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -643,6 +639,7 @@ class WeightedRankingLoss(nn.Module):
         risk_1d_logits=None,
         risk_3d_logits=None,
         risk_5d_logits=None,
+        tail_5d_logits=None,
         regime_gate=None,
         risk_1d_targets=None,
         risk_3d_targets=None,
@@ -720,6 +717,17 @@ class WeightedRankingLoss(nn.Module):
                     * F.binary_cross_entropy_with_logits(
                         risk_5d_logits,
                         risk_5d_targets,
+                    )
+                )
+            if tail_5d_logits is not None and self.tail_5d_weight > 0:
+                tail_5d_targets = (
+                    raw_returns <= self.tail_5d_threshold
+                ).to(raw_returns.dtype)
+                components['tail_5d_loss'] = (
+                    self.tail_5d_weight
+                    * F.binary_cross_entropy_with_logits(
+                        tail_5d_logits,
+                        tail_5d_targets,
                     )
                 )
             if (
@@ -1403,6 +1411,14 @@ def train_ranking_model(
                         if auxiliary_outputs['risk_5d_logits'] is not None
                         else None
                     ),
+                    tail_5d_logits=(
+                        auxiliary_outputs['tail_5d_logits'][
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0)
+                        if auxiliary_outputs['tail_5d_logits'] is not None
+                        else None
+                    ),
                     regime_gate=auxiliary_outputs['regime_gate'][
                         i
                     ].reshape(1),
@@ -1616,6 +1632,16 @@ def evaluate_ranking_model(
                             ] is not None
                             else None
                         ),
+                        tail_5d_logits=(
+                            auxiliary_outputs['tail_5d_logits'][
+                                i,
+                                valid_indices,
+                            ].unsqueeze(0)
+                            if auxiliary_outputs[
+                                'tail_5d_logits'
+                            ] is not None
+                            else None
+                        ),
                         regime_gate=auxiliary_outputs['regime_gate'][
                             i
                         ].reshape(1),
@@ -1719,6 +1745,18 @@ def evaluate_ranking_model(
                             ] is not None
                             else np.full(valid_indices.numel(), 0.5)
                         ),
+                        'tail_5d_probabilities': (
+                            torch.sigmoid(
+                                auxiliary_outputs['tail_5d_logits'][
+                                    i,
+                                    valid_indices,
+                                ]
+                            ).detach().cpu().numpy()
+                            if auxiliary_outputs[
+                                'tail_5d_logits'
+                            ] is not None
+                            else np.full(valid_indices.numel(), 0.5)
+                        ),
                         'risk_1d_targets': risk_1d_targets[
                             i,
                             valid_indices,
@@ -1734,6 +1772,13 @@ def evaluate_ranking_model(
                                 0.03,
                             ))
                         ).detach().cpu().numpy(),
+                        'tail_5d_targets': (
+                            masked_targets[i][valid_indices]
+                            <= float(config.get(
+                                'tail_5d_threshold',
+                                -0.03,
+                            ))
+                        ).float().detach().cpu().numpy(),
                         'regime_target': float(
                             regime_targets[
                                 i,
@@ -2050,6 +2095,7 @@ def configure_model_for_stage(model, stage):
         'risk_1d_head.',
         'risk_3d_head.',
         'risk_5d_head.',
+        'tail_5d_head.',
         'regime_market_encoder.',
         'regime_gate_head.',
     )
@@ -2085,6 +2131,8 @@ def set_model_stage_mode(model, stage, training):
             model.risk_3d_head.eval()
             if hasattr(model, 'risk_5d_head'):
                 model.risk_5d_head.eval()
+            if hasattr(model, 'tail_5d_head'):
+                model.tail_5d_head.eval()
         if hasattr(model, 'regime_market_encoder'):
             model.regime_market_encoder.eval()
             model.regime_gate_head.eval()
@@ -2096,6 +2144,8 @@ def set_model_stage_mode(model, stage, training):
         model.risk_3d_head.train()
         if hasattr(model, 'risk_5d_head'):
             model.risk_5d_head.train()
+        if hasattr(model, 'tail_5d_head'):
+            model.tail_5d_head.train()
         model.regime_market_encoder.train()
         model.regime_gate_head.train()
     elif stage == 'allocation':
@@ -2155,6 +2205,8 @@ def build_training_components(model, stage='ranking'):
             'risk_5d_target_temperature',
             0.03,
         ),
+        tail_5d_weight=config.get('tail_5d_weight', 0.0),
+        tail_5d_threshold=config.get('tail_5d_threshold', -0.03),
         regime_weight=config.get('regime_weight', 0.0),
         min_exposure=config.get('min_exposure', 0.80),
         max_exposure=config.get('max_exposure', 0.999999),
@@ -2929,8 +2981,7 @@ def main():
                 fold=fold_number,
             ))
 
-    policy = calibrate_ensemble_policy(
-        ensemble_days,
+    policy_calibration_kwargs = dict(
         min_exposure=config['min_exposure'],
         max_exposure=config['max_exposure'],
         allocation_temperature=config.get('allocation_temperature', 1.0),
@@ -2956,6 +3007,7 @@ def main():
         risk_1d_blend=float(config.get('risk_1d_blend', 0.40)),
         risk_3d_blend=float(config.get('risk_3d_blend', 0.60)),
         risk_5d_blend=float(config.get('risk_5d_blend', 0.0)),
+        tail_5d_blend=float(config.get('tail_5d_blend', 0.0)),
         correlation_exposure_gamma_grid=config.get(
             'correlation_exposure_gamma_grid',
             [0.0],
@@ -2968,6 +3020,26 @@ def main():
             'selection_candidate_k',
             20,
         )),
+        correlation_lookbacks=config.get(
+            'selection_correlation_lookbacks',
+            [20],
+        ),
+        cluster_cap_enabled=bool(config.get(
+            'cluster_cap_enabled',
+            False,
+        )),
+        cluster_correlation_threshold=float(config.get(
+            'cluster_correlation_threshold',
+            0.60,
+        )),
+        max_stocks_per_cluster=int(config.get(
+            'max_stocks_per_cluster',
+            2,
+        )),
+        tail_5d_threshold=float(config.get(
+            'tail_5d_threshold',
+            -0.03,
+        )),
         fixed_exposure_baseline=float(config.get(
             'fixed_exposure_baseline',
             0.6231689453125,
@@ -2975,50 +3047,50 @@ def main():
         downside_weight=config.get('ensemble_downside_weight', 0.5),
         top_k=5,
     )
+    policy = calibrate_ensemble_policy(
+        ensemble_days,
+        **policy_calibration_kwargs,
+    )
+    if config.get('nested_oof_enabled', False):
+        cross_fitted_policy = cross_fit_ensemble_policy(
+            ensemble_days,
+            **policy_calibration_kwargs,
+        )
+        cross_fitted_policy['deployment_policy_differences'] = {
+            field: [
+                float(policy[field]) - float(
+                    row['policy'][field]
+                )
+                for row in cross_fitted_policy['fold_policies']
+            ]
+            for field in (
+                'allocation_blend',
+                'disagreement_gamma',
+                'selection_risk_gamma',
+                'risk_score_penalty',
+                'correlation_exposure_gamma',
+                'exposure_head_blend',
+            )
+        }
+        ensemble_metrics = cross_fitted_policy['metrics']
+    else:
+        cross_fitted_policy = {
+            'method': 'disabled',
+            'metrics': policy['oof_metrics'],
+            'fold_policies': [],
+            'policy_stability': {},
+        }
+        ensemble_metrics = policy['oof_metrics']
     single_seed_summaries = {}
     for seed in ensemble_seeds:
-        single_seed_summaries[str(seed)] = summarize_ensemble_days(
+        single_seed_summaries[str(seed)] = evaluate_ensemble_policy(
             single_seed_days[seed],
-            min_exposure=config['min_exposure'],
-            max_exposure=config['max_exposure'],
-            allocation_temperature=config.get(
-                'allocation_temperature',
-                1.0,
-            ),
-            allocation_blend=float(policy['allocation_blend']),
-            disagreement_gamma=float(policy['disagreement_gamma']),
-            selection_risk_gamma=float(policy['selection_risk_gamma']),
-            selection_candidate_k=int(config.get(
-                'selection_candidate_k',
-                20,
-            )),
-            risk_score_penalty=float(policy.get(
-                'risk_score_penalty',
-                0.0,
-            )),
-            risk_1d_blend=float(config.get('risk_1d_blend', 0.40)),
-            risk_3d_blend=float(config.get('risk_3d_blend', 0.60)),
-            risk_5d_blend=float(config.get('risk_5d_blend', 0.0)),
-            correlation_exposure_gamma=float(policy.get(
-                'correlation_exposure_gamma',
-                0.0,
-            )),
-            exposure_head_blend=float(policy.get(
-                'exposure_head_blend',
-                1.0,
-            )),
-            fixed_exposure_baseline=float(config.get(
-                'fixed_exposure_baseline',
-                0.6231689453125,
-            )),
-            downside_weight=config.get('ensemble_downside_weight', 0.5),
-            top_k=5,
+            policy,
         )
     mean_single_return = float(np.mean([
         metrics['mean_weighted_portfolio_return']
         for metrics in single_seed_summaries.values()
     ]))
-    ensemble_metrics = policy['oof_metrics']
     identity_sensitivity = summarize_identity_sensitivity(fold_results)
     unk_sensitivity = identity_sensitivity.get('all_unk_vs_real', {})
     promotion_criteria = {
@@ -3065,6 +3137,10 @@ def main():
         ),
         'regime_gate_direction': bool(
             ensemble_metrics['regime_return_spearman'] < 0.0
+        ),
+        'cluster_cap_respected': bool(
+            ensemble_metrics['max_selected_cluster_count']
+            <= config.get('max_stocks_per_cluster', 2)
         ),
         'id_score_correlation': bool(
             unk_sensitivity.get('score_spearman', 0.0)
@@ -3142,6 +3218,12 @@ def main():
     policy.update({
         'ensemble_enabled': ensemble_enabled,
         'mode': 'rank_ensemble' if ensemble_enabled else 'single_model',
+        'policy_role': 'deployment_policy_calibrated_on_all_oof',
+        'promotion_metric_source': (
+            'cross_fitted_oof'
+            if config.get('nested_oof_enabled', False)
+            else 'all_oof'
+        ),
         'ensemble_seeds': ensemble_seeds,
         'model_paths': model_paths,
         'scaler_path': 'scaler.pkl',
@@ -3150,6 +3232,7 @@ def main():
             'selection_risk_lookback',
             20,
         )),
+        'cross_fitted_oof': cross_fitted_policy,
         'promotion_criteria': promotion_criteria,
     })
     with open(
@@ -3220,12 +3303,31 @@ def main():
         'mean_selected_risk_5d': ensemble_metrics[
             'mean_selected_risk_5d'
         ],
+        'mean_selected_tail_5d': ensemble_metrics[
+            'mean_selected_tail_5d'
+        ],
+        'mean_selected_combined_risk': ensemble_metrics[
+            'mean_selected_combined_risk'
+        ],
         'mean_risk_1d_brier': ensemble_metrics['mean_risk_1d_brier'],
         'mean_risk_3d_brier': ensemble_metrics['mean_risk_3d_brier'],
         'mean_risk_5d_brier': ensemble_metrics['mean_risk_5d_brier'],
+        'mean_tail_5d_brier': ensemble_metrics['mean_tail_5d_brier'],
         'mean_regime_brier': ensemble_metrics['mean_regime_brier'],
         'regime_return_spearman': ensemble_metrics[
             'regime_return_spearman'
+        ],
+        'regime_market_return_spearman': ensemble_metrics[
+            'regime_market_return_spearman'
+        ],
+        'regime_tail_share_spearman': ensemble_metrics[
+            'regime_tail_share_spearman'
+        ],
+        'tail_risk_return_spearman': ensemble_metrics[
+            'tail_risk_return_spearman'
+        ],
+        'combined_risk_return_spearman': ensemble_metrics[
+            'combined_risk_return_spearman'
         ],
         'mean_allocation_contribution': ensemble_metrics[
             'mean_allocation_contribution'
@@ -3242,6 +3344,15 @@ def main():
         'raw_mean_positive_correlation': ensemble_metrics[
             'raw_mean_positive_correlation'
         ],
+        'mean_raw_top5_return': ensemble_metrics[
+            'mean_raw_top5_return'
+        ],
+        'mean_diversification_return_contribution': ensemble_metrics[
+            'mean_diversification_return_contribution'
+        ],
+        'max_selected_cluster_count': ensemble_metrics[
+            'max_selected_cluster_count'
+        ],
         'mean_reversal_risk': ensemble_metrics['mean_reversal_risk'],
         'exposure_std': ensemble_metrics['exposure_std'],
         'exposure_return_spearman': ensemble_metrics[
@@ -3252,6 +3363,18 @@ def main():
         ],
         'identity_sensitivity': identity_sensitivity,
         'ensemble_oof': ensemble_metrics,
+        'cross_fitted_oof': cross_fitted_policy,
+        'deployment_oof': policy['oof_metrics'],
+        'deployment_policy': {
+            key: policy[key] for key in (
+                'allocation_blend',
+                'disagreement_gamma',
+                'selection_risk_gamma',
+                'risk_score_penalty',
+                'correlation_exposure_gamma',
+                'exposure_head_blend',
+            )
+        },
         'single_seed_oof': single_seed_summaries,
         'single_seed_mean_weighted_return': mean_single_return,
         'promotion_criteria': promotion_criteria,

@@ -140,23 +140,33 @@ class StockTransformer(nn.Module):
             config.get('risk_5d_blend', 0.0)
             if self.risk_5d_head_enabled else 0.0
         )
+        self.tail_5d_head_enabled = bool(
+            config.get('tail_5d_head_enabled', False)
+        )
+        self.tail_5d_blend = float(
+            config.get('tail_5d_blend', 0.0)
+            if self.tail_5d_head_enabled else 0.0
+        )
         if self.risk_heads_enabled:
             if min(
                 self.risk_1d_blend,
                 self.risk_3d_blend,
                 self.risk_5d_blend,
+                self.tail_5d_blend,
             ) < 0:
                 raise ValueError('风险头混合权重不能为负')
             blend_sum = (
                 self.risk_1d_blend
                 + self.risk_3d_blend
                 + self.risk_5d_blend
+                + self.tail_5d_blend
             )
             if blend_sum <= 0:
                 raise ValueError('风险头混合权重和必须大于0')
             self.risk_1d_blend /= blend_sum
             self.risk_3d_blend /= blend_sum
             self.risk_5d_blend /= blend_sum
+            self.tail_5d_blend /= blend_sum
             risk_head_input = config['d_model'] // 2
             risk_head_hidden = config['d_model'] // 4
             self.risk_1d_head = nn.Sequential(
@@ -173,6 +183,13 @@ class StockTransformer(nn.Module):
             )
             if self.risk_5d_head_enabled:
                 self.risk_5d_head = nn.Sequential(
+                    nn.Linear(risk_head_input, risk_head_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(config['dropout'] * 0.5),
+                    nn.Linear(risk_head_hidden, 1),
+                )
+            if self.tail_5d_head_enabled:
+                self.tail_5d_head = nn.Sequential(
                     nn.Linear(risk_head_input, risk_head_hidden),
                     nn.ReLU(),
                     nn.Dropout(config['dropout'] * 0.5),
@@ -439,6 +456,7 @@ class StockTransformer(nn.Module):
         risk_1d_logits = None
         risk_3d_logits = None
         risk_5d_logits = None
+        tail_5d_logits = None
         combined_risk = None
         if self.risk_heads_enabled:
             risk_1d_logits = self.risk_1d_head(flat_features).view(
@@ -453,6 +471,10 @@ class StockTransformer(nn.Module):
                 risk_5d_logits = self.risk_5d_head(
                     flat_features
                 ).view(batch_size, num_stocks)
+            if self.tail_5d_head_enabled:
+                tail_5d_logits = self.tail_5d_head(
+                    flat_features
+                ).view(batch_size, num_stocks)
             combined_risk = (
                 self.risk_1d_blend * torch.sigmoid(risk_1d_logits)
                 + self.risk_3d_blend * torch.sigmoid(risk_3d_logits)
@@ -461,6 +483,11 @@ class StockTransformer(nn.Module):
                 combined_risk = (
                     combined_risk
                     + self.risk_5d_blend * torch.sigmoid(risk_5d_logits)
+                )
+            if tail_5d_logits is not None:
+                combined_risk = (
+                    combined_risk
+                    + self.tail_5d_blend * torch.sigmoid(tail_5d_logits)
                 )
 
         regime_gate = raw_score_output.new_zeros(batch_size)
@@ -602,6 +629,7 @@ class StockTransformer(nn.Module):
                     'risk_1d_logits': risk_1d_logits,
                     'risk_3d_logits': risk_3d_logits,
                     'risk_5d_logits': risk_5d_logits,
+                    'tail_5d_logits': tail_5d_logits,
                     'combined_risk': combined_risk,
                     'regime_gate': regime_gate,
                     'exposure_base_probability': base_exposure_probability,
