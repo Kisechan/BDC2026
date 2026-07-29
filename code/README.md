@@ -19,7 +19,8 @@
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
    回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
-   每次只用另外两折标定 Allocation/Exposure 混合、风险与反转参数，再在留出折评估；
+   每次只用另外两折依次标定 Ranking、Allocation、Exposure，并以配对收益、
+   P10和最差折门控各模块，再在完全未参与决策的留出折评估；
 7. 每折依次训练 Ranking、Risk/Regime、Allocation、Exposure；三折后把各阶段
    最佳optimizer更新步数中位数换算成全量epoch，进行四阶段全量重训。
 
@@ -80,10 +81,10 @@
 - `add_relative_market_features()`：在单股特征合并后增加7个同日横截面百分位和
   5个市场状态特征；所有输入只依赖当前及过去行情；
 - `create_ranking_dataset_vectorized()`：向量化构建按日排序样本（训练核心加速点）。
-- rank ensemble、OOF 对齐、收益分解和策略网格标定函数；
-- 风险感知 Top-5：从排名前30名候选中使用5/20/60日横截面动量反转风险；
-  同时以过去20日和60日相关性的最大值构图，相关系数不低于0.60的连通簇最多
-  入选2只。关闭簇约束且`selection_risk_gamma=0`时完整复现旧选择逻辑。
+- rank ensemble、OOF 对齐、收益分解、分阶段策略标定及模块稳健门控函数；
+- 风险感知 Top-5：反转软惩罚仍可在排名候选中校准；相关簇硬约束默认关闭，
+  启用时仅能在原始 Top-10 内替换。若 Top-10 无法在每簇最多2只的前提下选满
+  Top-5，当日完整保留原始 Top-5，不再向 Top-30 之外扩池。
 
 说明：特征工程使用了 `TA-Lib`，若未正确安装会报错。
 原 `RSQR5/10/20/30/60` 的滚动索引实现会使绝大部分结果变成 NaN 后填 0，
@@ -157,19 +158,24 @@
 - `config.json`：训练时配置快照；
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
-当前模型输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_diverse_tailregime_v6_decay5y/`。
+当前策略输出目录为
+`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_modulegated_policy_v7/`。
+该目录不复制模型；`artifact_source_dir` 指向
+`nested_oof_diverse_tailregime_v6_decay5y` 的 checkpoint、scaler、股票映射和
+训练配置。`ensemble_policy.json` 同时保留交叉拟合策略、全 OOF 候选策略及经过
+跨折模块资格过滤的实际部署策略。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
 1. 加载历史数据，取最新交易日；
 2. 执行与训练一致的特征工程；
-3. 从模型目录加载训练时 `config.json` 和全量 `scaler.pkl`，源码参数漂移只报告、不参与模型构造；
+3. 从策略目录加载部署参数，并通过 `artifact_source_dir` 从 v6 产物目录加载
+   训练配置、全量 `scaler.pkl`、股票映射与 checkpoint；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
-5. 先按全量OOF部署策略选择的短期/尾部风险分数惩罚调整Ranking百分位，再从
-   前30名候选中按反转软惩罚及20/60日相关簇硬上限贪心选择Top-5。交叉拟合
-   OOF只用于晋级评估，全量OOF策略只用于部署。集成模式会
+5. 先按稳健部署策略决定是否应用风险、反转和相关簇模块；相关簇启用时严格限制
+   在原始 Top-10，无法满足时原样回退。交叉拟合 OOF 是唯一晋级依据，全量 OOF
+   候选还必须通过跨折模块资格检查才能进入部署策略。集成模式会
    平均各模型 Allocation 分布，并可按模型排名分歧将总仓位向0.20收缩，输出到
    `result.csv`：
 	 - `stock_id`
@@ -217,16 +223,16 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 训练模型
+3) 用既有 v6 OOF 重放 v7 策略（不会训练模型）
 
 ```
-sh train.sh
+POLICY_ONLY=1 ./train.sh
 ```
 
 4) 生成预测结果
 
 ```
-sh test.sh
+./test.sh
 ```
 
 ---

@@ -49,9 +49,11 @@ end_date = "***"
 
 # 训练与预测
 
-训练：运行根目录下的sh train.sh
+当前 v7 是复用 v6 模型产物的策略实验，不重新训练模型。运行
+`POLICY_ONLY=1 ./train.sh` 重放嵌套 OOF 并生成策略目录；随后运行
+`./test.sh` 生成预测。
 
-windows可以直接运行`python code/src/train.py`
+若要从头训练模型，应先切回对应的模型训练配置；当前 v7 配置会拒绝误触发正式训练。
 
 成功完成训练
 

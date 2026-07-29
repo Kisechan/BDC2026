@@ -9,13 +9,13 @@ The active `158+39_reduced25_relmarket12` experiment has 178 inputs after adding
 seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
-market-pressure features. The active model experiment is
-`nested_oof_diverse_tailregime_v6_decay5y`; it keeps the 1/3/5-day soft risk
-heads and adds a five-day tail-event head, while retaining the market regime
-gate, Allocation Head, and Exposure Head. Risk-head gradients remain isolated
-from Ranking, five-year ranking samples remain recency weighted, strategy
-promotion uses nested cross-fitted OOF, and Top-5 construction enforces a
-20/60-day correlation-cluster cap.
+market-pressure features. The active strategy experiment is
+`nested_oof_modulegated_policy_v7`. It reuses the model, scaler, stock mapping,
+and OOF artifacts from `nested_oof_diverse_tailregime_v6_decay5y`; its own
+directory contains policy and report artifacts only. Strategy changes are
+calibrated in Ranking, Allocation, and Exposure stages with nested OOF module
+gates. The bounded correlation-cluster option only replaces names within the
+raw Top-10 and falls back to the original Top-5 when infeasible.
 Keep each experiment's
 model directory separate, because
 checkpoints from different architectures or input dimensions are incompatible.
