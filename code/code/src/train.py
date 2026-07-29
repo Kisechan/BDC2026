@@ -3489,6 +3489,15 @@ def main():
         'max_selected_cluster_count': ensemble_metrics[
             'max_selected_cluster_count'
         ],
+        'mean_effective_candidate_k': ensemble_metrics[
+            'mean_effective_candidate_k'
+        ],
+        'max_effective_candidate_k': ensemble_metrics[
+            'max_effective_candidate_k'
+        ],
+        'candidate_pool_expansion_rate': ensemble_metrics[
+            'candidate_pool_expansion_rate'
+        ],
         'mean_reversal_risk': ensemble_metrics['mean_reversal_risk'],
         'exposure_std': ensemble_metrics['exposure_std'],
         'exposure_return_spearman': ensemble_metrics[

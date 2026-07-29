@@ -1063,8 +1063,8 @@ def select_risk_aware_top_indices(
         raise ValueError('return_history 股票维度与分数不一致')
     if risk_gamma < 0:
         raise ValueError('selection_risk_gamma 不能为负')
-    candidate_k = min(int(candidate_k), scores.size)
-    if candidate_k < top_k:
+    requested_candidate_k = min(int(candidate_k), scores.size)
+    if requested_candidate_k < top_k:
         raise ValueError('selection_candidate_k 不能小于 Top-k')
     if max_stocks_per_cluster < 1:
         raise ValueError('max_stocks_per_cluster 必须大于0')
@@ -1077,7 +1077,6 @@ def select_risk_aware_top_indices(
 
     raw_order = np.lexsort((np.arange(scores.size), -scores))
     raw_top_indices = raw_order[:top_k]
-    candidate_indices = raw_order[:candidate_k]
     cs5, cs20, cs60 = momentum_percentiles.T
     reversal_risk = (
         0.6 * np.maximum(cs60 - cs5, 0.0)
@@ -1089,11 +1088,36 @@ def select_risk_aware_top_indices(
         return_history,
         correlation_lookbacks,
     )
-    cluster_by_index = _candidate_correlation_clusters(
-        positive_correlations,
-        candidate_indices,
-        cluster_correlation_threshold,
-    )
+    effective_candidate_k = requested_candidate_k
+    while True:
+        candidate_indices = raw_order[:effective_candidate_k]
+        cluster_by_index = _candidate_correlation_clusters(
+            positive_correlations,
+            candidate_indices,
+            cluster_correlation_threshold,
+        )
+        _, cluster_sizes = np.unique(
+            cluster_by_index[candidate_indices],
+            return_counts=True,
+        )
+        cluster_capacity = int(np.minimum(
+            cluster_sizes,
+            max_stocks_per_cluster,
+        ).sum())
+        if not cluster_cap_enabled or cluster_capacity >= top_k:
+            break
+        if effective_candidate_k >= scores.size:
+            raise ValueError(
+                '即使扩展到全部股票，相关簇硬约束仍无法选满Top-k；'
+                '数据中可用相关簇数量不足'
+            )
+        effective_candidate_k = min(
+            scores.size,
+            max(
+                effective_candidate_k + 10,
+                int(np.ceil(effective_candidate_k * 1.25)),
+            ),
+        )
 
     if risk_gamma == 0.0 and not cluster_cap_enabled:
         selected = raw_top_indices.tolist()
@@ -1175,6 +1199,11 @@ def select_risk_aware_top_indices(
         'raw_cluster_ids': cluster_by_index[raw_top_indices],
         'num_candidate_clusters': int(
             np.unique(cluster_by_index[candidate_indices]).size
+        ),
+        'requested_candidate_k': int(requested_candidate_k),
+        'effective_candidate_k': int(effective_candidate_k),
+        'candidate_pool_expanded': bool(
+            effective_candidate_k > requested_candidate_k
         ),
         'cluster_cap_enabled': bool(cluster_cap_enabled),
         'mean_positive_correlation': _mean_pairwise_correlation(
@@ -1293,6 +1322,9 @@ def build_ensemble_portfolio(
             'cluster_ids': np.arange(top_k, dtype=np.int64),
             'raw_cluster_ids': np.arange(top_k, dtype=np.int64),
             'num_candidate_clusters': top_k,
+            'requested_candidate_k': int(selection_candidate_k),
+            'effective_candidate_k': int(selection_candidate_k),
+            'candidate_pool_expanded': False,
             'cluster_cap_enabled': False,
             'mean_positive_correlation': 0.0,
             'raw_mean_positive_correlation': 0.0,
@@ -1386,6 +1418,15 @@ def build_ensemble_portfolio(
         'raw_cluster_ids': risk_selection['raw_cluster_ids'],
         'num_candidate_clusters': risk_selection[
             'num_candidate_clusters'
+        ],
+        'requested_candidate_k': risk_selection[
+            'requested_candidate_k'
+        ],
+        'effective_candidate_k': risk_selection[
+            'effective_candidate_k'
+        ],
+        'candidate_pool_expanded': risk_selection[
+            'candidate_pool_expanded'
         ],
         'cluster_cap_enabled': risk_selection['cluster_cap_enabled'],
         'mean_positive_correlation': risk_selection[
@@ -1794,6 +1835,15 @@ def summarize_ensemble_days(
             'num_candidate_clusters': int(
                 portfolio['num_candidate_clusters']
             ),
+            'requested_candidate_k': int(
+                portfolio['requested_candidate_k']
+            ),
+            'effective_candidate_k': int(
+                portfolio['effective_candidate_k']
+            ),
+            'candidate_pool_expanded': bool(
+                portfolio['candidate_pool_expanded']
+            ),
             'max_selected_cluster_count': int(max(
                 np.unique(
                     portfolio['selected_cluster_ids'],
@@ -1966,6 +2016,13 @@ def summarize_ensemble_days(
         ),
         'mean_reversal_risk': mean('mean_reversal_risk'),
         'mean_candidate_clusters': mean('num_candidate_clusters'),
+        'mean_effective_candidate_k': mean('effective_candidate_k'),
+        'candidate_pool_expansion_rate': float(np.mean([
+            row['candidate_pool_expanded'] for row in daily
+        ])),
+        'max_effective_candidate_k': int(max(
+            row['effective_candidate_k'] for row in daily
+        )),
         'max_selected_cluster_count': int(max(
             row['max_selected_cluster_count'] for row in daily
         )),
@@ -2300,6 +2357,7 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'raw_mean_positive_correlation',
         'mean_reversal_risk',
         'num_candidate_clusters',
+        'effective_candidate_k',
         'rank_ic',
     )
     summary = {
@@ -2403,12 +2461,19 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         ),
         'mean_reversal_risk': 'mean_mean_reversal_risk',
         'mean_candidate_clusters': 'mean_num_candidate_clusters',
+        'mean_effective_candidate_k': 'mean_effective_candidate_k',
         'mean_diversification_return_contribution': (
             'mean_diversification_return_contribution'
         ),
     }
     for public_name, generated_name in aliases.items():
         summary[public_name] = summary[generated_name]
+    summary['candidate_pool_expansion_rate'] = float(np.mean([
+        row['candidate_pool_expanded'] for row in daily
+    ]))
+    summary['max_effective_candidate_k'] = int(max(
+        row['effective_candidate_k'] for row in daily
+    ))
     return summary
 
 

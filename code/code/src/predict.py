@@ -873,6 +873,15 @@ def main():
 			'num_candidate_clusters': int(
 				portfolio['num_candidate_clusters']
 			),
+			'requested_candidate_k': int(
+				portfolio['requested_candidate_k']
+			),
+			'effective_candidate_k': int(
+				portfolio['effective_candidate_k']
+			),
+			'candidate_pool_expanded': bool(
+				portfolio['candidate_pool_expanded']
+			),
 			'head_base_exposure': float(
 				portfolio['head_base_exposure']
 			),
@@ -903,6 +912,8 @@ def main():
 	if portfolio.get('cluster_cap_enabled', False):
 		print(
 			f'相关簇: 候选 {portfolio["num_candidate_clusters"]} 簇, '
+			f'候选池 Top-{portfolio["effective_candidate_k"]}'
+			f'{"（已扩展）" if portfolio["candidate_pool_expanded"] else ""}, '
 			f'Top-5 簇编号 '
 			f'{[int(value) for value in portfolio["selected_cluster_ids"]]}'
 		)

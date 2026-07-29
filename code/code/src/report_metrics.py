@@ -100,6 +100,12 @@ def print_cross_validation() -> None:
             f"{float(summary['mean_positive_correlation']):.4f} / "
             f"{_pct(float(summary['mean_diversification_return_contribution']))}"
         )
+        print(
+            "候选池平均/最大规模及扩展日期占比: "
+            f"{float(summary['mean_effective_candidate_k']):.1f} / "
+            f"{int(summary['max_effective_candidate_k'])} / "
+            f"{float(summary['candidate_pool_expansion_rate']):.2%}"
+        )
     if "risk_score_penalty" in summary:
         print(
             "OOF Allocation混合/Exposure混合/风险分数惩罚/"
