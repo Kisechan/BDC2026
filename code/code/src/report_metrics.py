@@ -76,8 +76,10 @@ def print_cross_validation() -> None:
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
     if "risk_score_penalty" in summary:
         print(
-            "OOF Allocation混合/风险分数惩罚/选择gamma/相关性降仓: "
+            "OOF Allocation混合/Exposure混合/风险分数惩罚/"
+            "选择gamma/相关性降仓: "
             f"{float(summary.get('allocation_blend', 0.0)):.2f} / "
+            f"{float(summary.get('exposure_head_blend', 1.0)):.2f} / "
             f"{float(summary['risk_score_penalty']):.2f} / "
             f"{float(summary.get('selection_risk_gamma', 0.0)):.2f} / "
             f"{float(summary.get('correlation_exposure_gamma', 0.0)):.2f}"

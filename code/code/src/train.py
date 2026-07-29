@@ -287,6 +287,8 @@ class WeightedRankingLoss(nn.Module):
                  lambdarank_return_gap_scale=0.02,
                  risk_1d_weight=0.0,
                  risk_3d_weight=0.0,
+                 risk_5d_weight=0.0,
+                 risk_5d_target_temperature=0.03,
                  regime_weight=0.0):
         super(WeightedRankingLoss, self).__init__()
         if listwise_temperature <= 0:
@@ -324,6 +326,10 @@ class WeightedRankingLoss(nn.Module):
         )
         self.risk_1d_weight = float(risk_1d_weight)
         self.risk_3d_weight = float(risk_3d_weight)
+        self.risk_5d_weight = float(risk_5d_weight)
+        self.risk_5d_target_temperature = float(
+            risk_5d_target_temperature
+        )
         self.regime_weight = float(regime_weight)
         self.min_exposure = min_exposure
         self.max_exposure = max_exposure
@@ -355,9 +361,12 @@ class WeightedRankingLoss(nn.Module):
         if min(
             self.risk_1d_weight,
             self.risk_3d_weight,
+            self.risk_5d_weight,
             self.regime_weight,
         ) < 0:
             raise ValueError('风险头和状态门控损失权重不能为负')
+        if self.risk_5d_target_temperature <= 0:
+            raise ValueError('5日风险目标 temperature 必须大于0')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -590,6 +599,7 @@ class WeightedRankingLoss(nn.Module):
         identity_gate=None,
         risk_1d_logits=None,
         risk_3d_logits=None,
+        risk_5d_logits=None,
         regime_gate=None,
         risk_1d_targets=None,
         risk_3d_targets=None,
@@ -656,6 +666,17 @@ class WeightedRankingLoss(nn.Module):
                     * F.binary_cross_entropy_with_logits(
                         risk_3d_logits,
                         risk_3d_targets,
+                    )
+                )
+            if risk_5d_logits is not None and self.risk_5d_weight > 0:
+                risk_5d_targets = torch.sigmoid(
+                    -raw_returns / self.risk_5d_target_temperature
+                )
+                components['risk_5d_loss'] = (
+                    self.risk_5d_weight
+                    * F.binary_cross_entropy_with_logits(
+                        risk_5d_logits,
+                        risk_5d_targets,
                     )
                 )
             if (
@@ -1239,6 +1260,14 @@ def train_ranking_model(
                         if auxiliary_outputs['risk_3d_logits'] is not None
                         else None
                     ),
+                    risk_5d_logits=(
+                        auxiliary_outputs['risk_5d_logits'][
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0)
+                        if auxiliary_outputs['risk_5d_logits'] is not None
+                        else None
+                    ),
                     regime_gate=auxiliary_outputs['regime_gate'][
                         i
                     ].reshape(1),
@@ -1442,6 +1471,16 @@ def evaluate_ranking_model(
                             ] is not None
                             else None
                         ),
+                        risk_5d_logits=(
+                            auxiliary_outputs['risk_5d_logits'][
+                                i,
+                                valid_indices,
+                            ].unsqueeze(0)
+                            if auxiliary_outputs[
+                                'risk_5d_logits'
+                            ] is not None
+                            else None
+                        ),
                         regime_gate=auxiliary_outputs['regime_gate'][
                             i
                         ].reshape(1),
@@ -1533,6 +1572,18 @@ def evaluate_ranking_model(
                             ] is not None
                             else np.full(valid_indices.numel(), 0.5)
                         ),
+                        'risk_5d_probabilities': (
+                            torch.sigmoid(
+                                auxiliary_outputs['risk_5d_logits'][
+                                    i,
+                                    valid_indices,
+                                ]
+                            ).detach().cpu().numpy()
+                            if auxiliary_outputs[
+                                'risk_5d_logits'
+                            ] is not None
+                            else np.full(valid_indices.numel(), 0.5)
+                        ),
                         'risk_1d_targets': risk_1d_targets[
                             i,
                             valid_indices,
@@ -1541,6 +1592,13 @@ def evaluate_ranking_model(
                             i,
                             valid_indices,
                         ].detach().cpu().numpy(),
+                        'risk_5d_targets': torch.sigmoid(
+                            -masked_targets[i][valid_indices]
+                            / float(config.get(
+                                'risk_5d_target_temperature',
+                                0.03,
+                            ))
+                        ).detach().cpu().numpy(),
                         'regime_target': float(
                             regime_targets[
                                 i,
@@ -1856,6 +1914,7 @@ def configure_model_for_stage(model, stage):
     risk_prefixes = (
         'risk_1d_head.',
         'risk_3d_head.',
+        'risk_5d_head.',
         'regime_market_encoder.',
         'regime_gate_head.',
     )
@@ -1889,6 +1948,8 @@ def set_model_stage_mode(model, stage, training):
         if hasattr(model, 'risk_1d_head'):
             model.risk_1d_head.eval()
             model.risk_3d_head.eval()
+            if hasattr(model, 'risk_5d_head'):
+                model.risk_5d_head.eval()
         if hasattr(model, 'regime_market_encoder'):
             model.regime_market_encoder.eval()
             model.regime_gate_head.eval()
@@ -1898,6 +1959,8 @@ def set_model_stage_mode(model, stage, training):
         model.eval()
         model.risk_1d_head.train()
         model.risk_3d_head.train()
+        if hasattr(model, 'risk_5d_head'):
+            model.risk_5d_head.train()
         model.regime_market_encoder.train()
         model.regime_gate_head.train()
     elif stage == 'allocation':
@@ -1952,6 +2015,11 @@ def build_training_components(model, stage='ranking'):
         ),
         risk_1d_weight=config.get('risk_1d_weight', 0.0),
         risk_3d_weight=config.get('risk_3d_weight', 0.0),
+        risk_5d_weight=config.get('risk_5d_weight', 0.0),
+        risk_5d_target_temperature=config.get(
+            'risk_5d_target_temperature',
+            0.03,
+        ),
         regime_weight=config.get('regime_weight', 0.0),
         min_exposure=config.get('min_exposure', 0.80),
         max_exposure=config.get('max_exposure', 0.999999),
@@ -2699,9 +2767,14 @@ def main():
         ),
         risk_1d_blend=float(config.get('risk_1d_blend', 0.40)),
         risk_3d_blend=float(config.get('risk_3d_blend', 0.60)),
+        risk_5d_blend=float(config.get('risk_5d_blend', 0.0)),
         correlation_exposure_gamma_grid=config.get(
             'correlation_exposure_gamma_grid',
             [0.0],
+        ),
+        exposure_head_blend_grid=config.get(
+            'exposure_head_blend_grid',
+            [1.0],
         ),
         selection_candidate_k=int(config.get(
             'selection_candidate_k',
@@ -2737,9 +2810,14 @@ def main():
             )),
             risk_1d_blend=float(config.get('risk_1d_blend', 0.40)),
             risk_3d_blend=float(config.get('risk_3d_blend', 0.60)),
+            risk_5d_blend=float(config.get('risk_5d_blend', 0.0)),
             correlation_exposure_gamma=float(policy.get(
                 'correlation_exposure_gamma',
                 0.0,
+            )),
+            exposure_head_blend=float(policy.get(
+                'exposure_head_blend',
+                1.0,
             )),
             fixed_exposure_baseline=float(config.get(
                 'fixed_exposure_baseline',
@@ -2779,7 +2857,7 @@ def main():
         'allocation_at_exposure_positive': bool(
             ensemble_metrics[
                 'mean_allocation_at_exposure_contribution'
-            ] > 0.0
+            ] > 1e-6
         ),
         'selection_correlation_improved': bool(
             ensemble_metrics['mean_positive_correlation']
@@ -2910,6 +2988,10 @@ def main():
             'correlation_exposure_gamma',
             0.0,
         )),
+        'exposure_head_blend': float(policy.get(
+            'exposure_head_blend',
+            1.0,
+        )),
         'mean_top5_return': ensemble_metrics['mean_top5_return'],
         'worst_fold_top5_return': ensemble_metrics[
             'worst_fold_top5_return'
@@ -2930,6 +3012,9 @@ def main():
             'positive_rate'
         ],
         'mean_gross_exposure': ensemble_metrics['mean_gross_exposure'],
+        'mean_head_gross_exposure': ensemble_metrics[
+            'mean_head_gross_exposure'
+        ],
         'mean_cash_weight': ensemble_metrics['mean_cash_weight'],
         'mean_rank_ic': ensemble_metrics['mean_rank_ic'],
         'worst_rank_ic': ensemble_metrics['worst_rank_ic'],
@@ -2944,8 +3029,12 @@ def main():
         'mean_selected_risk_3d': ensemble_metrics[
             'mean_selected_risk_3d'
         ],
+        'mean_selected_risk_5d': ensemble_metrics[
+            'mean_selected_risk_5d'
+        ],
         'mean_risk_1d_brier': ensemble_metrics['mean_risk_1d_brier'],
         'mean_risk_3d_brier': ensemble_metrics['mean_risk_3d_brier'],
+        'mean_risk_5d_brier': ensemble_metrics['mean_risk_5d_brier'],
         'mean_regime_brier': ensemble_metrics['mean_regime_brier'],
         'regime_return_spearman': ensemble_metrics[
             'regime_return_spearman'

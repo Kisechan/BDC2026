@@ -397,6 +397,7 @@ def main():
 	model_regime_gates = []
 	model_risk_1d = []
 	model_risk_3d = []
+	model_risk_5d = []
 	base_identity_seed = int(trained_config.get(
 		'identity_sensitivity_seed',
 		20260728,
@@ -457,12 +458,19 @@ def main():
 				if auxiliary_output['risk_3d_logits'] is not None
 				else np.full(len(scores), 0.5)
 			)
+			risk_5d_probabilities = (
+				torch.sigmoid(auxiliary_output['risk_5d_logits'])
+				.squeeze(0).float().cpu().numpy()
+				if auxiliary_output['risk_5d_logits'] is not None
+				else np.full(len(scores), 0.5)
+			)
 			model_regime_gates.append(float(
 				auxiliary_output['regime_gate']
 				.squeeze(0).float().cpu().item()
 			))
 			model_risk_1d.append(risk_1d_probabilities)
 			model_risk_3d.append(risk_3d_probabilities)
+			model_risk_5d.append(risk_5d_probabilities)
 			unk_scores_output, _, _, unk_exposure_output = run_model(
 				torch.ones_like(stock_index_tensor)
 			)
@@ -545,6 +553,10 @@ def main():
 					float(risk_3d_probabilities[index])
 					for index in model_top
 				],
+				'top5_risk_5d': [
+					float(risk_5d_probabilities[index])
+					for index in model_top
+				],
 				'all_unk_vs_real': identity_comparison(
 					unk_scores_output,
 					unk_exposure_output,
@@ -575,10 +587,21 @@ def main():
 			20,
 		)),
 		risk_probability_matrix=(
-			float(trained_config.get('risk_1d_blend', 0.40))
+			float(policy.get(
+				'risk_1d_blend',
+				trained_config.get('risk_1d_blend', 0.40),
+			))
 			* np.stack(model_risk_1d)
-			+ float(trained_config.get('risk_3d_blend', 0.60))
+			+ float(policy.get(
+				'risk_3d_blend',
+				trained_config.get('risk_3d_blend', 0.60),
+			))
 			* np.stack(model_risk_3d)
+			+ float(policy.get(
+				'risk_5d_blend',
+				trained_config.get('risk_5d_blend', 0.0),
+			))
+			* np.stack(model_risk_5d)
 		),
 		regime_gates=np.asarray(model_regime_gates),
 		risk_score_penalty=float(policy.get(
@@ -588,6 +611,14 @@ def main():
 		correlation_exposure_gamma=float(policy.get(
 			'correlation_exposure_gamma',
 			0.0,
+		)),
+		exposure_head_blend=float(policy.get(
+			'exposure_head_blend',
+			1.0,
+		)),
+		fixed_exposure_baseline=float(policy.get(
+			'fixed_exposure_baseline',
+			0.6231689453125,
 		)),
 		top_k=int(policy.get('top_k', 5)),
 	)
@@ -635,6 +666,14 @@ def main():
 			'correlation_exposure_gamma': float(policy.get(
 				'correlation_exposure_gamma',
 				0.0,
+			)),
+			'exposure_head_blend': float(policy.get(
+				'exposure_head_blend',
+				1.0,
+			)),
+			'fixed_exposure_baseline': float(policy.get(
+				'fixed_exposure_baseline',
+				0.6231689453125,
 			)),
 			'min_exposure': float(policy['min_exposure']),
 			'max_exposure': float(policy['max_exposure']),
@@ -692,6 +731,13 @@ def main():
 					axis=0,
 				)[top_indices]
 			],
+			'selected_risk_5d': [
+				float(value)
+				for value in np.mean(
+					np.stack(model_risk_5d),
+					axis=0,
+				)[top_indices]
+			],
 			'selected_reversal_risk': [
 				float(value)
 				for value in portfolio['selected_reversal_risk']
@@ -705,6 +751,9 @@ def main():
 			),
 			'raw_mean_positive_correlation': float(
 				portfolio['raw_mean_positive_correlation']
+			),
+			'head_base_exposure': float(
+				portfolio['head_base_exposure']
 			),
 			'base_exposure': float(portfolio['base_exposure']),
 			'final_exposure': weight_sum,
@@ -733,6 +782,11 @@ def main():
 	print(
 		f'相关性降仓 gamma: '
 		f'{float(policy.get("correlation_exposure_gamma", 0.0)):.4f}'
+	)
+	print(
+		f'Exposure Head混合: '
+		f'{float(policy.get("exposure_head_blend", 1.0)):.2f}; '
+		f'Head仓位 {portfolio["head_base_exposure"]:.6f}'
 	)
 	print(f'分歧调整前仓位: {portfolio["base_exposure"]:.12f}')
 	print(f'提交权重和: {weight_sum:.12f}')
