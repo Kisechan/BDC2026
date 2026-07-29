@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12'
 patience_num = 12
-experiment_name = 'idgate_reversal_diverse_heads_v2'
+experiment_name = 'idgate_reversal_diverse_heads_v2_5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
@@ -91,5 +91,6 @@ config = {
     'deterministic_training': True,
 
     'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
-    'data_path': './data',
+    # 五年历史数据与原三年数据隔离存放，避免覆盖已有实验的切分文件。
+    'data_path': './data_5y',
 }
