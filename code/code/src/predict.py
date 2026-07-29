@@ -763,10 +763,11 @@ def main():
 			'top5': top5,
 			'raw_top5': [
 				sequence_stock_ids[index]
-				for index in portfolio.get(
-					'unadjusted_top_indices',
-					portfolio['raw_top_indices'],
-				)
+				for index in portfolio['raw_top_indices']
+			],
+			'unadjusted_top5': [
+				sequence_stock_ids[index]
+				for index in portfolio['unadjusted_top_indices']
 			],
 			'selection_details': [
 				{
