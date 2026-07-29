@@ -122,6 +122,74 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1)
         )
+        self.risk_heads_enabled = bool(
+            config.get('risk_heads_enabled', False)
+        )
+        self.regime_gate_enabled = bool(
+            config.get('regime_gate_enabled', False)
+        )
+        self.risk_penalty_scale = float(
+            config.get('risk_penalty_scale', 0.25)
+        )
+        self.risk_1d_blend = float(config.get('risk_1d_blend', 0.40))
+        self.risk_3d_blend = float(config.get('risk_3d_blend', 0.60))
+        if self.risk_heads_enabled:
+            if min(self.risk_1d_blend, self.risk_3d_blend) < 0:
+                raise ValueError('风险头混合权重不能为负')
+            blend_sum = self.risk_1d_blend + self.risk_3d_blend
+            if blend_sum <= 0:
+                raise ValueError('风险头混合权重和必须大于0')
+            self.risk_1d_blend /= blend_sum
+            self.risk_3d_blend /= blend_sum
+            risk_head_input = config['d_model'] // 2
+            risk_head_hidden = config['d_model'] // 4
+            self.risk_1d_head = nn.Sequential(
+                nn.Linear(risk_head_input, risk_head_hidden),
+                nn.ReLU(),
+                nn.Dropout(config['dropout'] * 0.5),
+                nn.Linear(risk_head_hidden, 1),
+            )
+            self.risk_3d_head = nn.Sequential(
+                nn.Linear(risk_head_input, risk_head_hidden),
+                nn.ReLU(),
+                nn.Dropout(config['dropout'] * 0.5),
+                nn.Linear(risk_head_hidden, 1),
+            )
+        if self.regime_gate_enabled:
+            regime_feature_indices = [
+                int(index)
+                for index in config.get(
+                    'regime_market_feature_indices',
+                    config.get('market_state_feature_indices', []),
+                )
+            ]
+            if not regime_feature_indices:
+                raise ValueError('市场状态门控缺少市场特征索引')
+            if (
+                min(regime_feature_indices) < 0
+                or max(regime_feature_indices) >= input_dim
+            ):
+                raise ValueError('regime_market_feature_indices 超出输入维度')
+            regime_hidden_size = int(
+                config.get('regime_market_hidden_size', 16)
+            )
+            self.register_buffer(
+                'regime_market_feature_indices',
+                torch.tensor(regime_feature_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.regime_market_encoder = nn.GRU(
+                input_size=len(regime_feature_indices),
+                hidden_size=regime_hidden_size,
+                num_layers=1,
+                batch_first=True,
+            )
+            self.regime_gate_head = nn.Sequential(
+                nn.Linear(regime_hidden_size, regime_hidden_size),
+                nn.ReLU(),
+                nn.Dropout(config['dropout'] * 0.5),
+                nn.Linear(regime_hidden_size, 1),
+            )
 
         # 收益回归辅助头直接预测未来 5 日原始收益率。
         self.return_head = nn.Sequential(
@@ -176,6 +244,15 @@ class StockTransformer(nn.Module):
                 batch_first=True,
             )
             exposure_input_dim += market_hidden_size
+        self.exposure_portfolio_summary_enabled = bool(
+            config.get('exposure_portfolio_summary_enabled', False)
+        )
+        if self.exposure_portfolio_summary_enabled:
+            if not self.risk_heads_enabled or not self.regime_gate_enabled:
+                raise ValueError(
+                    'Exposure组合摘要需要启用风险头和市场状态门控'
+                )
+            exposure_input_dim += 5
         self.exposure_head = nn.Sequential(
             nn.Linear(exposure_input_dim, config['d_model'] // 4),
             nn.ReLU(),
@@ -200,7 +277,32 @@ class StockTransformer(nn.Module):
             return self.stock_embedding.weight.new_tensor(1.0)
         return torch.sigmoid(self.identity_gate_logit)
     
-    def forward(self, src, stock_indices, stock_mask=None):
+    @staticmethod
+    def _market_sequence(src, stock_mask, feature_indices):
+        market_values = src.index_select(-1, feature_indices)
+        if stock_mask is None:
+            return market_values.mean(dim=1)
+        market_mask = stock_mask.to(market_values.dtype)[:, :, None, None]
+        return (
+            (market_values * market_mask).sum(dim=1)
+            / market_mask.sum(dim=1).clamp(min=1.0)
+        )
+
+    @staticmethod
+    def _masked_cross_sectional_zscore(values, stock_mask):
+        if stock_mask is None:
+            return (
+                values - values.mean(dim=1, keepdim=True)
+            ) / values.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
+        mask = stock_mask.to(values.dtype)
+        count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        mean = (values * mask).sum(dim=1, keepdim=True) / count
+        variance = (
+            (values - mean).square() * mask
+        ).sum(dim=1, keepdim=True) / count
+        return (values - mean) / variance.sqrt().clamp(min=1e-6)
+
+    def forward(self, src, stock_indices, stock_mask=None, return_aux=False):
         # src: [batch, num_stocks, seq_len, feature_dim]
         batch_size, num_stocks, seq_len, feature_dim = src.size()
         
@@ -252,9 +354,52 @@ class StockTransformer(nn.Module):
         allocation_logits = self.allocation_head(ranking_features)  # [batch*num_stocks, 1]
         
         # 重塑为最终输出格式
-        output = scores.view(batch_size, num_stocks)  # [batch, num_stocks]
+        raw_score_output = scores.view(batch_size, num_stocks)
         return_output = predicted_returns.view(batch_size, num_stocks)
         allocation_output = allocation_logits.view(batch_size, num_stocks)
+        risk_1d_logits = None
+        risk_3d_logits = None
+        combined_risk = None
+        if self.risk_heads_enabled:
+            risk_1d_logits = self.risk_1d_head(ranking_features).view(
+                batch_size,
+                num_stocks,
+            )
+            risk_3d_logits = self.risk_3d_head(ranking_features).view(
+                batch_size,
+                num_stocks,
+            )
+            combined_risk = (
+                self.risk_1d_blend * torch.sigmoid(risk_1d_logits)
+                + self.risk_3d_blend * torch.sigmoid(risk_3d_logits)
+            )
+
+        regime_gate = raw_score_output.new_zeros(batch_size)
+        if self.regime_gate_enabled:
+            regime_sequence = self._market_sequence(
+                src,
+                stock_mask,
+                self.regime_market_feature_indices,
+            )
+            _, regime_hidden = self.regime_market_encoder(regime_sequence)
+            regime_gate = torch.sigmoid(
+                self.regime_gate_head(regime_hidden[-1])
+            ).squeeze(-1)
+
+        output = raw_score_output
+        if self.risk_heads_enabled and self.regime_gate_enabled:
+            output = (
+                self._masked_cross_sectional_zscore(
+                    raw_score_output,
+                    stock_mask,
+                )
+                - self.risk_penalty_scale
+                * regime_gate[:, None]
+                * self._masked_cross_sectional_zscore(
+                    combined_risk,
+                    stock_mask,
+                )
+            )
 
         ranking_features_by_stock = ranking_features.view(batch_size, num_stocks, -1)
         if stock_mask is None:
@@ -267,21 +412,48 @@ class StockTransformer(nn.Module):
             )
         exposure_features = pooled_market_features
         if self.exposure_market_encoder_enabled:
-            market_values = src.index_select(
-                -1,
+            market_sequence = self._market_sequence(
+                src,
+                stock_mask,
                 self.market_state_feature_indices,
             )
-            if stock_mask is None:
-                market_sequence = market_values.mean(dim=1)
-            else:
-                market_mask = stock_mask.to(market_values.dtype)[:, :, None, None]
-                market_sequence = (
-                    (market_values * market_mask).sum(dim=1)
-                    / market_mask.sum(dim=1).clamp(min=1.0)
-                )
             _, market_hidden = self.exposure_market_encoder(market_sequence)
             exposure_features = torch.cat(
                 [pooled_market_features, market_hidden[-1]],
+                dim=-1,
+            )
+        if self.exposure_portfolio_summary_enabled:
+            top_k = min(5, num_stocks)
+            selection_scores = output
+            if stock_mask is not None:
+                selection_scores = selection_scores.masked_fill(
+                    ~stock_mask.bool(),
+                    -torch.inf,
+                )
+            top_indices = torch.topk(
+                selection_scores.detach(),
+                top_k,
+                dim=1,
+            ).indices
+            selected_risk_1d = torch.sigmoid(risk_1d_logits).gather(
+                1,
+                top_indices,
+            )
+            selected_risk_3d = torch.sigmoid(risk_3d_logits).gather(
+                1,
+                top_indices,
+            )
+            selected_combined_risk = combined_risk.gather(1, top_indices)
+            selected_scores = output.gather(1, top_indices)
+            portfolio_summary = torch.stack([
+                regime_gate,
+                selected_risk_1d.mean(dim=1),
+                selected_risk_3d.mean(dim=1),
+                selected_combined_risk.max(dim=1).values,
+                selected_scores.std(dim=1, unbiased=False),
+            ], dim=1)
+            exposure_features = torch.cat(
+                [exposure_features, portfolio_summary],
                 dim=-1,
             )
         raw_exposure = torch.sigmoid(
@@ -292,4 +464,18 @@ class StockTransformer(nn.Module):
         ) * raw_exposure
         exposure = exposure.clamp(min=self.min_exposure, max=self.max_exposure)
 
+        if return_aux:
+            return (
+                output,
+                return_output,
+                allocation_output,
+                exposure,
+                {
+                    'raw_scores': raw_score_output,
+                    'risk_1d_logits': risk_1d_logits,
+                    'risk_3d_logits': risk_3d_logits,
+                    'combined_risk': combined_risk,
+                    'regime_gate': regime_gate,
+                },
+            )
         return output, return_output, allocation_output, exposure
