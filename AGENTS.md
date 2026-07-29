@@ -10,10 +10,12 @@ seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
 market-pressure features. The active model experiment is
-`regime_lambdarank_staged_v4_riskisolated_decay5y`; it keeps the 1/3-day risk
-heads, market regime gate, Allocation Head, and Exposure Head, while isolating
-risk-head gradients from Ranking, applying recency-weighted five-year training,
-calibrating score risk through OOF, and using monotonic risk-aware exposure.
+`regime_lambdarank_staged_v5_tail5_exposureblend_decay5y`; it keeps the 1/3-day
+risk heads and adds a holding-period-aligned 5-day downside head, while retaining
+the market regime gate, Allocation Head, and Exposure Head. Risk-head gradients
+remain isolated from Ranking, five-year ranking samples remain recency weighted,
+and OOF now calibrates both score risk and the blend between the learned Exposure
+Head and the fixed-exposure baseline.
 Keep each experiment's
 model directory separate, because
 checkpoints from different architectures or input dimensions are incompatible.

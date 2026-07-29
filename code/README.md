@@ -45,7 +45,7 @@
   `ensemble_enabled`、`ensemble_seeds`、`evaluation_stride`、
   `allocation_blend_grid`、`disagreement_gamma_grid`、
   `selection_risk_gamma_grid`、`risk_score_penalty_grid`、
-  `correlation_exposure_gamma_grid`）；
+  `correlation_exposure_gamma_grid`、`exposure_head_blend_grid`）；
 - CUDA AMP、TF32、fused AdamW、pinned memory 和 non-blocking 传输开关；
 - 数据路径和输出路径（默认输出到 `output/`）。
 
@@ -58,14 +58,14 @@
   dropout；可学习门控初值为0.20并带平方正则，限制 ID 分支影响；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
 - `score_head` 与 `return_head`：分别输出5日Alpha分数和原始收益预测；
-- `risk_1d_head`、`risk_3d_head`：预测短期软下跌概率；
+- `risk_1d_head`、`risk_3d_head`、`risk_5d_head`：分别预测1、3、5日软下跌概率；
 - 独立 `regime_market_encoder`：用市场压力序列生成状态门控；风险强度不再固定
   写入模型分数，而是仅通过OOF网格校准；
 - `allocation_head`：输出相对仓位 logits，训练监督覆盖预测 Top-20，最终只在
   风险感知 Top-5 中重新 softmax；
 - `exposure_head`：将股票池聚合表示、13维市场序列及Top-5分数离散度拼接，并通过
   正系数单调扣减市场压力和Top-5风险，输出`[0.20, 0.999999]`内的总股票仓位；
-  现金恒为`1-exposure`。
+  OOF再校准其与固定仓位基线的混合比例，现金恒为`1-exposure`。
 
 输入包含特征张量、股票索引和有效股票 mask；模型返回排序分数、预测收益、
 相对仓位 logits 三个 `[batch, num_stocks]` 张量，以及一个 `[batch]` 总仓位张量。
@@ -155,7 +155,7 @@
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
 当前模型输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_regime_lambdarank_staged_v4_riskisolated_decay5y/`。
+`model/60_158+39_reduced25_relmarket12_risk15_regime_lambdarank_staged_v5_tail5_exposureblend_decay5y/`。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
