@@ -67,6 +67,15 @@ def move_batch_tensor(tensor, device):
         ),
     )
 
+
+def cast_auxiliary_outputs_to_float(auxiliary_outputs):
+    """让 AMP 生成的辅助头输出以 FP32 参与数值敏感的损失计算。"""
+    return {
+        name: value.float() if isinstance(value, torch.Tensor) else value
+        for name, value in auxiliary_outputs.items()
+    }
+
+
 feature_cloums_map = {
     '39': ['开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅','sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv','volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',  'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'],
 
@@ -1112,6 +1121,7 @@ def train_ranking_model(
         return_outputs = return_outputs.float()
         allocation_outputs = allocation_outputs.float()
         exposures = exposures.float()
+        auxiliary_outputs = cast_auxiliary_outputs_to_float(auxiliary_outputs)
         
         # 应用mask，只考虑有效股票
         masked_outputs = outputs * masks + (1 - masks) * (-1e9)  # 无效位置设为很小的值
@@ -1289,6 +1299,9 @@ def evaluate_ranking_model(
             return_outputs = return_outputs.float()
             allocation_outputs = allocation_outputs.float()
             exposures = exposures.float()
+            auxiliary_outputs = cast_auxiliary_outputs_to_float(
+                auxiliary_outputs,
+            )
             
             # 应用mask
             masked_outputs = outputs * masks + (1 - masks) * (-1e9)
