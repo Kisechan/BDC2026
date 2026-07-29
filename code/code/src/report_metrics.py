@@ -80,6 +80,14 @@ def print_cross_validation() -> None:
                 f"{float(summary['mean_model_disagreement']):.4f}"
             )
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
+    ranking_baseline = summary.get("original_ranking_baseline", {})
+    if ranking_baseline:
+        print(
+            "原始 Ranking 基线—平均收益/下行波动/目标: "
+            f"{_pct(float(ranking_baseline['mean_top5_return']))} / "
+            f"{float(ranking_baseline['top5_downside_deviation']):.4%} / "
+            f"{_pct(float(ranking_baseline['ranking_policy_objective']))}"
+        )
     if "mean_tail_5d_brier" in summary:
         print(
             "5日尾部风险均值/Brier、融合风险与未来Top-5收益相关: "
@@ -106,6 +114,13 @@ def print_cross_validation() -> None:
             f"{int(summary['max_effective_candidate_k'])} / "
             f"{float(summary['candidate_pool_expansion_rate']):.2%}"
         )
+        if "cluster_constraint_application_rate" in summary:
+            print(
+                "相关簇约束应用率/跳过率/最大原始排名: "
+                f"{float(summary['cluster_constraint_application_rate']):.2%} / "
+                f"{float(summary['cluster_constraint_skip_rate']):.2%} / "
+                f"{int(summary['max_selected_raw_rank'])}"
+            )
     if "risk_score_penalty" in summary:
         print(
             "OOF Allocation混合/Exposure混合/风险分数惩罚/"
@@ -129,6 +144,41 @@ def print_cross_validation() -> None:
                 f"Reversal={float(selected['selection_risk_gamma']):.2f}, "
                 f"CorrExposure="
                 f"{float(selected['correlation_exposure_gamma']):.2f}"
+            )
+        module_reports = summary.get("module_alternative_reports", {})
+        if module_reports:
+            print("全量 OOF 模块最佳替代方案（仅诊断，不直接部署）:")
+            for module, details in module_reports.items():
+                if not details.get("available", False):
+                    print(f"  {module}: 无非基线候选")
+                    continue
+                gate = details["gate"]
+                fold_values = gate.get("fold_contributions", {})
+                print(
+                    f"  {module}: value={details['best_alternative_value']}, "
+                    f"配对均值={_pct(float(gate['mean_paired_contribution']))}, "
+                    f"各折={{{', '.join(f'{k}: {_pct(float(v))}' for k, v in fold_values.items())}}}, "
+                    f"P10变化={_pct(float(gate['p10_change']))}, "
+                    f"最差折变化={_pct(float(gate['worst_fold_change']))}, "
+                    f"gate={'PASS' if gate['enabled'] else 'FAIL'}"
+                )
+        candidate = summary.get("all_oof_candidate_policy", {})
+        robust = summary.get("robust_deployment_policy", {})
+        if candidate and robust:
+            compared_fields = (
+                "risk_score_penalty",
+                "selection_risk_gamma",
+                "cluster_cap_enabled",
+                "allocation_blend",
+                "exposure_head_blend",
+                "correlation_exposure_gamma",
+            )
+            print(
+                "全量 OOF 候选 → 稳健部署: "
+                + ", ".join(
+                    f"{field}={candidate.get(field)}→{robust.get(field)}"
+                    for field in compared_fields
+                )
             )
         deployment = summary.get("deployment_policy", {})
         if deployment:
