@@ -15,7 +15,13 @@ from utils import add_relative_market_features
 from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import extract_selection_risk_context
-from utils import RELATIVE_MARKET_FEATURES, RELATIVE_MARKET_FEATURE_SET
+from utils import (
+	MARKET_PRESSURE_FEATURES,
+	RELATIVE_MARKET_FEATURES,
+	RELATIVE_MARKET_FEATURE_SET,
+	RISK_MARKET_FEATURES,
+	RISK_MARKET_FEATURE_SET,
+)
 
 
 feature_cloums_map = {
@@ -69,9 +75,15 @@ feature_cloums_map[RELATIVE_MARKET_FEATURE_SET] = [
 	*RELATIVE_MARKET_FEATURES,
 ]
 feature_engineer_func_map[RELATIVE_MARKET_FEATURE_SET] = engineer_features_158plus39
+feature_cloums_map[RISK_MARKET_FEATURE_SET] = [
+	*feature_cloums_map[RELATIVE_MARKET_FEATURE_SET],
+	*RISK_MARKET_FEATURES,
+]
+feature_engineer_func_map[RISK_MARKET_FEATURE_SET] = engineer_features_158plus39
 assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
 assert len(feature_cloums_map[RELATIVE_MARKET_FEATURE_SET]) == 178
+assert len(feature_cloums_map[RISK_MARKET_FEATURE_SET]) == 193
 
 
 def preprocess_predict_data(df, stockid2idx, runtime_config=None):
@@ -93,7 +105,7 @@ def preprocess_predict_data(df, stockid2idx, runtime_config=None):
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))
 
 	processed = pd.concat(processed_list).reset_index(drop=True)
-	if feature_num == RELATIVE_MARKET_FEATURE_SET:
+	if feature_num in {RELATIVE_MARKET_FEATURE_SET, RISK_MARKET_FEATURE_SET}:
 		processed = add_relative_market_features(processed)
 	processed['instrument'] = processed['股票代码'].map(stockid2idx).fillna(1)
 	processed['instrument'] = processed['instrument'].astype(np.int64)
@@ -319,6 +331,27 @@ def main():
 		stockid2idx,
 		runtime_config=trained_config,
 	)
+	if trained_config.get('regime_gate_enabled', False):
+		expected_market_indices = [
+			features.index(name)
+			for name in [
+				*RELATIVE_MARKET_FEATURES[-5:],
+				*MARKET_PRESSURE_FEATURES,
+			]
+		]
+		for config_key in (
+			'market_state_feature_indices',
+			'regime_market_feature_indices',
+		):
+			configured_indices = [
+				int(index)
+				for index in trained_config.get(config_key, [])
+			]
+			if configured_indices != expected_market_indices:
+				raise ValueError(
+					f'{config_key} 与训练特征位置不一致: '
+					f'{configured_indices} != {expected_market_indices}'
+				)
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 	scaler = joblib.load(scaler_path)
@@ -361,6 +394,9 @@ def main():
 	model_allocations = []
 	model_exposures = []
 	model_diagnostics = []
+	model_regime_gates = []
+	model_risk_1d = []
+	model_risk_3d = []
 	base_identity_seed = int(trained_config.get(
 		'identity_sensitivity_seed',
 		20260728,
@@ -377,7 +413,7 @@ def main():
 			)
 			model.to(device)
 			model.eval()
-			def run_model(indices):
+			def run_model(indices, return_aux=False):
 				with torch.autocast(
 					device_type=device.type,
 					dtype=torch.float16,
@@ -386,11 +422,20 @@ def main():
 						and trained_config.get('amp_enabled', True)
 					),
 				):
-					return model(x, indices, stock_mask)
+					return model(
+						x,
+						indices,
+						stock_mask,
+						return_aux=return_aux,
+					)
 
-			score_output, _, allocation_output, exposure_output = run_model(
-				stock_index_tensor
-			)
+			(
+				score_output,
+				_,
+				allocation_output,
+				exposure_output,
+				auxiliary_output,
+			) = run_model(stock_index_tensor, return_aux=True)
 			scores = score_output.squeeze(0).float().cpu().numpy()
 			allocation_logits = (
 				allocation_output.squeeze(0).float().cpu().numpy()
@@ -400,6 +445,24 @@ def main():
 			model_allocations.append(allocation_logits)
 			model_exposures.append(exposure)
 			model_top = np.argsort(scores, kind='stable')[::-1][:5]
+			risk_1d_probabilities = (
+				torch.sigmoid(auxiliary_output['risk_1d_logits'])
+				.squeeze(0).float().cpu().numpy()
+				if auxiliary_output['risk_1d_logits'] is not None
+				else np.full(len(scores), 0.5)
+			)
+			risk_3d_probabilities = (
+				torch.sigmoid(auxiliary_output['risk_3d_logits'])
+				.squeeze(0).float().cpu().numpy()
+				if auxiliary_output['risk_3d_logits'] is not None
+				else np.full(len(scores), 0.5)
+			)
+			model_regime_gates.append(float(
+				auxiliary_output['regime_gate']
+				.squeeze(0).float().cpu().item()
+			))
+			model_risk_1d.append(risk_1d_probabilities)
+			model_risk_3d.append(risk_3d_probabilities)
 			unk_scores_output, _, _, unk_exposure_output = run_model(
 				torch.ones_like(stock_index_tensor)
 			)
@@ -452,10 +515,22 @@ def main():
 				'seed': int(model_seeds[model_idx]),
 				'model_path': policy['model_paths'][model_idx],
 				'exposure': exposure,
+				'regime_gate': float(
+					auxiliary_output['regime_gate']
+					.squeeze(0).float().cpu().item()
+				),
 				'identity_gate': float(
 					model.identity_gate_value().detach().float().cpu().item()
 				),
 				'top5': [sequence_stock_ids[index] for index in model_top],
+				'top5_risk_1d': [
+					float(risk_1d_probabilities[index])
+					for index in model_top
+				],
+				'top5_risk_3d': [
+					float(risk_3d_probabilities[index])
+					for index in model_top
+				],
 				'all_unk_vs_real': identity_comparison(
 					unk_scores_output,
 					unk_exposure_output,
@@ -562,6 +637,21 @@ def main():
 				for value in portfolio['selected_disagreement']
 			],
 			'mean_disagreement': float(portfolio['mean_disagreement']),
+			'regime_gate': float(np.median(model_regime_gates)),
+			'selected_risk_1d': [
+				float(value)
+				for value in np.mean(
+					np.stack(model_risk_1d),
+					axis=0,
+				)[top_indices]
+			],
+			'selected_risk_3d': [
+				float(value)
+				for value in np.mean(
+					np.stack(model_risk_3d),
+					axis=0,
+				)[top_indices]
+			],
 			'selected_reversal_risk': [
 				float(value)
 				for value in portfolio['selected_reversal_risk']
@@ -587,6 +677,9 @@ def main():
 	print(f'预测日期: {latest_date.date()}')
 	print(f'参与排序股票数: {len(sequence_stock_ids)}')
 	print(f'模型平均排名分歧: {portfolio["mean_disagreement"]:.6f}')
+	print(
+		f'市场压力门控: {float(np.median(model_regime_gates)):.6f}'
+	)
 	print(
 		f'风险选择 gamma/相关性: '
 		f'{float(policy.get("selection_risk_gamma", 0.0)):.4f} / '
