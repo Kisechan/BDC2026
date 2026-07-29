@@ -355,7 +355,8 @@ class StockTransformer(nn.Module):
         ).sum(dim=1, keepdim=True) / count
         return (values - mean) / variance.sqrt().clamp(min=1e-6)
 
-    def forward(self, src, stock_indices, stock_mask=None, return_aux=False):
+    def encode_backbone(self, src, stock_indices, stock_mask=None):
+        """编码冻结的排序主干，供后续辅助阶段缓存复用。"""
         # src: [batch, num_stocks, seq_len, feature_dim]
         batch_size, num_stocks, seq_len, feature_dim = src.size()
         
@@ -401,10 +402,35 @@ class StockTransformer(nn.Module):
         # 排序特异性变换
         ranking_features = self.ranking_layers(interactive_features)  # [batch*num_stocks, d_model//2]
         
+        ranking_features = ranking_features.view(batch_size, num_stocks, -1)
+        regime_sequence = None
+        if self.regime_gate_enabled:
+            regime_sequence = self._market_sequence(
+                src, stock_mask, self.regime_market_feature_indices,
+            )
+        market_sequence = None
+        if self.exposure_market_encoder_enabled:
+            market_sequence = self._market_sequence(
+                src.float(), stock_mask, self.market_state_feature_indices,
+            )
+        return ranking_features, regime_sequence, market_sequence
+
+    def _forward_heads(
+        self,
+        ranking_features,
+        stock_mask=None,
+        regime_sequence=None,
+        market_sequence=None,
+        return_aux=False,
+    ):
+        """从排序主干表示运行各预测头；支持冻结主干缓存。"""
+        batch_size, num_stocks, _ = ranking_features.shape
+        flat_features = ranking_features.reshape(batch_size * num_stocks, -1)
+
         # 生成排序分数
-        scores = self.score_head(ranking_features)  # [batch*num_stocks, 1]
-        predicted_returns = self.return_head(ranking_features)  # [batch*num_stocks, 1]
-        allocation_logits = self.allocation_head(ranking_features)  # [batch*num_stocks, 1]
+        scores = self.score_head(flat_features)  # [batch*num_stocks, 1]
+        predicted_returns = self.return_head(flat_features)  # [batch*num_stocks, 1]
+        allocation_logits = self.allocation_head(flat_features)  # [batch*num_stocks, 1]
         
         # 重塑为最终输出格式
         raw_score_output = scores.view(batch_size, num_stocks)
@@ -415,17 +441,17 @@ class StockTransformer(nn.Module):
         risk_5d_logits = None
         combined_risk = None
         if self.risk_heads_enabled:
-            risk_1d_logits = self.risk_1d_head(ranking_features).view(
+            risk_1d_logits = self.risk_1d_head(flat_features).view(
                 batch_size,
                 num_stocks,
             )
-            risk_3d_logits = self.risk_3d_head(ranking_features).view(
+            risk_3d_logits = self.risk_3d_head(flat_features).view(
                 batch_size,
                 num_stocks,
             )
             if self.risk_5d_head_enabled:
                 risk_5d_logits = self.risk_5d_head(
-                    ranking_features
+                    flat_features
                 ).view(batch_size, num_stocks)
             combined_risk = (
                 self.risk_1d_blend * torch.sigmoid(risk_1d_logits)
@@ -439,11 +465,8 @@ class StockTransformer(nn.Module):
 
         regime_gate = raw_score_output.new_zeros(batch_size)
         if self.regime_gate_enabled:
-            regime_sequence = self._market_sequence(
-                src,
-                stock_mask,
-                self.regime_market_feature_indices,
-            )
+            if regime_sequence is None:
+                raise ValueError('市场状态门控缺少缓存序列')
             _, regime_hidden = self.regime_market_encoder(regime_sequence)
             regime_gate = torch.sigmoid(
                 self.regime_gate_head(regime_hidden[-1])
@@ -470,12 +493,11 @@ class StockTransformer(nn.Module):
 
         # Exposure 的 GRU、组合摘要和 BCE 输入保持 FP32。该分支很小，
         # 关闭 autocast 几乎不影响吞吐，但可避免 FP16 循环计算溢出。
-        with torch.autocast(device_type=src.device.type, enabled=False):
-            ranking_features_by_stock = ranking_features.float().view(
-                batch_size,
-                num_stocks,
-                -1,
-            )
+        with torch.autocast(
+            device_type=ranking_features.device.type,
+            enabled=False,
+        ):
+            ranking_features_by_stock = ranking_features.float()
             if stock_mask is None:
                 pooled_market_features = ranking_features_by_stock.mean(dim=1)
             else:
@@ -488,11 +510,8 @@ class StockTransformer(nn.Module):
                 )
             exposure_features = pooled_market_features
             if self.exposure_market_encoder_enabled:
-                market_sequence = self._market_sequence(
-                    src.float(),
-                    stock_mask,
-                    self.market_state_feature_indices,
-                )
+                if market_sequence is None:
+                    raise ValueError('Exposure 市场编码器缺少缓存序列')
                 _, market_hidden = self.exposure_market_encoder(
                     market_sequence
                 )
@@ -597,3 +616,31 @@ class StockTransformer(nn.Module):
                 },
             )
         return output, return_output, allocation_output, exposure
+
+    def forward_from_cached(
+        self,
+        ranking_features,
+        regime_sequence=None,
+        market_sequence=None,
+        stock_mask=None,
+        return_aux=False,
+    ):
+        return self._forward_heads(
+            ranking_features,
+            stock_mask=stock_mask,
+            regime_sequence=regime_sequence,
+            market_sequence=market_sequence,
+            return_aux=return_aux,
+        )
+
+    def forward(self, src, stock_indices, stock_mask=None, return_aux=False):
+        ranking_features, regime_sequence, market_sequence = self.encode_backbone(
+            src, stock_indices, stock_mask,
+        )
+        return self._forward_heads(
+            ranking_features,
+            stock_mask=stock_mask,
+            regime_sequence=regime_sequence,
+            market_sequence=market_sequence,
+            return_aux=return_aux,
+        )

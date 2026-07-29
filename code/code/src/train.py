@@ -76,6 +76,49 @@ def cast_auxiliary_outputs_to_float(auxiliary_outputs):
     }
 
 
+def forward_model_batch(model, batch, sequences, stock_indices, masks, device):
+    """优先使用冻结主干缓存；排名阶段仍按原始输入完整前向。"""
+    if 'cached_ranking_features' not in batch:
+        return model(sequences, stock_indices, masks, return_aux=True)
+    return model.forward_from_cached(
+        move_batch_tensor(batch['cached_ranking_features'], device),
+        regime_sequence=move_batch_tensor(
+            batch['cached_regime_sequence'], device,
+        ),
+        market_sequence=move_batch_tensor(
+            batch['cached_market_sequence'], device,
+        ),
+        stock_mask=masks,
+        return_aux=True,
+    )
+
+
+def dense_stage_loss(
+    criterion, model, outputs, relevance, return_outputs, targets,
+    allocation_outputs, exposures, auxiliary_outputs, risk_1d_targets,
+    risk_3d_targets, regime_targets, stage, return_components=False,
+):
+    """无 padding 的完整 batch 一次计算辅助阶段损失，避免逐日期 Python 循环。"""
+    return criterion(
+        outputs,
+        relevance,
+        return_outputs,
+        targets,
+        allocation_outputs,
+        exposures,
+        identity_gate=model.identity_gate_value(),
+        risk_1d_logits=auxiliary_outputs['risk_1d_logits'],
+        risk_3d_logits=auxiliary_outputs['risk_3d_logits'],
+        risk_5d_logits=auxiliary_outputs['risk_5d_logits'],
+        regime_gate=auxiliary_outputs['regime_gate'],
+        risk_1d_targets=risk_1d_targets,
+        risk_3d_targets=risk_3d_targets,
+        regime_targets=regime_targets,
+        stage=stage,
+        return_components=return_components,
+    )
+
+
 def optimizer_parameters_with_grad(optimizer):
     """只返回当前阶段优化器实际管理且已经产生梯度的参数。"""
     return [
@@ -1008,6 +1051,59 @@ class RankingDataset(torch.utils.data.Dataset):
             ),
         }
 
+
+class FrozenBackboneDataset(torch.utils.data.Dataset):
+    """将冻结的 Ranking 主干表示与原始样本并列保存的轻量数据集。"""
+    def __init__(self, base_dataset, cached_samples):
+        if len(base_dataset) != len(cached_samples):
+            raise ValueError('冻结主干缓存与数据集长度不一致')
+        self.base_dataset = base_dataset
+        self.cached_samples = cached_samples
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, index):
+        item = dict(self.base_dataset[index])
+        item.update(self.cached_samples[index])
+        return item
+
+
+def cache_frozen_backbone_dataset(model, dataset, device):
+    """一次性缓存已冻结的主干输出，避免后三个阶段重复 Transformer 前向。"""
+    if not config.get('cache_frozen_backbone', True):
+        return dataset
+    cache_loader = build_data_loader(dataset, False, device)
+    cached_samples = []
+    model.eval()
+    with torch.inference_mode():
+        for batch in tqdm(cache_loader, desc='Caching frozen ranking backbone'):
+            sequences = move_batch_tensor(batch['sequences'], device)
+            stock_indices = move_batch_tensor(batch['stock_indices'], device)
+            masks = move_batch_tensor(batch['masks'], device)
+            ranking_features, regime_sequence, market_sequence = (
+                model.encode_backbone(sequences, stock_indices, masks)
+            )
+            for index, stock_count in enumerate(
+                masks.sum(dim=1).to(torch.long).tolist()
+            ):
+                cached_samples.append({
+                    'cached_ranking_features': (
+                        ranking_features[index, :stock_count].float().cpu()
+                    ),
+                    'cached_regime_sequence': (
+                        regime_sequence[index].float().cpu()
+                        if regime_sequence is not None
+                        else torch.empty(sequences.size(2), 0)
+                    ),
+                    'cached_market_sequence': (
+                        market_sequence[index].float().cpu()
+                        if market_sequence is not None
+                        else torch.empty(sequences.size(2), 0)
+                    ),
+                })
+    return FrozenBackboneDataset(dataset, cached_samples)
+
 def collate_fn(batch):
     """自定义collate函数处理变长序列"""
     sequences = [item['sequences'] for item in batch]
@@ -1021,6 +1117,15 @@ def collate_fn(batch):
     recency_weights = torch.stack([
         item['recency_weight'] for item in batch
     ])
+    has_cached_backbone = 'cached_ranking_features' in batch[0]
+    if has_cached_backbone:
+        cached_features = [item['cached_ranking_features'] for item in batch]
+        cached_regime_sequences = [
+            item['cached_regime_sequence'] for item in batch
+        ]
+        cached_market_sequences = [
+            item['cached_market_sequence'] for item in batch
+        ]
     
     # 找到最大股票数量
     max_stocks = max(seq.size(0) for seq in sequences)
@@ -1034,6 +1139,7 @@ def collate_fn(batch):
     padded_risk_3d_targets = []
     padded_regime_targets = []
     masks = []
+    padded_cached_features = []
     
     for (
         seq,
@@ -1072,6 +1178,19 @@ def collate_fn(batch):
             risk_1d = torch.cat([risk_1d, risk_target_pad], dim=0)
             risk_3d = torch.cat([risk_3d, risk_target_pad], dim=0)
             regime = torch.cat([regime, risk_target_pad], dim=0)
+
+        if has_cached_backbone:
+            cached_feature = cached_features[len(padded_cached_features)]
+            if num_stocks < max_stocks:
+                cached_feature = torch.cat([
+                    cached_feature,
+                    torch.zeros(
+                        max_stocks - num_stocks,
+                        cached_feature.size(1),
+                        dtype=cached_feature.dtype,
+                    ),
+                ], dim=0)
+            padded_cached_features.append(cached_feature)
         
         # 创建mask标记有效位置
         mask = torch.ones(max_stocks)
@@ -1086,7 +1205,7 @@ def collate_fn(batch):
         padded_regime_targets.append(regime)
         masks.append(mask)
     
-    return {
+    result = {
         'sequences': torch.stack(padded_sequences),      # [batch, max_stocks, seq_len, features]
         'targets': torch.stack(padded_targets),          # [batch, max_stocks]
         'relevance': torch.stack(padded_relevance),      # [batch, max_stocks]
@@ -1098,6 +1217,13 @@ def collate_fn(batch):
         'prediction_dates': prediction_dates,
         'recency_weights': recency_weights,
     }
+    if has_cached_backbone:
+        result.update({
+            'cached_ranking_features': torch.stack(padded_cached_features),
+            'cached_regime_sequence': torch.stack(cached_regime_sequences),
+            'cached_market_sequence': torch.stack(cached_market_sequences),
+        })
+    return result
 
 
 def non_overlapping_subset(dataset, stride):
@@ -1153,7 +1279,10 @@ def train_ranking_model(
     local_step = 0
     
     for batch in tqdm(dataloader, desc=f"Training Epoch {epoch+1}"):
-        sequences = move_batch_tensor(batch['sequences'], device)
+        sequences = (
+            move_batch_tensor(batch['sequences'], device)
+            if 'cached_ranking_features' not in batch else None
+        )
         targets = move_batch_tensor(batch['targets'], device)
         relevance = move_batch_tensor(batch['relevance'], device)
         stock_indices = move_batch_tensor(batch['stock_indices'], device)
@@ -1189,11 +1318,8 @@ def train_ranking_model(
                 allocation_outputs,
                 exposures,
                 auxiliary_outputs,
-            ) = model(
-                sequences,
-                stock_indices,
-                masks,
-                return_aux=True,
+            ) = forward_model_batch(
+                model, batch, sequences, stock_indices, masks, device,
             )
         outputs = outputs.float()
         return_outputs = return_outputs.float()
@@ -1208,35 +1334,44 @@ def train_ranking_model(
         masked_allocation_outputs = allocation_outputs * masks
         masked_relevance = relevance.float() * masks  # 使用预处理好的相关性得分
         
-        # 计算损失（只对有效股票计算）
+        # 辅助阶段的样本通常都拥有完整 300 股票池；将这些损失一次批量
+        # 计算，保留 ranking 的逐日衰减加权与变长 batch 回退路径。
         batch_loss = None
         batch_loss_components = {}
         batch_weight_total = None
-        batch_size = sequences.size(0)
-        
-        for i in range(batch_size):
-            mask = masks[i]
-            valid_indices = mask.nonzero().squeeze()
+        batch_size = targets.size(0)
+        if stage != 'ranking' and bool(masks.bool().all()):
+            batch_loss, batch_loss_components = dense_stage_loss(
+                criterion, model, outputs, masked_relevance,
+                return_outputs, targets, allocation_outputs, exposures,
+                auxiliary_outputs, risk_1d_targets, risk_3d_targets,
+                regime_targets, stage, return_components=True,
+            )
+            batch_weight_total = batch_loss.new_tensor(1.0)
+        else:
+            for i in range(batch_size):
+                mask = masks[i]
+                valid_indices = mask.nonzero().squeeze()
             
-            if valid_indices.numel() == 0:
-                continue
+                if valid_indices.numel() == 0:
+                    continue
                 
-            if valid_indices.dim() == 0:
-                valid_indices = valid_indices.unsqueeze(0)
+                if valid_indices.dim() == 0:
+                    valid_indices = valid_indices.unsqueeze(0)
             
-            # 获取有效股票的预测值和预处理好的相关性得分
-            valid_pred = masked_outputs[i][valid_indices]
-            valid_relevance = masked_relevance[i][valid_indices]
-            valid_return_pred = masked_return_outputs[i][valid_indices]
-            valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
-            valid_raw_return = masked_targets[i][valid_indices]
-            valid_risk_1d_targets = risk_1d_targets[i][valid_indices]
-            valid_risk_3d_targets = risk_3d_targets[i][valid_indices]
-            valid_regime_targets = regime_targets[i][valid_indices]
+                # 获取有效股票的预测值和预处理好的相关性得分
+                valid_pred = masked_outputs[i][valid_indices]
+                valid_relevance = masked_relevance[i][valid_indices]
+                valid_return_pred = masked_return_outputs[i][valid_indices]
+                valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
+                valid_raw_return = masked_targets[i][valid_indices]
+                valid_risk_1d_targets = risk_1d_targets[i][valid_indices]
+                valid_risk_3d_targets = risk_3d_targets[i][valid_indices]
+                valid_regime_targets = regime_targets[i][valid_indices]
             
-            if len(valid_pred) > 1:
-                # 直接使用预处理好的相关性得分，无需重新计算
-                loss, loss_components = criterion(
+                if len(valid_pred) > 1:
+                    # 直接使用预处理好的相关性得分，无需重新计算
+                    loss, loss_components = criterion(
                     valid_pred.unsqueeze(0),
                     valid_relevance.unsqueeze(0),
                     valid_return_pred.unsqueeze(0),
@@ -1276,28 +1411,28 @@ def train_ranking_model(
                     regime_targets=valid_regime_targets.unsqueeze(0),
                     stage=stage,
                     return_components=True,
-                )
-                sample_weight = (
+                    )
+                    sample_weight = (
                     recency_weights[i]
                     if stage == 'ranking'
                     else recency_weights.new_tensor(1.0)
-                )
-                weighted_loss = sample_weight * loss
-                batch_loss = (
+                    )
+                    weighted_loss = sample_weight * loss
+                    batch_loss = (
                     batch_loss + weighted_loss
                     if isinstance(batch_loss, torch.Tensor)
                     else weighted_loss
-                )
-                batch_weight_total = (
+                    )
+                    batch_weight_total = (
                     batch_weight_total + sample_weight
                     if isinstance(batch_weight_total, torch.Tensor)
                     else sample_weight
-                )
-                for name, value in loss_components.items():
-                    batch_loss_components[name] = (
+                    )
+                    for name, value in loss_components.items():
+                        batch_loss_components[name] = (
                         batch_loss_components.get(name, 0.0)
                         + sample_weight * value
-                    )
+                        )
         
         if batch_loss is not None:
             batch_loss = batch_loss / batch_weight_total.clamp(min=1e-12)
@@ -1370,7 +1505,10 @@ def evaluate_ranking_model(
     
     with torch.inference_mode():
         for batch in tqdm(dataloader, desc=f"Evaluating Epoch {epoch+1}"):
-            sequences = move_batch_tensor(batch['sequences'], device)
+            sequences = (
+                move_batch_tensor(batch['sequences'], device)
+                if 'cached_ranking_features' not in batch else None
+            )
             targets = move_batch_tensor(batch['targets'], device)
             stock_indices = move_batch_tensor(batch['stock_indices'], device)
             masks = move_batch_tensor(batch['masks'], device)
@@ -1398,11 +1536,8 @@ def evaluate_ranking_model(
                     allocation_outputs,
                     exposures,
                     auxiliary_outputs,
-                ) = model(
-                    sequences,
-                    stock_indices,
-                    masks,
-                    return_aux=True,
+                ) = forward_model_batch(
+                    model, batch, sequences, stock_indices, masks, device,
                 )
             outputs = outputs.float()
             return_outputs = return_outputs.float()
@@ -1420,7 +1555,7 @@ def evaluate_ranking_model(
             
             # 计算损失
             batch_loss = None
-            batch_size = sequences.size(0)
+            batch_size = targets.size(0)
             
             for i in range(batch_size):
                 mask = masks[i]
@@ -2154,6 +2289,10 @@ def fit_training_stage(
     best_epoch = -1
     epochs_without_improvement = 0
     epochs_ran = 0
+    eval_interval = (
+        1 if stage == 'ranking'
+        else max(1, int(config.get('auxiliary_eval_interval', 1)))
+    )
     for epoch in range(settings['max_epochs']):
         epochs_ran = epoch + 1
         train_loss, train_metrics = train_ranking_model(
@@ -2167,6 +2306,24 @@ def fit_training_stage(
             grad_scaler,
             stage=stage,
         )
+        scheduler.step()
+        if writer:
+            writer.add_scalar(
+                f'{stage}/learning_rate',
+                scheduler.get_last_lr()[0],
+                global_step=epoch,
+            )
+        should_evaluate = (
+            epoch == 0
+            or (epoch + 1) % eval_interval == 0
+            or epoch + 1 == settings['max_epochs']
+        )
+        if not should_evaluate:
+            print(
+                f"{stage} Epoch {epoch + 1}: train_loss={train_loss:.4f}; "
+                f"验证按每 {eval_interval} 轮一次执行"
+            )
+            continue
         eval_loss, eval_metrics = evaluate_ranking_model(
             model,
             val_loader,
@@ -2176,13 +2333,6 @@ def fit_training_stage(
             epoch,
             stage=stage,
         )
-        scheduler.step()
-        if writer:
-            writer.add_scalar(
-                f'{stage}/learning_rate',
-                scheduler.get_last_lr()[0],
-                global_step=epoch,
-            )
         if settings['checkpoint_metric'] == 'negative_eval_loss':
             current_score = -float(eval_loss)
         else:
@@ -2310,6 +2460,7 @@ def train_one_fold(
     train_loader = build_data_loader(train_dataset, True, device)
     train_eval_loader = build_data_loader(train_eval_dataset, False, device)
     val_loader = build_data_loader(val_eval_dataset, False, device)
+    raw_val_loader = val_loader
 
     model = StockTransformer(input_dim=len(features), config=config, num_stocks=num_stocks).to(device)
     print(
@@ -2334,6 +2485,25 @@ def train_one_fold(
             checkpoint_path,
             fold_number=fold_number,
         )
+        if stage == 'ranking' and config.get('cache_frozen_backbone', True):
+            print('Ranking 阶段完成：缓存冻结主干表示供后续辅助阶段复用')
+            train_loader = build_data_loader(
+                cache_frozen_backbone_dataset(model, train_dataset, device),
+                True,
+                device,
+            )
+            train_eval_loader = build_data_loader(
+                cache_frozen_backbone_dataset(
+                    model, train_eval_dataset, device,
+                ),
+                False,
+                device,
+            )
+            val_loader = build_data_loader(
+                cache_frozen_backbone_dataset(model, val_eval_dataset, device),
+                False,
+                device,
+            )
 
     criterion, _ = build_training_components(model, stage='exposure')
     best_epoch = stage_results['ranking']['best_epoch']
@@ -2360,7 +2530,7 @@ def train_one_fold(
     )
     id_sensitivity = evaluate_identity_sensitivity(
         model,
-        val_loader,
+        raw_val_loader,
         device,
         permutation_seed=(
             int(config.get('identity_sensitivity_seed', 20260728))
@@ -2530,6 +2700,17 @@ def train_final_model(
         f"{stage_epochs} =========="
     )
     for stage in stages[first_stage_index:]:
+        if (
+            stage != 'ranking'
+            and config.get('cache_frozen_backbone', True)
+            and not isinstance(train_loader.dataset, FrozenBackboneDataset)
+        ):
+            print('全量训练：缓存冻结 Ranking 主干表示')
+            train_loader = build_data_loader(
+                cache_frozen_backbone_dataset(model, train_dataset, device),
+                True,
+                device,
+            )
         num_epochs = int(stage_epochs[stage])
         criterion, optimizer = build_training_components(
             model,
@@ -2578,6 +2759,13 @@ def train_final_model(
             },
             os.path.join(final_dir, f'checkpoint_after_{stage}.pth'),
         )
+        if stage == 'ranking' and config.get('cache_frozen_backbone', True):
+            print('全量训练 Ranking 阶段完成：缓存主干表示')
+            train_loader = build_data_loader(
+                cache_frozen_backbone_dataset(model, train_dataset, device),
+                True,
+                device,
+            )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
     metadata = {

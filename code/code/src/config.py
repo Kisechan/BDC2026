@@ -11,7 +11,7 @@ config = {
     'nhead': 4,             # 注意力头数量
     'num_layers': 2,        # Transformer层数
     'dim_feedforward': 256, # 前馈网络维度
-    'batch_size': 12,       # 2080 Ti 显存余量充足；仍需留意股票维度的二次复杂度
+    'batch_size': 20,       # 2080 Ti 显存余量充足；仍需留意股票维度的二次复杂度
     'max_epochs': 50,
     'min_final_epochs': 1,
     'patience': patience_num,
@@ -131,6 +131,10 @@ config = {
     'exposure_patience': 4,
     'exposure_checkpoint_metric': 'weighted_portfolio_risk_adjusted',
     'exposure_min_final_epochs': 1,
+    # Ranking 每轮验证；后三个冻结主干的辅助阶段每两轮验证一次。
+    'auxiliary_eval_interval': 2,
+    # Ranking 完成后缓存主干表示，Risk/Allocation/Exposure 不再重复 Transformer 前向。
+    'cache_frozen_backbone': True,
 
     # 当前 relmarket12 基线的晋级门槛；测试周不参与这些阈值。
     'promotion_mean_weighted_return': 0.019902,
