@@ -61,6 +61,12 @@ def add_relative_market_features(df):
     panel['收盘'] = pd.to_numeric(panel['收盘'], errors='coerce')
     panel['成交量'] = pd.to_numeric(panel['成交量'], errors='coerce')
     panel = panel.sort_values(['股票代码', '日期'])
+    progress = tqdm(
+        total=37,
+        desc='相对/风险市场特征',
+        unit='项',
+        dynamic_ncols=True,
+    )
 
     stock_codes = panel['股票代码']
     dates = panel['日期']
@@ -68,14 +74,20 @@ def add_relative_market_features(df):
     volume_by_stock = panel.groupby(stock_codes, sort=False)['成交量']
 
     return_1 = close_by_stock.pct_change(periods=1, fill_method=None)
+    progress.update()
     return_3 = close_by_stock.pct_change(periods=3, fill_method=None)
+    progress.update()
     return_5 = close_by_stock.pct_change(periods=5, fill_method=None)
+    progress.update()
     return_20 = close_by_stock.pct_change(periods=20, fill_method=None)
+    progress.update()
     return_60 = close_by_stock.pct_change(periods=60, fill_method=None)
+    progress.update()
     volatility_20 = return_1.groupby(
         stock_codes,
         sort=False,
     ).transform(lambda values: values.rolling(20, min_periods=20).std())
+    progress.update()
     downside_squared = return_1.clip(upper=0.0).pow(2)
     downside_volatility_5 = downside_squared.groupby(
         stock_codes,
@@ -83,30 +95,37 @@ def add_relative_market_features(df):
     ).transform(
         lambda values: values.rolling(5, min_periods=5).mean().pow(0.5)
     )
+    progress.update()
     downside_volatility_20 = downside_squared.groupby(
         stock_codes,
         sort=False,
     ).transform(
         lambda values: values.rolling(20, min_periods=20).mean().pow(0.5)
     )
+    progress.update()
     volume_ma20 = volume_by_stock.transform(
         lambda values: values.rolling(20, min_periods=20).mean()
     )
+    progress.update()
     close_ma20 = close_by_stock.transform(
         lambda values: values.rolling(20, min_periods=20).mean()
     )
+    progress.update()
     close_ma60 = close_by_stock.transform(
         lambda values: values.rolling(60, min_periods=60).mean()
     )
+    progress.update()
     close_high20 = close_by_stock.transform(
         lambda values: values.rolling(20, min_periods=20).max()
     )
+    progress.update()
     volume_ratio_20 = panel['成交量'] / volume_ma20.replace(0.0, np.nan) - 1.0
     ma20_distance = panel['收盘'] / close_ma20.replace(0.0, np.nan) - 1.0
     ma60_distance = panel['收盘'] / close_ma60.replace(0.0, np.nan) - 1.0
     drawdown_20 = panel['收盘'] / close_high20.replace(0.0, np.nan) - 1.0
     momentum_gap_5_20 = return_5 - return_20
     momentum_gap_5_60 = return_5 - return_60
+    progress.update()
 
     relative_sources = {
         'cs_return_5_pct': return_5,
@@ -123,6 +142,7 @@ def add_relative_market_features(df):
             method='average',
             pct=True,
         ).fillna(0.5)
+        progress.update()
 
     risk_relative_sources = {
         'cs_return_1_pct': return_1,
@@ -138,11 +158,16 @@ def add_relative_market_features(df):
             method='average',
             pct=True,
         ).fillna(0.5)
+        progress.update()
 
     panel['market_return_1'] = return_1.groupby(dates).transform('mean')
+    progress.update()
     panel['market_return_3'] = return_3.groupby(dates).transform('mean')
+    progress.update()
     panel['market_return_5'] = return_5.groupby(dates).transform('mean')
+    progress.update()
     panel['market_return_20'] = return_20.groupby(dates).transform('mean')
+    progress.update()
 
     up_indicator = return_1.gt(0.0).astype(float).where(return_1.notna())
     above_ma20_indicator = (
@@ -152,6 +177,7 @@ def add_relative_market_features(df):
     panel['market_breadth_above_ma20'] = (
         above_ma20_indicator.groupby(dates).transform('mean')
     )
+    progress.update()
 
     market_return_20_mean = return_20.groupby(dates).transform('mean')
     panel['market_return_20_dispersion'] = (
@@ -161,6 +187,7 @@ def add_relative_market_features(df):
         .transform('mean')
         .pow(0.5)
     )
+    progress.update()
     panel['market_downside_vol_5'] = (
         downside_volatility_5.groupby(dates).transform('mean')
     )
@@ -168,6 +195,7 @@ def add_relative_market_features(df):
         downside_volatility_20.groupby(dates).transform('mean')
     )
     panel['market_drawdown_20'] = drawdown_20.groupby(dates).transform('mean')
+    progress.update()
     panel['market_breadth_change_5'] = (
         panel['market_breadth_up']
         - panel.groupby(stock_codes, sort=False)['market_breadth_up'].shift(5)
@@ -179,6 +207,7 @@ def add_relative_market_features(df):
             sort=False,
         )['market_breadth_above_ma20'].shift(5)
     )
+    progress.update()
 
     # 用个股收益与等权市场收益的20日相关性均值近似市场拥挤度。
     # 相比全股票两两相关矩阵，该定义为 O(NT)，且只依赖当日及过去数据。
@@ -221,6 +250,7 @@ def add_relative_market_features(df):
         .groupby(dates)
         .transform('mean')
     )
+    progress.update()
 
     generated_features = [*RELATIVE_MARKET_FEATURES, *RISK_MARKET_FEATURES]
     panel[generated_features] = (
@@ -228,6 +258,8 @@ def add_relative_market_features(df):
         .replace([np.inf, -np.inf], np.nan)
         .fillna(0.0)
     )
+    progress.update()
+    progress.close()
     return panel.sort_index()
 
 
@@ -2080,6 +2112,28 @@ def calibrate_ensemble_policy(
     top_k=5,
 ):
     """仅用 OOF 收益网格选择 allocation 混合与分歧降仓强度。"""
+    allocation_blend_grid = tuple(allocation_blend_grid)
+    disagreement_gamma_grid = tuple(disagreement_gamma_grid)
+    selection_risk_gamma_grid = tuple(selection_risk_gamma_grid)
+    risk_score_penalty_grid = tuple(risk_score_penalty_grid)
+    correlation_exposure_gamma_grid = tuple(
+        correlation_exposure_gamma_grid
+    )
+    exposure_head_blend_grid = tuple(exposure_head_blend_grid)
+    grid_size = int(np.prod([
+        len(allocation_blend_grid),
+        len(disagreement_gamma_grid),
+        len(selection_risk_gamma_grid),
+        len(risk_score_penalty_grid),
+        len(correlation_exposure_gamma_grid),
+        len(exposure_head_blend_grid),
+    ]))
+    calibration_progress = tqdm(
+        total=grid_size,
+        desc=f'OOF策略校准({len(ensemble_days)}日)',
+        unit='组',
+        dynamic_ncols=True,
+    )
     risk_blends = np.asarray(
         [
             risk_1d_blend,
@@ -2161,6 +2215,8 @@ def calibrate_ensemble_policy(
                                 ),
                                 'metrics': metrics,
                             })
+                            calibration_progress.update()
+    calibration_progress.close()
     if not candidates:
         raise ValueError('ensemble policy 搜索网格不能为空')
     best = max(

@@ -38,3 +38,12 @@ checkpoints from different architectures or input dimensions are incompatible.
 - Avoid adding new files unless the change cannot reasonably fit an existing
   module. Prefer extending the closest existing module and document why any new
   file is necessary.
+
+## Runtime observability
+
+- Long-running preprocessing, calibration, evaluation, or training work must
+  emit visible phase or progress updates. Do not leave an operation that may
+  take more than 30 seconds silent when its major units can be counted or
+  reported.
+- Progress output must identify the active phase and advance at meaningful
+  units so users can distinguish computation from a hang.
