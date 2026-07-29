@@ -24,6 +24,7 @@ from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
 from utils import cross_fit_ensemble_policy, evaluate_ensemble_policy
 from utils import cross_fit_module_gated_policy
+from utils import attach_label_end_dates, forward_fit_module_gated_policy
 import joblib
 import os
 import json
@@ -3169,6 +3170,16 @@ def run_policy_only():
     })
     if len(fold_ids) < 3:
         raise ValueError('策略重放需要来源目录中完整的至少三折 OOF')
+    source_data_path = source_config.get('data_path', './data_5y')
+    source_data_file = os.path.join(source_data_path, 'train.csv')
+    if not os.path.isfile(source_data_file):
+        raise FileNotFoundError(
+            f'无法从训练快照加载交易日历: {source_data_file}'
+        )
+    trading_dates = pd.read_csv(
+        source_data_file,
+        usecols=['日期'],
+    )['日期'].dropna().unique()
     print(
         'POLICY_ONLY=1: 跳过特征工程、三折训练和全量重训；'
         f'从 {source_dir} 加载 {len(fold_ids)} 折 OOF'
@@ -3193,7 +3204,11 @@ def run_policy_only():
                     f'缺少 Seed {seed} Fold {fold} OOF: '
                     f'{prediction_path}'
                 )
-            records_by_model.append(joblib.load(prediction_path))
+            records_by_model.append(attach_label_end_dates(
+                joblib.load(prediction_path),
+                trading_dates,
+                horizon=int(source_config.get('purge_days', 5)),
+            ))
         ensemble_days.extend(align_oof_prediction_records(
             records_by_model,
             fold,
@@ -3202,8 +3217,16 @@ def run_policy_only():
         config,
         ensemble_enabled,
     )
-    replay = cross_fit_module_gated_policy(
+    replay = forward_fit_module_gated_policy(
         ensemble_days,
+        forward_module_max_fold_loss=float(config.get(
+            'forward_module_max_fold_loss',
+            0.0025,
+        )),
+        forward_module_max_p10_loss=float(config.get(
+            'forward_module_max_p10_loss',
+            0.005,
+        )),
         **calibration_kwargs,
     )
     cross_metrics = replay['metrics']
@@ -3261,18 +3284,33 @@ def run_policy_only():
         }[module]) != policy['module_fallbacks'][module]
     )
     cluster_report = replay['module_eligibility']['correlation_cluster']
+    source_identity = source_summary.get('identity_sensitivity', {})
+    source_unk = source_identity.get('all_unk_vs_real', {})
     promotion_criteria = {
         'applicable': True,
         'mean_weighted_return': bool(
-            cross_metrics['mean_weighted_portfolio_return'] > 0.003115
+            cross_metrics['mean_weighted_portfolio_return']
+            >= config.get('promotion_mean_weighted_return', 0.019902)
         ),
         'worst_fold_weighted_return': bool(
-            cross_metrics['worst_fold_weighted_portfolio_return'] > 0.001785
+            cross_metrics['worst_fold_weighted_portfolio_return']
+            >= config.get(
+                'promotion_worst_fold_weighted_return',
+                0.012523,
+            )
         ),
         'mean_top5_return': bool(
-            cross_metrics['mean_top5_return'] > 0.006746
+            cross_metrics['mean_top5_return']
+            >= config.get('promotion_mean_top5_return', 0.0300)
         ),
-        'mean_rank_ic': bool(cross_metrics['mean_rank_ic'] >= 0.0514),
+        'p10_weighted_return': bool(
+            cross_metrics['p10_weighted_portfolio_return']
+            > config.get('promotion_p10_weighted_return', -0.025672)
+        ),
+        'mean_rank_ic': bool(
+            cross_metrics['mean_rank_ic']
+            >= config.get('promotion_mean_rank_ic', 0.0514)
+        ),
         'enabled_modules_pass_gates': bool(enabled_modules_valid),
         'cluster_selection_not_harmful': bool(
             not policy['cluster_cap_enabled']
@@ -3283,6 +3321,29 @@ def run_policy_only():
         ),
         'exposure_minimum_retained': bool(
             policy['exposure_head_blend'] >= 0.25
+        ),
+        'exposure_objective_improved': bool(
+            cross_metrics['exposure_policy_objective_delta'] >= 0.0
+        ),
+        'exposure_not_constant': bool(
+            cross_metrics['exposure_std']
+            >= config.get('promotion_min_exposure_std', 0.01)
+        ),
+        'regime_gate_not_constant': bool(
+            cross_metrics['regime_gate_std']
+            >= config.get('promotion_min_regime_gate_std', 0.01)
+        ),
+        'regime_gate_direction': bool(
+            cross_metrics['regime_return_spearman'] < 0.0
+            and cross_metrics['regime_tail_share_spearman'] > 0.0
+        ),
+        'id_score_correlation': bool(
+            source_unk.get('score_spearman', 0.0)
+            >= config.get('promotion_id_score_correlation', 0.90)
+        ),
+        'id_top5_overlap': bool(
+            source_unk.get('top5_overlap', 0.0)
+            >= config.get('promotion_id_top5_overlap', 0.40)
         ),
     }
     promotion_criteria['passed'] = all(
@@ -3339,10 +3400,19 @@ def run_policy_only():
                 'mean_gross_exposure',
                 'mean_cash_weight',
                 'mean_rank_ic',
+                'worst_daily_rank_ic',
                 'worst_rank_ic',
+                'worst_fold_mean_rank_ic',
                 'mean_model_disagreement',
                 'mean_allocation_contribution',
+                'mean_allocation_at_exposure_contribution',
                 'mean_exposure_contribution',
+                'mean_exposure_policy_contribution',
+                'exposure_policy_objective_delta',
+                'policy_objective',
+                'fixed_exposure_policy_objective',
+                'exposure_std',
+                'regime_gate_std',
                 'mean_positive_correlation',
                 'raw_mean_positive_correlation',
                 'mean_diversification_return_contribution',
@@ -3395,6 +3465,20 @@ def run_policy_only():
     }
     for optional_key in (
         'mean_tail_5d_brier',
+        'mean_tail_5d_baseline_brier',
+        'mean_tail_5d_brier_skill',
+        'mean_tail_5d_roc_auc',
+        'mean_tail_5d_pr_auc',
+        'mean_tail_5d_event_rate',
+        'mean_risk_1d_baseline_brier',
+        'mean_risk_1d_brier_skill',
+        'mean_risk_1d_event_rate',
+        'mean_risk_3d_baseline_brier',
+        'mean_risk_3d_brier_skill',
+        'mean_risk_3d_event_rate',
+        'mean_risk_5d_baseline_brier',
+        'mean_risk_5d_brier_skill',
+        'mean_risk_5d_event_rate',
         'mean_selected_tail_5d',
         'combined_risk_return_spearman',
         'regime_return_spearman',
@@ -3563,18 +3647,27 @@ def main():
 
     ensemble_days = []
     single_seed_days = {seed: [] for seed in ensemble_seeds}
+    full_trading_dates = full_data['日期'].dropna().unique()
     for fold in folds:
         fold_number = int(fold['fold'])
         ensemble_days.extend(align_oof_prediction_records(
             [
-                oof_records[fold_number][seed]
+                attach_label_end_dates(
+                    oof_records[fold_number][seed],
+                    full_trading_dates,
+                    horizon=int(config.get('purge_days', 5)),
+                )
                 for seed in ensemble_seeds
             ],
             fold=fold_number,
         ))
         for seed in ensemble_seeds:
             single_seed_days[seed].extend(align_oof_prediction_records(
-                [oof_records[fold_number][seed]],
+                [attach_label_end_dates(
+                    oof_records[fold_number][seed],
+                    full_trading_dates,
+                    horizon=int(config.get('purge_days', 5)),
+                )],
                 fold=fold_number,
             ))
 

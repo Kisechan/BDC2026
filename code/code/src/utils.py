@@ -4,6 +4,7 @@ import joblib
 import os
 from tqdm import tqdm
 from scipy.stats import rankdata, spearmanr
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 RELATIVE_MARKET_FEATURE_SET = '158+39_reduced25_relmarket12'
 RELATIVE_MARKET_FEATURES = (
@@ -47,6 +48,82 @@ SELECTION_MOMENTUM_FEATURES = (
     'cs_return_60_pct',
 )
 SELECTION_RETURN_FEATURE = 'return_1'
+
+
+def attach_label_end_dates(records, trading_dates, horizon=5):
+    """为旧 OOF 产物补齐标签结束日，严格按市场交易日而非自然日推导。"""
+    trading_dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).sort_values()
+    trading_dates = trading_dates.unique()
+    if horizon < 1:
+        raise ValueError('标签期限必须大于0')
+    positions = {
+        pd.Timestamp(date): index
+        for index, date in enumerate(trading_dates)
+    }
+    enriched = []
+    for record in records:
+        copied = dict(record)
+        prediction_date = pd.Timestamp(record['prediction_date'])
+        if 'label_end_date' in record:
+            label_end_date = pd.Timestamp(record['label_end_date'])
+        else:
+            if prediction_date not in positions:
+                raise ValueError(
+                    f'OOF预测日不在交易日历中: {prediction_date.date()}'
+                )
+            end_position = positions[prediction_date] + int(horizon)
+            if end_position >= len(trading_dates):
+                raise ValueError(
+                    f'无法为 {prediction_date.date()} 推导完整标签结束日'
+                )
+            label_end_date = pd.Timestamp(trading_dates[end_position])
+        if label_end_date <= prediction_date:
+            raise ValueError('标签结束日必须晚于预测日')
+        copied['label_end_date'] = label_end_date.strftime('%Y-%m-%d')
+        enriched.append(copied)
+    return enriched
+
+
+def _aggregate_probability_diagnostics(daily, head):
+    """用整个 OOF 的常数发生率作为概率头基线，避免逐日标签泄漏。"""
+    count = float(sum(row[f'{head}_count'] for row in daily))
+    if count <= 0:
+        raise ValueError(f'{head} 概率诊断没有有效样本')
+    target_sum = float(sum(row[f'{head}_target_sum'] for row in daily))
+    target_square_sum = float(sum(
+        row[f'{head}_target_square_sum'] for row in daily
+    ))
+    brier_sum = float(sum(row[f'{head}_brier_sum'] for row in daily))
+    event_rate = target_sum / count
+    brier = brier_sum / count
+    baseline_brier = max(
+        target_square_sum / count - event_rate ** 2,
+        0.0,
+    )
+    auc_weight = float(sum(row[f'{head}_auc_weight'] for row in daily))
+    return {
+        'event_rate': event_rate,
+        'brier': brier,
+        'baseline_brier': baseline_brier,
+        'brier_skill': (
+            float(1.0 - brier / baseline_brier)
+            if baseline_brier > 1e-12 else 0.0
+        ),
+        'roc_auc': (
+            float(sum(
+                row[f'{head}_roc_auc'] * row[f'{head}_auc_weight']
+                for row in daily
+            ) / auc_weight)
+            if auc_weight > 0 else 0.0
+        ),
+        'pr_auc': (
+            float(sum(
+                row[f'{head}_pr_auc'] * row[f'{head}_auc_weight']
+                for row in daily
+            ) / auc_weight)
+            if auc_weight > 0 else event_rate
+        ),
+    }
 
 
 def add_relative_market_features(df):
@@ -1537,12 +1614,21 @@ def align_oof_prediction_records(records_by_model, fold):
             raise ValueError(f'Fold {fold} 的多模型 OOF 日期不一致')
     for day_idx, prediction_date in enumerate(reference_dates):
         reference = sorted_records[0][day_idx]
+        if 'label_end_date' not in reference:
+            raise ValueError(
+                f'Fold {fold} 在 {prediction_date} 缺少 label_end_date'
+            )
+        label_end_date = reference['label_end_date']
         reference_stocks = np.asarray(reference['stock_indices'], dtype=np.int64)
         has_risk_context = all(
             key in reference
             for key in ('momentum_percentiles', 'return_history')
         )
         for records in sorted_records[1:]:
+            if records[day_idx].get('label_end_date') != label_end_date:
+                raise ValueError(
+                    f'Fold {fold} 在 {prediction_date} 的标签结束日不一致'
+                )
             stocks = np.asarray(records[day_idx]['stock_indices'], dtype=np.int64)
             if not np.array_equal(stocks, reference_stocks):
                 raise ValueError(
@@ -1611,6 +1697,7 @@ def align_oof_prediction_records(records_by_model, fold):
         day = {
             'fold': int(fold),
             'prediction_date': prediction_date,
+            'label_end_date': label_end_date,
             'stock_indices': reference_stocks,
             'targets': np.asarray(reference['targets'], dtype=np.float64),
             'scores': np.stack([
@@ -1744,6 +1831,38 @@ def summarize_ensemble_days(
     include_daily=False,
 ):
     """计算 OOF ensemble 的收益分解、下行风险和 Rank IC。"""
+    def probability_diagnostics(predictions, targets, binary=False):
+        predictions = np.asarray(predictions, dtype=np.float64)
+        targets = np.asarray(targets, dtype=np.float64)
+        event_rate = float(targets.mean())
+        brier = float(np.mean((predictions - targets) ** 2))
+        baseline_brier = float(np.mean((targets - event_rate) ** 2))
+        result = {
+            'count': int(targets.size),
+            'target_sum': float(targets.sum()),
+            'target_square_sum': float(np.square(targets).sum()),
+            'brier_sum': float(np.square(predictions - targets).sum()),
+            'event_rate': event_rate,
+            'brier': brier,
+            'baseline_brier': baseline_brier,
+            'brier_skill': (
+                float(1.0 - brier / baseline_brier)
+                if baseline_brier > 1e-12 else 0.0
+            ),
+            'roc_auc': 0.0,
+            'pr_auc': event_rate,
+            'auc_weight': 0,
+        }
+        if binary and np.unique(targets).size == 2:
+            result['roc_auc'] = float(
+                roc_auc_score(targets, predictions)
+            )
+            result['pr_auc'] = float(
+                average_precision_score(targets, predictions)
+            )
+            result['auc_weight'] = int(targets.size)
+        return result
+
     risk_blends = np.asarray(
         [
             risk_1d_blend,
@@ -1808,6 +1927,25 @@ def summarize_ensemble_days(
         mean_risk_3d_prediction = day['risk_3d_probabilities'].mean(axis=0)
         mean_risk_5d_prediction = day['risk_5d_probabilities'].mean(axis=0)
         mean_tail_5d_prediction = day['tail_5d_probabilities'].mean(axis=0)
+        risk_diagnostics = {
+            'risk_1d': probability_diagnostics(
+                mean_risk_1d_prediction,
+                day['risk_1d_targets'],
+            ),
+            'risk_3d': probability_diagnostics(
+                mean_risk_3d_prediction,
+                day['risk_3d_targets'],
+            ),
+            'risk_5d': probability_diagnostics(
+                mean_risk_5d_prediction,
+                day['risk_5d_targets'],
+            ),
+            'tail_5d': probability_diagnostics(
+                mean_tail_5d_prediction,
+                day['tail_5d_targets'],
+                binary=True,
+            ),
+        }
         regime_prediction = float(np.median(day['regime_gates']))
         equal_full_return = float(selected_returns.mean())
         raw_top5_return = float(
@@ -1837,6 +1975,7 @@ def summarize_ensemble_days(
         daily.append({
             'fold': int(day['fold']),
             'prediction_date': day['prediction_date'],
+            'label_end_date': day['label_end_date'],
             'top5_return': equal_full_return,
             'raw_top5_return': raw_top5_return,
             'diversification_return_contribution': (
@@ -1859,6 +1998,9 @@ def summarize_ensemble_days(
                 weighted_return - allocation_only_return
             ),
             'fixed_exposure_return': fixed_exposure_return,
+            'exposure_policy_contribution': (
+                weighted_return - fixed_exposure_return
+            ),
             'gross_exposure': portfolio['exposure'],
             'head_gross_exposure': portfolio['head_base_exposure'],
             'exposure_head_blend': float(exposure_head_blend),
@@ -1898,6 +2040,11 @@ def summarize_ensemble_days(
             'regime_brier': float(
                 (regime_prediction - day['regime_target']) ** 2
             ),
+            **{
+                f'{head}_{metric}': float(value)
+                for head, diagnostics in risk_diagnostics.items()
+                for metric, value in diagnostics.items()
+            },
             'mean_positive_correlation': portfolio[
                 'mean_positive_correlation'
             ],
@@ -2056,7 +2203,12 @@ def summarize_ensemble_days(
         'downside_deviation': downside_deviation,
         'top5_downside_deviation': top5_downside_deviation,
         'mean_rank_ic': mean('rank_ic'),
+        'worst_daily_rank_ic': float(min(row['rank_ic'] for row in daily)),
+        # 兼容旧报告读取器；新代码应使用语义明确的字段。
         'worst_rank_ic': float(min(row['rank_ic'] for row in daily)),
+        'worst_fold_mean_rank_ic': float(min(
+            row['mean_rank_ic'] for row in fold_summaries
+        )),
         'mean_gross_exposure': mean('gross_exposure'),
         'mean_head_gross_exposure': mean('head_gross_exposure'),
         'mean_cash_weight': mean('cash_weight'),
@@ -2099,6 +2251,9 @@ def summarize_ensemble_days(
             'allocation_at_exposure_contribution'
         ),
         'mean_exposure_contribution': mean('exposure_contribution'),
+        'mean_exposure_policy_contribution': mean(
+            'exposure_policy_contribution'
+        ),
         'exposure_std': float(gross_exposures.std()),
         'exposure_return_spearman': float(
             exposure_return_correlation
@@ -2155,8 +2310,20 @@ def summarize_ensemble_days(
             fixed_exposure_returns.mean()
             - downside_weight * fixed_downside_deviation
         ),
+        'exposure_policy_objective_delta': float(
+            weighted_returns.mean()
+            - downside_weight * downside_deviation
+            - (
+                fixed_exposure_returns.mean()
+                - downside_weight * fixed_downside_deviation
+            )
+        ),
         'folds': fold_summaries,
     }
+    for head in ('risk_1d', 'risk_3d', 'risk_5d', 'tail_5d'):
+        diagnostics = _aggregate_probability_diagnostics(daily, head)
+        for metric, value in diagnostics.items():
+            summary[f'mean_{head}_{metric}'] = value
     if include_daily:
         summary['daily'] = daily
     return summary
@@ -2475,6 +2642,7 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'allocation_contribution',
         'allocation_at_exposure_contribution',
         'exposure_contribution',
+        'exposure_policy_contribution',
         'gross_exposure',
         'head_gross_exposure',
         'cash_weight',
@@ -2490,6 +2658,26 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'risk_5d_brier',
         'tail_5d_brier',
         'regime_brier',
+        'risk_1d_event_rate',
+        'risk_1d_baseline_brier',
+        'risk_1d_brier_skill',
+        'risk_1d_roc_auc',
+        'risk_1d_pr_auc',
+        'risk_3d_event_rate',
+        'risk_3d_baseline_brier',
+        'risk_3d_brier_skill',
+        'risk_3d_roc_auc',
+        'risk_3d_pr_auc',
+        'risk_5d_event_rate',
+        'risk_5d_baseline_brier',
+        'risk_5d_brier_skill',
+        'risk_5d_roc_auc',
+        'risk_5d_pr_auc',
+        'tail_5d_event_rate',
+        'tail_5d_baseline_brier',
+        'tail_5d_brier_skill',
+        'tail_5d_roc_auc',
+        'tail_5d_pr_auc',
         'mean_positive_correlation',
         'raw_mean_positive_correlation',
         'mean_reversal_risk',
@@ -2518,7 +2706,11 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'positive_rate': float(np.mean(weighted_returns > 0.0)),
         'downside_deviation': downside_deviation,
         'top5_downside_deviation': top5_downside,
+        'worst_daily_rank_ic': float(values('rank_ic').min()),
         'worst_rank_ic': float(values('rank_ic').min()),
+        'worst_fold_mean_rank_ic': float(min(
+            row['mean_rank_ic'] for row in folds
+        )),
         'worst_fold_weighted_portfolio_return': float(min(
             row['mean_weighted_portfolio_return'] for row in folds
         )),
@@ -2573,9 +2765,21 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'fixed_exposure_policy_objective': float(
             fixed_returns.mean() - downside_weight * fixed_downside
         ),
+        'exposure_policy_objective_delta': float(
+            weighted_returns.mean()
+            - downside_weight * downside_deviation
+            - (
+                fixed_returns.mean()
+                - downside_weight * fixed_downside
+            )
+        ),
         'folds': folds,
         'daily': daily,
     })
+    for head in ('risk_1d', 'risk_3d', 'risk_5d', 'tail_5d'):
+        diagnostics = _aggregate_probability_diagnostics(daily, head)
+        for metric, value in diagnostics.items():
+            summary[f'mean_{head}_{metric}'] = value
     # 与既有报告字段兼容。
     aliases = {
         'mean_top5_return': 'mean_top5_return',
@@ -2605,6 +2809,9 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
             'mean_allocation_at_exposure_contribution'
         ),
         'mean_exposure_contribution': 'mean_exposure_contribution',
+        'mean_exposure_policy_contribution': (
+            'mean_exposure_policy_contribution'
+        ),
         'mean_positive_correlation': 'mean_mean_positive_correlation',
         'raw_mean_positive_correlation': (
             'mean_raw_mean_positive_correlation'
@@ -3519,6 +3726,237 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
     return {
         'method': 'module_gated_two_folds_calibrate_one_fold_evaluate',
         'metrics': cross_fitted_metrics,
+        'fold_policies': fold_policies,
+        'policy_stability': stability,
+        'module_eligibility': deployment_eligibility,
+        'all_oof_candidate_policy': all_oof_candidate,
+        'robust_deployment_policy': robust_deployment,
+    }
+
+
+def forward_fit_module_gated_policy(
+    ensemble_days,
+    forward_module_max_fold_loss=0.0025,
+    forward_module_max_p10_loss=0.005,
+    **calibration_kwargs,
+):
+    """仅用历史折校准后续折，避免策略层使用未来市场阶段。"""
+    fold_ids = sorted({int(day['fold']) for day in ensemble_days})
+    if len(fold_ids) < 3:
+        raise ValueError('严格前向模块门控至少需要三折')
+    if forward_module_max_fold_loss < 0 or forward_module_max_p10_loss < 0:
+        raise ValueError('前向模块容许损失必须非负')
+    for day in ensemble_days:
+        if 'label_end_date' not in day:
+            raise ValueError('严格前向策略需要 label_end_date')
+        if pd.Timestamp(day['label_end_date']) <= pd.Timestamp(
+            day['prediction_date']
+        ):
+            raise ValueError('OOF标签结束日必须晚于预测日')
+
+    held_out_daily = []
+    fold_policies = []
+    module_pairs = {module: [] for module in _MODULE_POLICY_FIELDS}
+    policy_fields = tuple(
+        field for field, _ in _MODULE_POLICY_FIELDS.values()
+    ) + ('disagreement_gamma',)
+    fallback_policy = _module_policy_base(calibration_kwargs)
+
+    for fold_position, held_out_fold in enumerate(fold_ids):
+        evaluation_days = sorted(
+            [
+                day for day in ensemble_days
+                if int(day['fold']) == held_out_fold
+            ],
+            key=lambda day: day['prediction_date'],
+        )
+        if not evaluation_days:
+            raise ValueError(f'Fold {held_out_fold} 没有前向评估日期')
+        evaluation_start = pd.Timestamp(
+            evaluation_days[0]['prediction_date']
+        )
+        calibration_days = [
+            day for day in ensemble_days
+            if int(day['fold']) < held_out_fold
+            and pd.Timestamp(day['label_end_date']) < evaluation_start
+        ]
+        if fold_position == 0:
+            policy = dict(fallback_policy)
+            calibration_mode = 'warmup_fallback'
+        else:
+            if not calibration_days:
+                raise ValueError(
+                    f'Fold {held_out_fold} 前没有已完成标签的校准日期'
+                )
+            policy = calibrate_module_gated_policy(
+                calibration_days,
+                **calibration_kwargs,
+            )
+            calibration_mode = 'historical_folds_only'
+
+        for day in calibration_days:
+            if int(day['fold']) >= held_out_fold:
+                raise AssertionError('未来折泄漏进前向策略校准')
+            if pd.Timestamp(day['label_end_date']) >= evaluation_start:
+                raise AssertionError('未完成标签泄漏进前向策略校准')
+
+        held_metrics = evaluate_ensemble_policy(
+            evaluation_days,
+            policy,
+            include_daily=True,
+        )
+        held_out_daily.extend(held_metrics['daily'])
+        held_module_reports = {}
+        for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+            if policy[field] == fallback:
+                held_module_reports[module] = {
+                    'active': False,
+                    'mean_paired_contribution': 0.0,
+                }
+                continue
+            module_fallback = dict(policy)
+            module_fallback[field] = fallback
+            fallback_metrics = evaluate_ensemble_policy(
+                evaluation_days,
+                module_fallback,
+                include_daily=True,
+            )
+            return_key = (
+                'top5_return'
+                if module in (
+                    'risk_score',
+                    'reversal',
+                    'correlation_cluster',
+                )
+                else 'weighted_portfolio_return'
+            )
+            candidate_returns = np.asarray([
+                row[return_key] for row in held_metrics['daily']
+            ])
+            fallback_returns = np.asarray([
+                row[return_key] for row in fallback_metrics['daily']
+            ])
+            report = {
+                'active': True,
+                'return_key': return_key,
+                'mean_paired_contribution': float(
+                    (candidate_returns - fallback_returns).mean()
+                ),
+                'candidate_returns': candidate_returns.tolist(),
+                'fallback_returns': fallback_returns.tolist(),
+            }
+            held_module_reports[module] = report
+            module_pairs[module].append({
+                'fold': held_out_fold,
+                **report,
+            })
+        fold_policies.append({
+            'held_out_fold': held_out_fold,
+            'calibration_mode': calibration_mode,
+            'calibration_folds': sorted({
+                int(day['fold']) for day in calibration_days
+            }),
+            'calibration_dates': [
+                day['prediction_date'] for day in calibration_days
+            ],
+            'evaluation_dates': [
+                day['prediction_date'] for day in evaluation_days
+            ],
+            'policy': {field: policy[field] for field in policy_fields},
+            'held_out_module_contributions': held_module_reports,
+            'held_out_metrics': {
+                key: value for key, value in held_metrics.items()
+                if key != 'daily'
+            },
+        })
+
+    downside_weight = float(calibration_kwargs.get(
+        'downside_weight',
+        0.25,
+    ))
+    forward_metrics = _summarize_cross_fitted_daily(
+        sorted(
+            held_out_daily,
+            key=lambda row: (row['prediction_date'], row['fold']),
+        ),
+        downside_weight,
+    )
+    deployment_eligibility = {}
+    for module, rows in module_pairs.items():
+        if not rows:
+            deployment_eligibility[module] = {
+                'eligible': False,
+                'forward_enable_count': 0,
+                'reason': 'never_enabled_by_historical_calibration',
+            }
+            continue
+        paired = np.concatenate([
+            np.asarray(row['candidate_returns'])
+            - np.asarray(row['fallback_returns'])
+            for row in rows
+        ])
+        candidate_returns = np.concatenate([
+            np.asarray(row['candidate_returns']) for row in rows
+        ])
+        fallback_returns = np.concatenate([
+            np.asarray(row['fallback_returns']) for row in rows
+        ])
+        fold_contributions = {
+            str(row['fold']): row['mean_paired_contribution']
+            for row in rows
+        }
+        checks = {
+            'mean_contribution_positive': bool(paired.mean() > 0.0),
+            'at_least_one_fold_positive': bool(any(
+                value > 0.0 for value in fold_contributions.values()
+            )),
+            'fold_loss_within_tolerance': bool(min(
+                fold_contributions.values()
+            ) >= -float(forward_module_max_fold_loss)),
+            'p10_loss_within_tolerance': bool(
+                np.quantile(candidate_returns, 0.10)
+                >= np.quantile(fallback_returns, 0.10)
+                - float(forward_module_max_p10_loss)
+            ),
+        }
+        deployment_eligibility[module] = {
+            'eligible': bool(all(checks.values())),
+            'forward_enable_count': len(rows),
+            'mean_paired_contribution': float(paired.mean()),
+            'fold_contributions': fold_contributions,
+            'p10_change': float(
+                np.quantile(candidate_returns, 0.10)
+                - np.quantile(fallback_returns, 0.10)
+            ),
+            'checks': checks,
+        }
+
+    all_oof_candidate = calibrate_module_gated_policy(
+        ensemble_days,
+        **calibration_kwargs,
+    )
+    robust_deployment = dict(all_oof_candidate)
+    for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+        if not deployment_eligibility[module]['eligible']:
+            robust_deployment[field] = fallback
+    robust_deployment['disagreement_gamma'] = 0.0
+    robust_deployment['oof_metrics'] = evaluate_ensemble_policy(
+        ensemble_days,
+        robust_deployment,
+        include_daily=True,
+    )
+    stability = {
+        field: {
+            'values': [row['policy'][field] for row in fold_policies],
+            'num_unique': len({
+                row['policy'][field] for row in fold_policies
+            }),
+        }
+        for field in policy_fields
+    }
+    return {
+        'method': 'strict_forward_historical_folds_only',
+        'metrics': forward_metrics,
         'fold_policies': fold_policies,
         'policy_stability': stability,
         'module_eligibility': deployment_eligibility,

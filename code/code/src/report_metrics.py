@@ -71,15 +71,24 @@ def print_cross_validation() -> None:
                 f"{float(summary['weighted_portfolio_positive_rate']):.2%}"
             )
             print(
-                "平均 Allocation/Exposure 贡献: "
+                "平均 Allocation贡献/Exposure相对固定仓位贡献: "
                 f"{_pct(float(summary['mean_allocation_contribution']))} / "
-                f"{_pct(float(summary['mean_exposure_contribution']))}"
+                f"{_pct(float(summary.get(
+                    'mean_exposure_policy_contribution',
+                    summary['mean_exposure_contribution'],
+                )))}"
             )
             print(
                 f"平均模型排名分歧: "
                 f"{float(summary['mean_model_disagreement']):.4f}"
             )
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
+    if "worst_fold_mean_rank_ic" in summary:
+        print(
+            "最差日/最差折平均 Rank IC: "
+            f"{float(summary['worst_daily_rank_ic']):+.4f} / "
+            f"{float(summary['worst_fold_mean_rank_ic']):+.4f}"
+        )
     ranking_baseline = summary.get("original_ranking_baseline", {})
     if ranking_baseline:
         print(
@@ -95,6 +104,20 @@ def print_cross_validation() -> None:
             f"{float(summary['mean_tail_5d_brier']):.4f} / "
             f"{float(summary['combined_risk_return_spearman']):+.4f}"
         )
+        if "mean_tail_5d_brier_skill" in summary:
+            print(
+                "5日尾部风险事件率/Brier Skill/ROC-AUC/PR-AUC: "
+                f"{float(summary['mean_tail_5d_event_rate']):.4f} / "
+                f"{float(summary['mean_tail_5d_brier_skill']):+.4f} / "
+                f"{float(summary['mean_tail_5d_roc_auc']):.4f} / "
+                f"{float(summary['mean_tail_5d_pr_auc']):.4f}"
+            )
+            print(
+                "1/3/5日软风险 Brier Skill: "
+                f"{float(summary['mean_risk_1d_brier_skill']):+.4f} / "
+                f"{float(summary['mean_risk_3d_brier_skill']):+.4f} / "
+                f"{float(summary['mean_risk_5d_brier_skill']):+.4f}"
+            )
         print(
             "Regime Gate 与 Top-5/市场收益/尾部扩散相关: "
             f"{float(summary['regime_return_spearman']):+.4f} / "

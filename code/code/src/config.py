@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'nested_oof_modulegated_policy_v7'
+experiment_name = 'nested_oof_forward_policy_v7_1'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -110,10 +110,13 @@ config = {
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
     'nested_oof_enabled': True,
-    'ensemble_downside_weight': 0.5,
+    # 策略层纯收益优先，但保留较轻的下行波动惩罚。
+    'ensemble_downside_weight': 0.25,
     'policy_only_experiment': True,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
+    'forward_module_max_fold_loss': 0.0025,
+    'forward_module_max_p10_loss': 0.005,
     'minimum_allocation_deployment_blend': 0.25,
     'minimum_exposure_deployment_blend': 0.25,
     'listwise_temperature': 0.2,
@@ -158,6 +161,7 @@ config = {
     # 当前 relmarket12 基线的晋级门槛；测试周不参与这些阈值。
     'promotion_mean_weighted_return': 0.019902,
     'promotion_worst_fold_weighted_return': 0.012523,
+    'promotion_mean_top5_return': 0.0300,
     'promotion_p10_weighted_return': -0.025672,
     'promotion_mean_rank_ic': 0.0514,
     'promotion_id_score_correlation': 0.90,
