@@ -137,6 +137,115 @@ def resume_training_enabled():
 TRAINING_STAGES = ('ranking', 'risk', 'allocation', 'exposure')
 
 
+def recover_completed_stage_results(fold_dir, steps_per_epoch):
+    """从 TensorBoard 恢复已完整结束、但尚未来得及汇总的四阶段结果。"""
+    checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
+    event_dir = os.path.join(fold_dir, 'log')
+    if not os.path.isfile(checkpoint_path) or not os.path.isdir(event_dir):
+        return None
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import (
+            EventAccumulator,
+        )
+        accumulator = EventAccumulator(event_dir)
+        accumulator.Reload()
+    except (ImportError, KeyError, OSError, ValueError):
+        return None
+
+    scalar_tags = set(accumulator.Tags().get('scalars', []))
+    recovered = {}
+    for stage in TRAINING_STAGES:
+        settings = stage_settings(stage)
+        learning_rate_tag = f'{stage}/learning_rate'
+        eval_loss_tag = f'{stage}/eval/loss'
+        required_tags = {learning_rate_tag, eval_loss_tag}
+        if not required_tags.issubset(scalar_tags):
+            return None
+        learning_rate_events = accumulator.Scalars(learning_rate_tag)
+        eval_loss_events = accumulator.Scalars(eval_loss_tag)
+        if not learning_rate_events or not eval_loss_events:
+            return None
+        epochs_ran = max(event.step for event in learning_rate_events) + 1
+        if max(event.step for event in eval_loss_events) >= epochs_ran:
+            return None
+
+        checkpoint_metric = settings['checkpoint_metric']
+        if checkpoint_metric == 'negative_eval_loss':
+            score_by_step = {
+                event.step: -float(event.value)
+                for event in eval_loss_events
+            }
+        else:
+            metric_tags = {
+                'top5_return_plus_rank_ic': (
+                    'top5_return',
+                    'rank_ic',
+                ),
+                'weighted_portfolio_return_plus_rank_ic': (
+                    'weighted_portfolio_return',
+                    'rank_ic',
+                ),
+                'allocation_contribution': (
+                    'allocation_contribution',
+                ),
+                'weighted_portfolio_risk_adjusted': (
+                    'weighted_portfolio_return',
+                    'weighted_portfolio_downside_deviation',
+                ),
+            }.get(checkpoint_metric, (checkpoint_metric,))
+            events_by_metric = {}
+            for metric in metric_tags:
+                tag = f'{stage}/eval/{metric}'
+                if tag not in scalar_tags:
+                    return None
+                events_by_metric[metric] = {
+                    event.step: float(event.value)
+                    for event in accumulator.Scalars(tag)
+                }
+            score_by_step = {}
+            for event in eval_loss_events:
+                step_metrics = {
+                    metric: values[event.step]
+                    for metric, values in events_by_metric.items()
+                    if event.step in values
+                }
+                if len(step_metrics) != len(events_by_metric):
+                    return None
+                score_by_step[event.step] = calculate_checkpoint_score(
+                    step_metrics,
+                    checkpoint_metric,
+                )
+
+        best_score = -float('inf')
+        best_step = None
+        epochs_without_improvement = 0
+        for step in sorted(score_by_step):
+            current_score = score_by_step[step]
+            if current_score > best_score:
+                best_score = current_score
+                best_step = step
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+        completed_by_limit = epochs_ran == settings['max_epochs']
+        completed_by_patience = (
+            epochs_without_improvement >= settings['patience']
+            and max(score_by_step) == epochs_ran - 1
+        )
+        if not (completed_by_limit or completed_by_patience):
+            return None
+        recovered[stage] = {
+            'stage': stage,
+            'best_epoch': int(best_step + 1),
+            'epochs_ran': int(epochs_ran),
+            'checkpoint_metric': checkpoint_metric,
+            'checkpoint_score': float(best_score),
+            'steps_per_epoch': int(steps_per_epoch),
+            'recovered_from_tensorboard': True,
+        }
+    return recovered
+
+
 feature_cloums_map = {
     '39': ['开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅','sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'volume_change', 'obv','volume_ma_5', 'volume_ma_20', 'volume_ratio', 'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60', 'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',  'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'],
 
@@ -1790,6 +1899,11 @@ def evaluate_ranking_model(
                         selection_risk_feature_names is not None
                         and selection_risk_scaler is not None
                     ):
+                        if sequences is None:
+                            raise ValueError(
+                                'OOF风险上下文需要原始验证序列；'
+                                '请使用未缓存的验证 DataLoader'
+                            )
                         risk_context = extract_selection_risk_context(
                             sequences[i][valid_indices]
                             .detach().float().cpu().numpy(),
@@ -2526,36 +2640,58 @@ def train_one_fold(
     )
     stage_results = {}
     checkpoint_path = os.path.join(fold_dir, 'best_model.pth')
-    for stage in TRAINING_STAGES:
-        stage_results[stage] = fit_training_stage(
-            model,
-            train_loader,
-            val_loader,
-            device,
-            writer,
-            stage,
-            checkpoint_path,
-            fold_number=fold_number,
+    if resume_training_enabled():
+        stage_results = recover_completed_stage_results(
+            fold_dir,
+            steps_per_epoch=len(train_loader),
         )
-        if stage == 'ranking' and config.get('cache_frozen_backbone', True):
-            print('Ranking 阶段完成：缓存冻结主干表示供后续辅助阶段复用')
-            train_loader = build_data_loader(
-                cache_frozen_backbone_dataset(model, train_dataset, device),
+    if stage_results:
+        model.load_state_dict(
+            torch.load(checkpoint_path, map_location=device, weights_only=True)
+        )
+        print(
+            f'Fold {fold_number}: 从 TensorBoard 与最终checkpoint恢复'
+            '已完成的四阶段训练，仅补做 OOF 汇总'
+        )
+    else:
+        stage_results = {}
+        for stage in TRAINING_STAGES:
+            stage_results[stage] = fit_training_stage(
+                model,
+                train_loader,
+                val_loader,
+                device,
+                writer,
+                stage,
+                checkpoint_path,
+                fold_number=fold_number,
+            )
+            if stage == 'ranking' and config.get(
+                'cache_frozen_backbone',
                 True,
-                device,
-            )
-            train_eval_loader = build_data_loader(
-                cache_frozen_backbone_dataset(
-                    model, train_eval_dataset, device,
-                ),
-                False,
-                device,
-            )
-            val_loader = build_data_loader(
-                cache_frozen_backbone_dataset(model, val_eval_dataset, device),
-                False,
-                device,
-            )
+            ):
+                print('Ranking 阶段完成：缓存冻结主干表示供后续辅助阶段复用')
+                train_loader = build_data_loader(
+                    cache_frozen_backbone_dataset(
+                        model, train_dataset, device,
+                    ),
+                    True,
+                    device,
+                )
+                train_eval_loader = build_data_loader(
+                    cache_frozen_backbone_dataset(
+                        model, train_eval_dataset, device,
+                    ),
+                    False,
+                    device,
+                )
+                val_loader = build_data_loader(
+                    cache_frozen_backbone_dataset(
+                        model, val_eval_dataset, device,
+                    ),
+                    False,
+                    device,
+                )
 
     criterion, _ = build_training_components(model, stage='exposure')
     best_epoch = stage_results['ranking']['best_epoch']
@@ -2570,7 +2706,7 @@ def train_one_fold(
     )
     _, val_eval_metrics, oof_predictions = evaluate_ranking_model(
         model,
-        val_loader,
+        raw_val_loader,
         criterion,
         device,
         None,
