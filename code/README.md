@@ -12,16 +12,16 @@
 核心目标是学习“当天应优先持有哪些股票”的排序函数，而不是单只股票二分类。
 
 训练与推理主流程如下：
-1. 读取历史行情数据（`data/stock_data.csv`）；
-2. 做单股量价特征工程，并增加同日横截面相对特征与市场状态特征；
-3. 构建标签：未来收益率（代码中为 `open_t1` 到 `open_t5` 的相对收益）；
+1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）；
+2. 做单股量价特征工程，并增加短期反转、下行波动和市场压力特征；
+3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
 4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
-5. 联合优化平滑 Listwise、RankNet Pairwise、Rank IC、原始收益回归、Top-20
-   相对仓位和风险感知总仓位损失；
+5. Ranking阶段优化平滑Listwise、收益差加权LambdaRank@5、Rank IC、原始收益
+   回归、1/3日风险头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点，保存三组 OOF 输出并标定
    Allocation 与等权的混合比例，以及反转/相关性风险惩罚；
-7. 取三个最佳 epoch 的中位数与最小全量轮数的较大值，用全部标签有效样本
-   重训一个最终模型。
+7. 每折依次训练 Ranking、Allocation、Exposure；三折后分别取各阶段最佳 epoch
+   中位数进行三阶段全量重训。
 
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
@@ -56,10 +56,13 @@
 - 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做
   dropout；可学习门控初值为0.20并带平方正则，限制 ID 分支影响；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
-- `score_head` 与 `return_head`：分别输出排序分数和原始收益预测；
+- `score_head` 与 `return_head`：分别输出5日Alpha分数和原始收益预测；
+- `risk_1d_head`、`risk_3d_head`：预测短期软下跌概率；
+- 独立 `regime_market_encoder`：用市场压力序列生成状态门控，并只在压力状态下
+  加强短期风险惩罚；
 - `allocation_head`：输出相对仓位 logits，训练监督覆盖预测 Top-20，最终只在
   风险感知 Top-5 中重新 softmax；
-- `exposure_head`：将股票池聚合表示与5维市场状态序列的单层 GRU 表示拼接，输出
+- `exposure_head`：将股票池聚合表示、13维市场序列及稳定的Top-5风险摘要拼接，输出
   `[0.20, 0.999999]` 内的总股票仓位，现金恒为 `1-exposure`。
 
 输入包含特征张量、股票索引和有效股票 mask；模型返回排序分数、预测收益、
@@ -90,6 +93,14 @@
 共178个连续输入。横截面只使用同一交易日可观测股票，市场状态值广播给当天所有股票；
 每折 StandardScaler 仍只使用该折训练期拟合。
 
+当前 `158+39_reduced25_relmarket12_risk15` 在上述178维上继续增加：
+
+- 1/3日收益、5日相对20/60日动量差、5/20日下行波动和20日回撤的横截面百分位；
+- 市场1/3日收益、5/20日下行波动、20日回撤、5日宽度变化、5日MA20宽度变化和
+  20日市场拥挤度。
+
+共193个连续输入，全部只依赖预测日及以前行情。
+
 ### [train.py](train.py)
 训练主脚本，关键内容：
 - 数据预处理：
@@ -98,7 +109,8 @@
 	- 每折最多训练 `max_epochs`，验证指标连续 `patience` 轮无提升时提前停止；
 	- 默认固定随机种子42完成三折训练；checkpoint 只使用从验证期末向前每隔
 	  5 个交易日抽取的非重叠日期；
-	- 三折完成后统一选择最终 epoch，重新拟合一个全量 scaler，并训练一个最终模型；
+	- 三折完成后分别选择 Ranking、Allocation、Exposure 的最终轮数，重新拟合
+	  全量 scaler 并按相同顺序训练最终模型；
 	- 将 `ensemble_enabled=True` 可恢复三种子 × 三折及三个全量模型的稳健性实验；
 	- 当前使用 `learning_rate=3e-5`、`patience=12`、`id_dropout=0.2`、
 	  `embedding_dropout=0.1` 和 ID 门控，降低股票代码记忆风险。
@@ -107,13 +119,17 @@
 	- `RankingDataset` + `collate_fn`：处理每日股票数量不一致问题（padding + mask）。
 - 损失函数：`WeightedRankingLoss`
 	- 将整数排名转成排名百分位，用 `listwise_temperature` 平滑目标分布，并通过 `listwise_weight` 控制 Listwise 尺度；
-	- 组合归一化 `listwise_loss`、RankNet `pairwise_loss`、Rank IC 相关性损失与原始收益 SmoothL1 辅助损失；
+	- LambdaRank只处理预测Top-20、真实Top-20和20只困难负样本，按
+	  `ΔNDCG@5 × 真实收益差` 加权；
+	- Ranking阶段同时训练Rank IC、收益回归、1/3日风险BCE和状态门控BCE；
 	- 对真实Top-k样本施加更高权重。
 	- TensorBoard分别记录各加权损失分量与ID门控正则，便于检查目标是否失衡；
 	- `allocation_loss` 监督 ranking head 当前 Top-20 内的相对仓位分布，目标收益
 	  先裁剪至 `[-10%, 10%]`；
 	- `exposure_loss` 使用 Top-5 收益、全市场收益和 Top-5 下行波动构造软目标，
 	  并以 BCE 训练总仓位。
+	- Allocation阶段冻结整个Ranking主干；Exposure阶段冻结Ranking与Allocation，
+	  避免两个弱辅助目标反向破坏选股表示。
 - 评估指标：`calculate_ranking_metrics()`
 	- 计算等权 Top-5 收益、动态权重组合收益、总仓位、现金、最大单股仓位、Rank IC、回归 MAE 和原有归一化指标；
 	- 分离等权满仓、等权同仓位、Allocation 与 Exposure 的收益贡献；
@@ -121,7 +137,8 @@
 	  及模型排名分歧；
 	- 每折最佳 checkpoint 额外执行真实 ID、全 UNK 和固定置换 ID 评估，报告分数
 	  相关性、Top-5 重合率及收益变化。
-	- checkpoint 使用 `weighted_portfolio_return + checkpoint_rank_ic_weight * rank_ic` 组合指标，使选中股票后的权重头也参与模型选择。
+	- Ranking、Allocation、Exposure分别使用 `Top-5+0.2×Rank IC`、同仓位
+	  Allocation增益和风险调整组合收益选择checkpoint。
 
 训练产物：
 - `seed_42/fold_N/`：默认三组 checkpoint、scaler、指标、日志与 OOF 输出；
@@ -134,7 +151,7 @@
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
 当前模型输出目录为
-`model/60_158+39_reduced25_relmarket12_idgate_reversal_diverse_heads_v2/`。
+`model/60_158+39_reduced25_relmarket12_risk15_regime_lambdarank_staged_v3_5y/`。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
@@ -153,7 +170,7 @@
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
 Top-5、原始 Top-5、选择前后名次、ID 消融、反转风险、组合相关性、策略参数、
-股票仓位和现金。
+1/3日风险、市场状态门控、股票仓位和现金。
 
 `sequence_length=60` 不代表模型只看到两个月的信息：单日输入已包含最长60日窗口
 特征，再拼接60个时点后，最早的显式输入可追溯到`t-119`，覆盖约120个行情观测；
@@ -171,7 +188,7 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 ## 3. 数据与输入输出约定
 
 默认训练数据文件：
-- `data/train.csv`
+- `data_5y/train.csv`
 
 关键列：
 - `股票代码`、`日期`、`开盘`、`收盘`、`最高`、`最低`、`成交量`、`成交额`、`换手率`、`涨跌幅` 等。
