@@ -20,6 +20,27 @@ RELATIVE_MARKET_FEATURES = (
     'market_breadth_above_ma20',
     'market_return_20_dispersion',
 )
+RISK_MARKET_FEATURE_SET = '158+39_reduced25_relmarket12_risk15'
+STOCK_RISK_FEATURES = (
+    'cs_return_1_pct',
+    'cs_return_3_pct',
+    'cs_momentum_gap_5_20_pct',
+    'cs_momentum_gap_5_60_pct',
+    'cs_downside_vol_5_pct',
+    'cs_downside_vol_20_pct',
+    'cs_drawdown_20_pct',
+)
+MARKET_PRESSURE_FEATURES = (
+    'market_return_1',
+    'market_return_3',
+    'market_downside_vol_5',
+    'market_downside_vol_20',
+    'market_drawdown_20',
+    'market_breadth_change_5',
+    'market_ma20_breadth_change_5',
+    'market_crowding_20',
+)
+RISK_MARKET_FEATURES = (*STOCK_RISK_FEATURES, *MARKET_PRESSURE_FEATURES)
 SELECTION_MOMENTUM_FEATURES = (
     'cs_return_5_pct',
     'cs_return_20_pct',
@@ -47,6 +68,7 @@ def add_relative_market_features(df):
     volume_by_stock = panel.groupby(stock_codes, sort=False)['成交量']
 
     return_1 = close_by_stock.pct_change(periods=1, fill_method=None)
+    return_3 = close_by_stock.pct_change(periods=3, fill_method=None)
     return_5 = close_by_stock.pct_change(periods=5, fill_method=None)
     return_20 = close_by_stock.pct_change(periods=20, fill_method=None)
     return_60 = close_by_stock.pct_change(periods=60, fill_method=None)
@@ -54,6 +76,19 @@ def add_relative_market_features(df):
         stock_codes,
         sort=False,
     ).transform(lambda values: values.rolling(20, min_periods=20).std())
+    downside_squared = return_1.clip(upper=0.0).pow(2)
+    downside_volatility_5 = downside_squared.groupby(
+        stock_codes,
+        sort=False,
+    ).transform(
+        lambda values: values.rolling(5, min_periods=5).mean().pow(0.5)
+    )
+    downside_volatility_20 = downside_squared.groupby(
+        stock_codes,
+        sort=False,
+    ).transform(
+        lambda values: values.rolling(20, min_periods=20).mean().pow(0.5)
+    )
     volume_ma20 = volume_by_stock.transform(
         lambda values: values.rolling(20, min_periods=20).mean()
     )
@@ -63,9 +98,15 @@ def add_relative_market_features(df):
     close_ma60 = close_by_stock.transform(
         lambda values: values.rolling(60, min_periods=60).mean()
     )
+    close_high20 = close_by_stock.transform(
+        lambda values: values.rolling(20, min_periods=20).max()
+    )
     volume_ratio_20 = panel['成交量'] / volume_ma20.replace(0.0, np.nan) - 1.0
     ma20_distance = panel['收盘'] / close_ma20.replace(0.0, np.nan) - 1.0
     ma60_distance = panel['收盘'] / close_ma60.replace(0.0, np.nan) - 1.0
+    drawdown_20 = panel['收盘'] / close_high20.replace(0.0, np.nan) - 1.0
+    momentum_gap_5_20 = return_5 - return_20
+    momentum_gap_5_60 = return_5 - return_60
 
     relative_sources = {
         'cs_return_5_pct': return_5,
@@ -83,6 +124,23 @@ def add_relative_market_features(df):
             pct=True,
         ).fillna(0.5)
 
+    risk_relative_sources = {
+        'cs_return_1_pct': return_1,
+        'cs_return_3_pct': return_3,
+        'cs_momentum_gap_5_20_pct': momentum_gap_5_20,
+        'cs_momentum_gap_5_60_pct': momentum_gap_5_60,
+        'cs_downside_vol_5_pct': downside_volatility_5,
+        'cs_downside_vol_20_pct': downside_volatility_20,
+        'cs_drawdown_20_pct': drawdown_20,
+    }
+    for name, values in risk_relative_sources.items():
+        panel[name] = values.groupby(dates).rank(
+            method='average',
+            pct=True,
+        ).fillna(0.5)
+
+    panel['market_return_1'] = return_1.groupby(dates).transform('mean')
+    panel['market_return_3'] = return_3.groupby(dates).transform('mean')
     panel['market_return_5'] = return_5.groupby(dates).transform('mean')
     panel['market_return_20'] = return_20.groupby(dates).transform('mean')
 
@@ -103,9 +161,70 @@ def add_relative_market_features(df):
         .transform('mean')
         .pow(0.5)
     )
+    panel['market_downside_vol_5'] = (
+        downside_volatility_5.groupby(dates).transform('mean')
+    )
+    panel['market_downside_vol_20'] = (
+        downside_volatility_20.groupby(dates).transform('mean')
+    )
+    panel['market_drawdown_20'] = drawdown_20.groupby(dates).transform('mean')
+    panel['market_breadth_change_5'] = (
+        panel['market_breadth_up']
+        - panel.groupby(stock_codes, sort=False)['market_breadth_up'].shift(5)
+    )
+    panel['market_ma20_breadth_change_5'] = (
+        panel['market_breadth_above_ma20']
+        - panel.groupby(
+            stock_codes,
+            sort=False,
+        )['market_breadth_above_ma20'].shift(5)
+    )
 
-    panel[list(RELATIVE_MARKET_FEATURES)] = (
-        panel[list(RELATIVE_MARKET_FEATURES)]
+    # 用个股收益与等权市场收益的20日相关性均值近似市场拥挤度。
+    # 相比全股票两两相关矩阵，该定义为 O(NT)，且只依赖当日及过去数据。
+    market_return_1_by_row = panel['market_return_1']
+    rolling_return_mean = return_1.groupby(
+        stock_codes,
+        sort=False,
+    ).transform(lambda values: values.rolling(20, min_periods=20).mean())
+    rolling_market_mean = market_return_1_by_row.groupby(
+        stock_codes,
+        sort=False,
+    ).transform(lambda values: values.rolling(20, min_periods=20).mean())
+    rolling_product_mean = (return_1 * market_return_1_by_row).groupby(
+        stock_codes,
+        sort=False,
+    ).transform(lambda values: values.rolling(20, min_periods=20).mean())
+    rolling_return_second_moment = return_1.pow(2).groupby(
+        stock_codes,
+        sort=False,
+    ).transform(lambda values: values.rolling(20, min_periods=20).mean())
+    rolling_market_second_moment = market_return_1_by_row.pow(2).groupby(
+        stock_codes,
+        sort=False,
+    ).transform(lambda values: values.rolling(20, min_periods=20).mean())
+    rolling_covariance = (
+        rolling_product_mean - rolling_return_mean * rolling_market_mean
+    )
+    rolling_return_variance = (
+        rolling_return_second_moment - rolling_return_mean.pow(2)
+    ).clip(lower=0.0)
+    rolling_market_variance = (
+        rolling_market_second_moment - rolling_market_mean.pow(2)
+    ).clip(lower=0.0)
+    rolling_correlation = rolling_covariance / (
+        rolling_return_variance.pow(0.5)
+        * rolling_market_variance.pow(0.5)
+    ).replace(0.0, np.nan)
+    panel['market_crowding_20'] = (
+        rolling_correlation.clip(lower=0.0, upper=1.0)
+        .groupby(dates)
+        .transform('mean')
+    )
+
+    generated_features = [*RELATIVE_MARKET_FEATURES, *RISK_MARKET_FEATURES]
+    panel[generated_features] = (
+        panel[generated_features]
         .replace([np.inf, -np.inf], np.nan)
         .fillna(0.0)
     )
@@ -629,8 +748,19 @@ def create_ranking_dataset_vectorized(
     # 1. 确保数据按股票和时间排序
     data = data.sort_values(['instrument', 'datetime']).reset_index(drop=True)
     
-    # 2. 确保每只股票都有 'label'（次日涨跌幅），否则无法作为 target
-    data = data.dropna(subset=['label'])
+    target_columns = [
+        'label',
+        'risk_1d_target',
+        'risk_3d_target',
+        'regime_target',
+    ]
+    missing_targets = [
+        column for column in target_columns
+        if column not in data.columns
+    ]
+    if missing_targets:
+        raise ValueError(f'排序数据集缺少训练目标: {missing_targets}')
+    data = data.dropna(subset=target_columns)
     
     # 3. 为每只股票生成所有滑动窗口
     # 仅保留满足以下条件的 end_date：
@@ -648,6 +778,9 @@ def create_ranking_dataset_vectorized(
         # 提取特征和 label
         feature_values = group[features].values.astype(np.float32)  # (T, F)
         labels = group['label'].values.astype(np.float32)           # (T,)
+        risk_1d_labels = group['risk_1d_target'].values.astype(np.float32)
+        risk_3d_labels = group['risk_3d_target'].values.astype(np.float32)
+        regime_labels = group['regime_target'].values.astype(np.float32)
         dates = group['datetime'].values                             # (T,)
 
         # 生成滑动窗口：从第 sequence_length-1 行开始（0-indexed）
@@ -658,11 +791,30 @@ def create_ranking_dataset_vectorized(
             seq = feature_values[i : i + sequence_length]   # (L, F)
             target = labels[end_idx]                        # label 对应窗口最后一天的次日涨跌幅
             end_date = dates[end_idx]                       # 窗口结束日期（即预测日）
-            all_windows.append((end_date, stock_code, seq, target))
+            all_windows.append((
+                end_date,
+                stock_code,
+                seq,
+                target,
+                risk_1d_labels[end_idx],
+                risk_3d_labels[end_idx],
+                regime_labels[end_idx],
+            ))
 
     # 4. 转为 DataFrame 便于按日期聚合
     print("Step 2: 按日期聚合窗口...")
-    window_df = pd.DataFrame(all_windows, columns=['date', 'stock_code', 'seq', 'target'])
+    window_df = pd.DataFrame(
+        all_windows,
+        columns=[
+            'date',
+            'stock_code',
+            'seq',
+            'target',
+            'risk_1d_target',
+            'risk_3d_target',
+            'regime_target',
+        ],
+    )
 
     # 5. 按 date 分组，构建每日样本
     sequences = []
@@ -670,6 +822,9 @@ def create_ranking_dataset_vectorized(
     relevance_scores = []
     stock_indices = []
     prediction_dates = []
+    risk_1d_targets = []
+    risk_3d_targets = []
+    regime_targets = []
 
     print("Step 3: 构建每日样本并计算 relevance...")
     grouped_by_date = window_df.groupby('date')
@@ -704,6 +859,15 @@ def create_ranking_dataset_vectorized(
         relevance_scores.append(relevance)
         stock_indices.append(day_stocks)
         prediction_dates.append(pd.Timestamp(date).strftime('%Y-%m-%d'))
+        risk_1d_targets.append(
+            group['risk_1d_target'].to_numpy(dtype=np.float32)
+        )
+        risk_3d_targets.append(
+            group['risk_3d_target'].to_numpy(dtype=np.float32)
+        )
+        regime_targets.append(
+            group['regime_target'].to_numpy(dtype=np.float32)
+        )
 
     print(f"成功创建 {len(sequences)} 个训练样本")
     if len(sequences) > 0:
@@ -715,7 +879,16 @@ def create_ranking_dataset_vectorized(
     #     joblib.dump((sequences, targets, relevance_scores, stock_indices), ranking_data_path)
     #     print(f"数据集已保存到: {ranking_data_path}")
 
-    return sequences, targets, relevance_scores, stock_indices, prediction_dates
+    return (
+        sequences,
+        targets,
+        relevance_scores,
+        stock_indices,
+        prediction_dates,
+        risk_1d_targets,
+        risk_3d_targets,
+        regime_targets,
+    )
 
 
 def percentile_ranks(values):
@@ -1091,6 +1264,33 @@ def align_oof_prediction_records(records_by_model, fold):
                 raise ValueError(
                     f'Fold {fold} 在 {prediction_date} 的真实收益不一致'
                 )
+            for key in ('risk_1d_targets', 'risk_3d_targets'):
+                if (
+                    key in reference
+                    and key in records[day_idx]
+                    and not np.allclose(
+                        records[day_idx][key],
+                        reference[key],
+                        rtol=0.0,
+                        atol=1e-8,
+                    )
+                ):
+                    raise ValueError(
+                        f'Fold {fold} 在 {prediction_date} 的 {key} 不一致'
+                    )
+            if (
+                'regime_target' in reference
+                and 'regime_target' in records[day_idx]
+                and not np.isclose(
+                    records[day_idx]['regime_target'],
+                    reference['regime_target'],
+                    rtol=0.0,
+                    atol=1e-8,
+                )
+            ):
+                raise ValueError(
+                    f'Fold {fold} 在 {prediction_date} 的状态标签不一致'
+                )
             other_has_risk_context = all(
                 key in records[day_idx]
                 for key in ('momentum_percentiles', 'return_history')
@@ -1129,6 +1329,45 @@ def align_oof_prediction_records(records_by_model, fold):
             'exposures': np.asarray([
                 records[day_idx]['exposure'] for records in sorted_records
             ], dtype=np.float64),
+            'regime_gates': np.asarray([
+                records[day_idx].get('regime_gate', 0.0)
+                for records in sorted_records
+            ], dtype=np.float64),
+            'risk_1d_probabilities': np.stack([
+                np.asarray(
+                    records[day_idx].get(
+                        'risk_1d_probabilities',
+                        np.full(reference_stocks.size, 0.5),
+                    ),
+                    dtype=np.float64,
+                )
+                for records in sorted_records
+            ]),
+            'risk_3d_probabilities': np.stack([
+                np.asarray(
+                    records[day_idx].get(
+                        'risk_3d_probabilities',
+                        np.full(reference_stocks.size, 0.5),
+                    ),
+                    dtype=np.float64,
+                )
+                for records in sorted_records
+            ]),
+            'risk_1d_targets': np.asarray(
+                reference.get(
+                    'risk_1d_targets',
+                    np.full(reference_stocks.size, 0.5),
+                ),
+                dtype=np.float64,
+            ),
+            'risk_3d_targets': np.asarray(
+                reference.get(
+                    'risk_3d_targets',
+                    np.full(reference_stocks.size, 0.5),
+                ),
+                dtype=np.float64,
+            ),
+            'regime_target': float(reference.get('regime_target', 0.5)),
         }
         if has_risk_context:
             day['selection_risk_context'] = {
@@ -1178,6 +1417,11 @@ def summarize_ensemble_days(
         )
         selected = portfolio['top_indices']
         selected_returns = day['targets'][selected]
+        selected_risk_1d = day['risk_1d_probabilities'][:, selected].mean()
+        selected_risk_3d = day['risk_3d_probabilities'][:, selected].mean()
+        mean_risk_1d_prediction = day['risk_1d_probabilities'].mean(axis=0)
+        mean_risk_3d_prediction = day['risk_3d_probabilities'].mean(axis=0)
+        regime_prediction = float(np.median(day['regime_gates']))
         equal_full_return = float(selected_returns.mean())
         allocation_only_return = float(
             np.dot(portfolio['relative_weights'], selected_returns)
@@ -1218,6 +1462,25 @@ def summarize_ensemble_days(
             'gross_exposure': portfolio['exposure'],
             'cash_weight': 1.0 - portfolio['exposure'],
             'model_disagreement': portfolio['mean_disagreement'],
+            'regime_gate': regime_prediction,
+            'regime_target': float(day['regime_target']),
+            'selected_risk_1d': float(selected_risk_1d),
+            'selected_risk_3d': float(selected_risk_3d),
+            'risk_1d_brier': float(np.mean(
+                (
+                    mean_risk_1d_prediction
+                    - day['risk_1d_targets']
+                ) ** 2
+            )),
+            'risk_3d_brier': float(np.mean(
+                (
+                    mean_risk_3d_prediction
+                    - day['risk_3d_targets']
+                ) ** 2
+            )),
+            'regime_brier': float(
+                (regime_prediction - day['regime_target']) ** 2
+            ),
             'mean_positive_correlation': portfolio[
                 'mean_positive_correlation'
             ],
@@ -1247,9 +1510,19 @@ def summarize_ensemble_days(
     gross_exposures = np.asarray([
         row['gross_exposure'] for row in daily
     ], dtype=np.float64)
+    regime_gates = np.asarray([
+        row['regime_gate'] for row in daily
+    ], dtype=np.float64)
     top5_returns = np.asarray([
         row['top5_return'] for row in daily
     ], dtype=np.float64)
+    if regime_gates.std() < 1e-12 or top5_returns.std() < 1e-12:
+        regime_return_correlation = 0.0
+    else:
+        regime_return_correlation = spearmanr(
+            regime_gates,
+            top5_returns,
+        ).statistic
     if gross_exposures.std() < 1e-12 or top5_returns.std() < 1e-12:
         exposure_return_correlation = 0.0
     else:
@@ -1306,6 +1579,18 @@ def summarize_ensemble_days(
         'mean_gross_exposure': mean('gross_exposure'),
         'mean_cash_weight': mean('cash_weight'),
         'mean_model_disagreement': mean('model_disagreement'),
+        'mean_regime_gate': mean('regime_gate'),
+        'regime_gate_std': float(regime_gates.std()),
+        'mean_selected_risk_1d': mean('selected_risk_1d'),
+        'mean_selected_risk_3d': mean('selected_risk_3d'),
+        'mean_risk_1d_brier': mean('risk_1d_brier'),
+        'mean_risk_3d_brier': mean('risk_3d_brier'),
+        'mean_regime_brier': mean('regime_brier'),
+        'regime_return_spearman': float(
+            regime_return_correlation
+            if np.isfinite(regime_return_correlation)
+            else 0.0
+        ),
         'mean_allocation_contribution': mean('allocation_contribution'),
         'mean_allocation_at_exposure_contribution': mean(
             'allocation_at_exposure_contribution'
