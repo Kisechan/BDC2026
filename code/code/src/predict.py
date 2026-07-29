@@ -367,7 +367,10 @@ def main():
 		stockid2idx,
 	)
 	selection_risk_context = None
-	if 'selection_risk_gamma' in policy:
+	if (
+		'selection_risk_gamma' in policy
+		or policy.get('cluster_cap_enabled', False)
+	):
 		selection_risk_context = extract_selection_risk_context(
 			sequences_np,
 			features,
@@ -398,6 +401,7 @@ def main():
 	model_risk_1d = []
 	model_risk_3d = []
 	model_risk_5d = []
+	model_tail_5d = []
 	base_identity_seed = int(trained_config.get(
 		'identity_sensitivity_seed',
 		20260728,
@@ -464,6 +468,12 @@ def main():
 				if auxiliary_output['risk_5d_logits'] is not None
 				else np.full(len(scores), 0.5)
 			)
+			tail_5d_probabilities = (
+				torch.sigmoid(auxiliary_output['tail_5d_logits'])
+				.squeeze(0).float().cpu().numpy()
+				if auxiliary_output.get('tail_5d_logits') is not None
+				else np.full(len(scores), 0.5)
+			)
 			model_regime_gates.append(float(
 				auxiliary_output['regime_gate']
 				.squeeze(0).float().cpu().item()
@@ -471,6 +481,7 @@ def main():
 			model_risk_1d.append(risk_1d_probabilities)
 			model_risk_3d.append(risk_3d_probabilities)
 			model_risk_5d.append(risk_5d_probabilities)
+			model_tail_5d.append(tail_5d_probabilities)
 			unk_scores_output, _, _, unk_exposure_output = run_model(
 				torch.ones_like(stock_index_tensor)
 			)
@@ -557,6 +568,10 @@ def main():
 					float(risk_5d_probabilities[index])
 					for index in model_top
 				],
+				'top5_tail_5d': [
+					float(tail_5d_probabilities[index])
+					for index in model_top
+				],
 				'all_unk_vs_real': identity_comparison(
 					unk_scores_output,
 					unk_exposure_output,
@@ -568,6 +583,27 @@ def main():
 			})
 			del model
 
+	risk_blends = np.asarray([
+		float(policy.get(
+			'risk_1d_blend',
+			trained_config.get('risk_1d_blend', 0.40),
+		)),
+		float(policy.get(
+			'risk_3d_blend',
+			trained_config.get('risk_3d_blend', 0.60),
+		)),
+		float(policy.get(
+			'risk_5d_blend',
+			trained_config.get('risk_5d_blend', 0.0),
+		)),
+		float(policy.get(
+			'tail_5d_blend',
+			trained_config.get('tail_5d_blend', 0.0),
+		)),
+	], dtype=np.float64)
+	if (risk_blends < 0).any() or risk_blends.sum() <= 0:
+		raise ValueError('推理风险头融合权重必须非负且权重和大于0')
+	risk_blends /= risk_blends.sum()
 	portfolio = build_ensemble_portfolio(
 		np.stack(model_scores),
 		np.stack(model_allocations),
@@ -586,22 +622,30 @@ def main():
 			'selection_candidate_k',
 			20,
 		)),
+		correlation_lookbacks=policy.get(
+			'correlation_lookbacks',
+			trained_config.get('selection_correlation_lookbacks', [20]),
+		),
+		cluster_cap_enabled=bool(policy.get(
+			'cluster_cap_enabled',
+			trained_config.get('selection_cluster_cap_enabled', False),
+		)),
+		cluster_correlation_threshold=float(policy.get(
+			'cluster_correlation_threshold',
+			trained_config.get(
+				'selection_cluster_correlation_threshold',
+				0.60,
+			),
+		)),
+		max_stocks_per_cluster=int(policy.get(
+			'max_stocks_per_cluster',
+			trained_config.get('selection_max_stocks_per_cluster', 2),
+		)),
 		risk_probability_matrix=(
-			float(policy.get(
-				'risk_1d_blend',
-				trained_config.get('risk_1d_blend', 0.40),
-			))
-			* np.stack(model_risk_1d)
-			+ float(policy.get(
-				'risk_3d_blend',
-				trained_config.get('risk_3d_blend', 0.60),
-			))
-			* np.stack(model_risk_3d)
-			+ float(policy.get(
-				'risk_5d_blend',
-				trained_config.get('risk_5d_blend', 0.0),
-			))
-			* np.stack(model_risk_5d)
+			risk_blends[0] * np.stack(model_risk_1d)
+			+ risk_blends[1] * np.stack(model_risk_3d)
+			+ risk_blends[2] * np.stack(model_risk_5d)
+			+ risk_blends[3] * np.stack(model_tail_5d)
 		),
 		regime_gates=np.asarray(model_regime_gates),
 		risk_score_penalty=float(policy.get(
@@ -659,6 +703,42 @@ def main():
 				'selection_candidate_k',
 				20,
 			)),
+			'correlation_lookbacks': [
+				int(value) for value in policy.get(
+					'correlation_lookbacks',
+					trained_config.get(
+						'selection_correlation_lookbacks',
+						[20],
+					),
+				)
+			],
+			'cluster_cap_enabled': bool(policy.get(
+				'cluster_cap_enabled',
+				trained_config.get(
+					'selection_cluster_cap_enabled',
+					False,
+				),
+			)),
+			'cluster_correlation_threshold': float(policy.get(
+				'cluster_correlation_threshold',
+				trained_config.get(
+					'selection_cluster_correlation_threshold',
+					0.60,
+				),
+			)),
+			'max_stocks_per_cluster': int(policy.get(
+				'max_stocks_per_cluster',
+				trained_config.get(
+					'selection_max_stocks_per_cluster',
+					2,
+				),
+			)),
+			'risk_blends': {
+				'1d': float(risk_blends[0]),
+				'3d': float(risk_blends[1]),
+				'5d_soft': float(risk_blends[2]),
+				'5d_tail': float(risk_blends[3]),
+			},
 			'risk_score_penalty': float(policy.get(
 				'risk_score_penalty',
 				0.0,
@@ -703,6 +783,11 @@ def main():
 							selected_rank - 1
 						]
 					),
+					'cluster_id': int(
+						portfolio['selected_cluster_ids'][
+							selected_rank - 1
+						]
+					),
 				}
 				for selected_rank, index in enumerate(top_indices, start=1)
 			],
@@ -738,6 +823,30 @@ def main():
 					axis=0,
 				)[top_indices]
 			],
+			'selected_tail_5d': [
+				float(value)
+				for value in np.mean(
+					np.stack(model_tail_5d),
+					axis=0,
+				)[top_indices]
+			],
+			'selected_combined_risk': [
+				float(value)
+				for value in (
+					risk_blends[0] * np.mean(
+						np.stack(model_risk_1d), axis=0,
+					)
+					+ risk_blends[1] * np.mean(
+						np.stack(model_risk_3d), axis=0,
+					)
+					+ risk_blends[2] * np.mean(
+						np.stack(model_risk_5d), axis=0,
+					)
+					+ risk_blends[3] * np.mean(
+						np.stack(model_tail_5d), axis=0,
+					)
+				)[top_indices]
+			],
 			'selected_reversal_risk': [
 				float(value)
 				for value in portfolio['selected_reversal_risk']
@@ -751,6 +860,17 @@ def main():
 			),
 			'raw_mean_positive_correlation': float(
 				portfolio['raw_mean_positive_correlation']
+			),
+			'selected_cluster_ids': [
+				int(value)
+				for value in portfolio['selected_cluster_ids']
+			],
+			'raw_cluster_ids': [
+				int(value)
+				for value in portfolio['raw_cluster_ids']
+			],
+			'num_candidate_clusters': int(
+				portfolio['num_candidate_clusters']
 			),
 			'head_base_exposure': float(
 				portfolio['head_base_exposure']
@@ -779,6 +899,12 @@ def main():
 		f'{portfolio["mean_positive_correlation"]:.4f} '
 		f'(原始 {portfolio["raw_mean_positive_correlation"]:.4f})'
 	)
+	if portfolio.get('cluster_cap_enabled', False):
+		print(
+			f'相关簇: 候选 {portfolio["num_candidate_clusters"]} 簇, '
+			f'Top-5 簇编号 '
+			f'{[int(value) for value in portfolio["selected_cluster_ids"]]}'
+		)
 	print(
 		f'相关性降仓 gamma: '
 		f'{float(policy.get("correlation_exposure_gamma", 0.0)):.4f}'

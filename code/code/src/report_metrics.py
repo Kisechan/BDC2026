@@ -29,16 +29,22 @@ def print_cross_validation() -> None:
         summary = json.load(handle)
 
     seeds = summary.get("ensemble_seeds", [])
+    cross_fitted = summary.get("cross_fitted_oof", {})
+    validation_label = (
+        "嵌套交叉拟合 OOF"
+        if cross_fitted.get("method") != "disabled"
+        else "OOF"
+    )
     if len(seeds) > 1:
         print(
-            f"\n[模型验证：{len(seeds)} 随机种子 × "
+            f"\n[模型验证：{validation_label}，{len(seeds)} 随机种子 × "
             f"{int(summary.get('num_folds', 3))} 折 walk-forward，"
             f"每 {summary.get('evaluation_stride', 1)} 个交易日评估]"
         )
     else:
         seed_label = seeds[0] if seeds else "-"
         print(
-            f"\n[模型验证：单随机种子 {seed_label} × "
+            f"\n[模型验证：{validation_label}，单随机种子 {seed_label} × "
             f"{int(summary.get('num_folds', 3))} 折 walk-forward，"
             f"每 {summary.get('evaluation_stride', 1)} 个交易日评估]"
         )
@@ -74,6 +80,26 @@ def print_cross_validation() -> None:
                 f"{float(summary['mean_model_disagreement']):.4f}"
             )
     print(f"平均 Rank IC: {float(summary['mean_rank_ic']):+.4f}")
+    if "mean_tail_5d_brier" in summary:
+        print(
+            "5日尾部风险均值/Brier、融合风险与未来Top-5收益相关: "
+            f"{float(summary['mean_selected_tail_5d']):.4f} / "
+            f"{float(summary['mean_tail_5d_brier']):.4f} / "
+            f"{float(summary['combined_risk_return_spearman']):+.4f}"
+        )
+        print(
+            "Regime Gate 与 Top-5/市场收益/尾部扩散相关: "
+            f"{float(summary['regime_return_spearman']):+.4f} / "
+            f"{float(summary['regime_market_return_spearman']):+.4f} / "
+            f"{float(summary['regime_tail_share_spearman']):+.4f}"
+        )
+    if "raw_mean_positive_correlation" in summary:
+        print(
+            "原始/相关簇约束后平均正相关及选股收益变化: "
+            f"{float(summary['raw_mean_positive_correlation']):.4f} / "
+            f"{float(summary['mean_positive_correlation']):.4f} / "
+            f"{_pct(float(summary['mean_diversification_return_contribution']))}"
+        )
     if "risk_score_penalty" in summary:
         print(
             "OOF Allocation混合/Exposure混合/风险分数惩罚/"
@@ -84,6 +110,43 @@ def print_cross_validation() -> None:
             f"{float(summary.get('selection_risk_gamma', 0.0)):.2f} / "
             f"{float(summary.get('correlation_exposure_gamma', 0.0)):.2f}"
         )
+    if cross_fitted.get("fold_policies"):
+        print("嵌套 OOF 留出折策略:")
+        for row in cross_fitted["fold_policies"]:
+            selected = row["policy"]
+            print(
+                f"  Fold {row['held_out_fold']} <- calibration "
+                f"{row['calibration_folds']}: "
+                f"Allocation={float(selected['allocation_blend']):.2f}, "
+                f"Exposure={float(selected['exposure_head_blend']):.2f}, "
+                f"Risk={float(selected['risk_score_penalty']):.2f}, "
+                f"Reversal={float(selected['selection_risk_gamma']):.2f}, "
+                f"CorrExposure="
+                f"{float(selected['correlation_exposure_gamma']):.2f}"
+            )
+        deployment = summary.get("deployment_policy", {})
+        if deployment:
+            print(
+                "全量 OOF 部署策略（不用于晋级）: "
+                f"Allocation={float(deployment['allocation_blend']):.2f}, "
+                f"Exposure={float(deployment['exposure_head_blend']):.2f}, "
+                f"Risk={float(deployment['risk_score_penalty']):.2f}, "
+                f"Reversal={float(deployment['selection_risk_gamma']):.2f}, "
+                f"CorrExposure="
+                f"{float(deployment['correlation_exposure_gamma']):.2f}"
+            )
+        differences = cross_fitted.get(
+            "deployment_policy_differences",
+            {},
+        )
+        if differences:
+            print(
+                "部署策略相对三个留出策略的差值: "
+                + ", ".join(
+                    f"{name}={['%+.2f' % float(value) for value in values]}"
+                    for name, values in differences.items()
+                )
+            )
     random_baselines = []
     policy_folds = {
         int(row["fold"]): row
