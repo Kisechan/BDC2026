@@ -9,14 +9,14 @@ The active `158+39_reduced25_relmarket12` experiment has 178 inputs after adding
 seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
-market-pressure features. The active strategy experiment is
-`nested_oof_forward_policy_v7_1`. It reuses the model, scaler, stock mapping,
-and OOF artifacts from `nested_oof_diverse_tailregime_v6_decay5y`; its own
-directory contains policy and report artifacts only. Strategy changes are
-calibrated in Ranking, Allocation, and Exposure stages using strictly earlier,
-fully resolved OOF labels. The bounded correlation-cluster option only
-replaces names within the raw Top-10 and falls back to the original Top-5 when
-infeasible.
+market-pressure features. The active model experiment is
+`industryalpha_softconcentration_v8`. It keeps the 193 continuous inputs and
+does not feed industry codes or names into the Transformer. Historical
+industry snapshots are joined as-of for an industry-residual ranking objective,
+two Exposure portfolio summaries, and soft Top-10 concentration selection.
+Strategy changes are calibrated in Ranking, Allocation, and Exposure stages
+using strictly earlier, fully resolved OOF labels. Allocation and Exposure
+heads are mandatory and must not be removed by ablations.
 Keep each experiment's
 model directory separate, because
 checkpoints from different architectures or input dimensions are incompatible.

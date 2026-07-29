@@ -130,6 +130,8 @@
 	  `ΔNDCG@5 × 真实收益差` 加权；
 	- Ranking阶段只训练Rank IC、收益回归及排序目标；风险BCE和状态门控BCE在
 	  冻结Ranking主干后独立训练，避免多任务负迁移；
+	- 绝对收益排序保持主目标，并增加权重0.15的行业内超额收益排序；行业只用于
+	  as-of 分组，不作为 Transformer 输入或 Embedding；
 	- 对真实Top-k样本施加更高权重。
 	- TensorBoard分别记录各加权损失分量与ID门控正则，便于检查目标是否失衡；
 	- `allocation_loss` 监督 ranking head 当前 Top-20 内的相对仓位分布，目标收益
@@ -154,29 +156,28 @@
 - `scaler.pkl`：全量标准化器；
 - `ensemble_policy.json`：训练模式、模型路径及 OOF 选择的仓位策略；
 - `stockid2idx.json`：训练与推理共用的股票 ID 映射；
+- `industry2idx.json`：行业分组与组合诊断使用的稳定映射（不进入 Transformer）；
 - `cross_validation_summary.json`：多折汇总；
 - `config.json`：训练时配置快照；
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
-当前策略输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_forward_policy_v7_1/`。
-该目录不复制模型；`artifact_source_dir` 指向
-`nested_oof_diverse_tailregime_v6_decay5y` 的 checkpoint、scaler、股票映射和
-训练配置。`ensemble_policy.json` 同时保留严格前向策略、全 OOF 候选策略及经过
-历史折模块资格过滤的实际部署策略。Fold 1 使用保守预热策略，Fold 2 只使用
-Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
+当前模型目录为
+`model/60_158+39_reduced25_relmarket12_risk15_industryalpha_softconcentration_v8/`。
+`ensemble_policy.json` 同时保留严格前向策略、全 OOF 候选策略及经过历史折模块
+资格过滤的实际部署策略。Fold 1 使用保守预热策略，Fold 2 只使用 Fold 1 已完成
+标签，Fold 3 只使用 Fold 1–2 已完成标签。晋级结果与 v6 在 v1.16.1 协议下生成
+的同日期基准比较。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
 1. 加载历史数据，取最新交易日；
 2. 执行与训练一致的特征工程；
-3. 从策略目录加载部署参数，并通过 `artifact_source_dir` 从 v6 产物目录加载
-   训练配置、全量 `scaler.pkl`、股票映射与 checkpoint；
+3. 从模型目录加载训练配置、全量 `scaler.pkl`、股票/行业映射与 checkpoint；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
-5. 先按稳健部署策略决定是否应用风险、反转和相关簇模块；相关簇启用时严格限制
-   在原始 Top-10，无法满足时原样回退。交叉拟合 OOF 是唯一晋级依据，全量 OOF
-   候选还必须通过跨折模块资格检查才能进入部署策略。集成模式会
+5. 先按稳健部署策略决定是否应用风险、行业拥挤和相关性软惩罚；候选严格限制
+   在原始 Top-10，两个软惩罚为0时完全复现原始 Top-5。严格前向 OOF 是唯一
+   晋级依据，全量 OOF 候选还必须通过前向模块资格检查才能进入部署策略。集成模式会
    平均各模型 Allocation 分布，并可按模型排名分歧将总仓位向0.20收缩，输出到
    `result.csv`：
 	 - `stock_id`
@@ -197,7 +198,9 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：
 - 获取沪深300成分股；
-- 抓取历史日线数据并保存为训练所需格式。
+- 抓取历史日线数据并保存为训练所需格式；
+- 通过 `query_stock_industry(date=...)` 增量维护年度及折边界行业快照
+  `data_5y/stock_industry_history.csv`。
 
 ---
 
@@ -224,13 +227,20 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 用既有 v6 OOF 重放 v7.1 严格前向策略（不会训练模型）
+3) 下载历史行业快照（首次训练 v1.17 前必须执行）
 
 ```
-POLICY_ONLY=1 ./train.sh
+python get_stock_data.py --industry-only --start-date 2021-01-01 \
+  --end-date 2026-07-20 --output-dir ./data_5y
 ```
 
-4) 生成预测结果
+4) 训练单种子42三折与一次全量模型
+
+```
+./train.sh
+```
+
+5) 生成预测结果
 
 ```
 ./test.sh

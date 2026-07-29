@@ -49,11 +49,17 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v7.1 是复用 v6 模型产物的严格前向策略实验，不重新训练模型。运行
-`POLICY_ONLY=1 ./train.sh` 重放嵌套 OOF 并生成策略目录；随后运行
-`./test.sh` 生成预测。
+当前 v1.17 使用历史行业快照，但不把行业代码或名称输入 Transformer。首次训练前
+先运行：
 
-若要从头训练模型，应先切回对应的模型训练配置；当前 v7.1 配置会拒绝误触发正式训练。
+```
+python get_stock_data.py --industry-only --start-date 2021-01-01 \
+  --end-date 2026-07-20 --output-dir ./data_5y
+```
+
+随后运行 `./train.sh` 完成单种子42三折和一次全量重训，再运行 `./test.sh`
+生成预测。策略层按 Fold 1 预热、Fold 2 仅用 Fold 1、Fold 3 仅用 Fold 1–2 的
+已完成标签严格前向校准。
 
 成功完成训练
 
