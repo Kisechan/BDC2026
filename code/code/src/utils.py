@@ -1078,6 +1078,7 @@ def select_risk_aware_top_indices(
     cluster_cap_enabled=False,
     cluster_correlation_threshold=0.60,
     max_stocks_per_cluster=2,
+    cluster_max_raw_rank=None,
     top_k=5,
 ):
     """从排名候选中以反转风险和历史正相关惩罚贪心选择Top-k。"""
@@ -1120,7 +1121,17 @@ def select_risk_aware_top_indices(
         return_history,
         correlation_lookbacks,
     )
-    effective_candidate_k = requested_candidate_k
+    bounded_cluster_mode = (
+        cluster_cap_enabled and cluster_max_raw_rank is not None
+    )
+    if bounded_cluster_mode:
+        cluster_max_raw_rank = min(int(cluster_max_raw_rank), scores.size)
+        if cluster_max_raw_rank < top_k:
+            raise ValueError('cluster_max_raw_rank 不能小于 Top-k')
+        effective_candidate_k = cluster_max_raw_rank
+    else:
+        effective_candidate_k = requested_candidate_k
+    cluster_constraint_skipped = False
     while True:
         candidate_indices = raw_order[:effective_candidate_k]
         cluster_by_index = _candidate_correlation_clusters(
@@ -1138,6 +1149,9 @@ def select_risk_aware_top_indices(
         ).sum())
         if not cluster_cap_enabled or cluster_capacity >= top_k:
             break
+        if bounded_cluster_mode:
+            cluster_constraint_skipped = True
+            break
         if effective_candidate_k >= scores.size:
             raise ValueError(
                 '即使扩展到全部股票，相关簇硬约束仍无法选满Top-k；'
@@ -1151,7 +1165,18 @@ def select_risk_aware_top_indices(
             ),
         )
 
-    if risk_gamma == 0.0 and not cluster_cap_enabled:
+    cluster_constraint_applied = bool(
+        cluster_cap_enabled and not cluster_constraint_skipped
+    )
+    if cluster_constraint_skipped:
+        selected = raw_top_indices.tolist()
+        selected_correlation_risks = [
+            0.0 if position == 0 else float(
+                positive_correlations[index, selected[:position]].mean()
+            )
+            for position, index in enumerate(selected)
+        ]
+    elif risk_gamma == 0.0 and not cluster_cap_enabled:
         selected = raw_top_indices.tolist()
         selected_correlation_risks = [
             0.0 if position == 0 else float(
@@ -1171,7 +1196,7 @@ def select_risk_aware_top_indices(
             for index in sorted(remaining):
                 cluster_id = int(cluster_by_index[index])
                 if (
-                    cluster_cap_enabled
+                    cluster_constraint_applied
                     and selected_cluster_counts.get(cluster_id, 0)
                     >= max_stocks_per_cluster
                 ):
@@ -1238,6 +1263,14 @@ def select_risk_aware_top_indices(
             effective_candidate_k > requested_candidate_k
         ),
         'cluster_cap_enabled': bool(cluster_cap_enabled),
+        'cluster_constraint_applied': cluster_constraint_applied,
+        'cluster_constraint_skipped': bool(cluster_constraint_skipped),
+        'cluster_max_raw_rank': (
+            int(cluster_max_raw_rank)
+            if cluster_max_raw_rank is not None
+            else None
+        ),
+        'max_selected_raw_rank': int(raw_rank_by_index[selected].max()),
         'mean_positive_correlation': _mean_pairwise_correlation(
             positive_correlations,
             selected,
@@ -1265,6 +1298,7 @@ def build_ensemble_portfolio(
     cluster_cap_enabled=False,
     cluster_correlation_threshold=0.60,
     max_stocks_per_cluster=2,
+    cluster_max_raw_rank=None,
     risk_probability_matrix=None,
     regime_gates=None,
     risk_score_penalty=0.0,
@@ -1358,6 +1392,10 @@ def build_ensemble_portfolio(
             'effective_candidate_k': int(selection_candidate_k),
             'candidate_pool_expanded': False,
             'cluster_cap_enabled': False,
+            'cluster_constraint_applied': False,
+            'cluster_constraint_skipped': False,
+            'cluster_max_raw_rank': None,
+            'max_selected_raw_rank': int(top_k),
             'mean_positive_correlation': 0.0,
             'raw_mean_positive_correlation': 0.0,
         }
@@ -1372,6 +1410,7 @@ def build_ensemble_portfolio(
             cluster_cap_enabled=cluster_cap_enabled,
             cluster_correlation_threshold=cluster_correlation_threshold,
             max_stocks_per_cluster=max_stocks_per_cluster,
+            cluster_max_raw_rank=cluster_max_raw_rank,
             top_k=top_k,
         )
     top_indices = risk_selection['top_indices']
@@ -1461,6 +1500,14 @@ def build_ensemble_portfolio(
             'candidate_pool_expanded'
         ],
         'cluster_cap_enabled': risk_selection['cluster_cap_enabled'],
+        'cluster_constraint_applied': risk_selection[
+            'cluster_constraint_applied'
+        ],
+        'cluster_constraint_skipped': risk_selection[
+            'cluster_constraint_skipped'
+        ],
+        'cluster_max_raw_rank': risk_selection['cluster_max_raw_rank'],
+        'max_selected_raw_rank': risk_selection['max_selected_raw_rank'],
         'mean_positive_correlation': risk_selection[
             'mean_positive_correlation'
         ],
@@ -1689,6 +1736,7 @@ def summarize_ensemble_days(
     cluster_cap_enabled=False,
     cluster_correlation_threshold=0.60,
     max_stocks_per_cluster=2,
+    cluster_max_raw_rank=None,
     tail_5d_threshold=-0.03,
     fixed_exposure_baseline=0.6231689453125,
     downside_weight=0.5,
@@ -1738,6 +1786,7 @@ def summarize_ensemble_days(
             cluster_cap_enabled=cluster_cap_enabled,
             cluster_correlation_threshold=cluster_correlation_threshold,
             max_stocks_per_cluster=max_stocks_per_cluster,
+            cluster_max_raw_rank=cluster_max_raw_rank,
             risk_probability_matrix=combined_risk_probabilities,
             regime_gates=day['regime_gates'],
             risk_score_penalty=risk_score_penalty,
@@ -1876,6 +1925,15 @@ def summarize_ensemble_days(
             'candidate_pool_expanded': bool(
                 portfolio['candidate_pool_expanded']
             ),
+            'cluster_constraint_applied': bool(
+                portfolio['cluster_constraint_applied']
+            ),
+            'cluster_constraint_skipped': bool(
+                portfolio['cluster_constraint_skipped']
+            ),
+            'max_selected_raw_rank': int(
+                portfolio['max_selected_raw_rank']
+            ),
             'max_selected_cluster_count': int(max(
                 np.unique(
                     portfolio['selected_cluster_ids'],
@@ -1912,6 +1970,10 @@ def summarize_ensemble_days(
     top5_returns = np.asarray([
         row['top5_return'] for row in daily
     ], dtype=np.float64)
+    top5_negative_returns = np.minimum(top5_returns, 0.0)
+    top5_downside_deviation = float(np.sqrt(
+        np.mean(top5_negative_returns ** 2)
+    ))
     market_future_returns = np.asarray([
         row['market_future_return'] for row in daily
     ], dtype=np.float64)
@@ -1992,6 +2054,7 @@ def summarize_ensemble_days(
         'std_weighted_portfolio_return': float(weighted_returns.std()),
         'positive_rate': float(np.mean(weighted_returns > 0.0)),
         'downside_deviation': downside_deviation,
+        'top5_downside_deviation': top5_downside_deviation,
         'mean_rank_ic': mean('rank_ic'),
         'worst_rank_ic': float(min(row['rank_ic'] for row in daily)),
         'mean_gross_exposure': mean('gross_exposure'),
@@ -2058,6 +2121,15 @@ def summarize_ensemble_days(
         'max_selected_cluster_count': int(max(
             row['max_selected_cluster_count'] for row in daily
         )),
+        'cluster_constraint_application_rate': float(np.mean([
+            row['cluster_constraint_applied'] for row in daily
+        ])),
+        'cluster_constraint_skip_rate': float(np.mean([
+            row['cluster_constraint_skipped'] for row in daily
+        ])),
+        'max_selected_raw_rank': int(max(
+            row['max_selected_raw_rank'] for row in daily
+        )),
         'cluster_cap_enabled': bool(cluster_cap_enabled),
         'cluster_correlation_threshold': float(
             cluster_correlation_threshold
@@ -2074,6 +2146,10 @@ def summarize_ensemble_days(
         )),
         'policy_objective': float(
             weighted_returns.mean() - downside_weight * downside_deviation
+        ),
+        'ranking_policy_objective': float(
+            top5_returns.mean()
+            - downside_weight * top5_downside_deviation
         ),
         'fixed_exposure_policy_objective': float(
             fixed_exposure_returns.mean()
@@ -2329,6 +2405,7 @@ def evaluate_ensemble_policy(ensemble_days, policy, include_daily=False):
             'max_stocks_per_cluster',
             2,
         ),
+        cluster_max_raw_rank=policy.get('cluster_max_raw_rank'),
         tail_5d_threshold=policy.get('tail_5d_threshold', -0.03),
         fixed_exposure_baseline=policy['fixed_exposure_baseline'],
         downside_weight=policy['downside_weight'],
@@ -2359,6 +2436,10 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
     weighted_returns = values('weighted_portfolio_return')
     negative_returns = np.minimum(weighted_returns, 0.0)
     downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
+    top5_returns = values('top5_return')
+    top5_downside = float(np.sqrt(np.mean(
+        np.minimum(top5_returns, 0.0) ** 2
+    )))
     fixed_returns = values('fixed_exposure_return')
     fixed_downside = float(np.sqrt(np.mean(
         np.minimum(fixed_returns, 0.0) ** 2
@@ -2436,6 +2517,7 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         ),
         'positive_rate': float(np.mean(weighted_returns > 0.0)),
         'downside_deviation': downside_deviation,
+        'top5_downside_deviation': top5_downside,
         'worst_rank_ic': float(values('rank_ic').min()),
         'worst_fold_weighted_portfolio_return': float(min(
             row['mean_weighted_portfolio_return'] for row in folds
@@ -2472,9 +2554,21 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'max_selected_cluster_count': int(max(
             row['max_selected_cluster_count'] for row in daily
         )),
+        'cluster_constraint_application_rate': float(np.mean([
+            row.get('cluster_constraint_applied', False) for row in daily
+        ])),
+        'cluster_constraint_skip_rate': float(np.mean([
+            row.get('cluster_constraint_skipped', False) for row in daily
+        ])),
+        'max_selected_raw_rank': int(max(
+            row.get('max_selected_raw_rank', 5) for row in daily
+        )),
         'policy_objective': float(
             weighted_returns.mean()
             - downside_weight * downside_deviation
+        ),
+        'ranking_policy_objective': float(
+            top5_returns.mean() - downside_weight * top5_downside
         ),
         'fixed_exposure_policy_objective': float(
             fixed_returns.mean() - downside_weight * fixed_downside
@@ -2621,4 +2715,813 @@ def cross_fit_ensemble_policy(ensemble_days, **calibration_kwargs):
         'metrics': metrics,
         'fold_policies': fold_policies,
         'policy_stability': stability,
+    }
+
+
+_MODULE_POLICY_FIELDS = {
+    'risk_score': ('risk_score_penalty', 0.0),
+    'reversal': ('selection_risk_gamma', 0.0),
+    'correlation_cluster': ('cluster_cap_enabled', False),
+    'allocation': ('allocation_blend', 0.25),
+    'exposure_head': ('exposure_head_blend', 0.25),
+    'correlation_exposure': ('correlation_exposure_gamma', 0.0),
+}
+
+
+def _module_policy_base(calibration_kwargs):
+    """构造可直接传给 evaluate_ensemble_policy 的保守策略基线。"""
+    risk_blends = np.asarray([
+        calibration_kwargs.get('risk_1d_blend', 0.40),
+        calibration_kwargs.get('risk_3d_blend', 0.60),
+        calibration_kwargs.get('risk_5d_blend', 0.0),
+        calibration_kwargs.get('tail_5d_blend', 0.0),
+    ], dtype=np.float64)
+    if (risk_blends < 0).any() or risk_blends.sum() <= 0:
+        raise ValueError('风险头混合权重必须非负且权重和大于0')
+    risk_blends /= risk_blends.sum()
+    minimum_allocation_blend = float(calibration_kwargs.get(
+        'minimum_allocation_blend',
+        0.25,
+    ))
+    minimum_exposure_blend = float(calibration_kwargs.get(
+        'minimum_exposure_blend',
+        0.25,
+    ))
+    return {
+        'allocation_blend': minimum_allocation_blend,
+        'disagreement_gamma': 0.0,
+        'selection_risk_gamma': 0.0,
+        'risk_score_penalty': 0.0,
+        'risk_1d_blend': float(risk_blends[0]),
+        'risk_3d_blend': float(risk_blends[1]),
+        'risk_5d_blend': float(risk_blends[2]),
+        'tail_5d_blend': float(risk_blends[3]),
+        'correlation_exposure_gamma': 0.0,
+        'exposure_head_blend': minimum_exposure_blend,
+        'selection_candidate_k': int(calibration_kwargs.get(
+            'selection_candidate_k',
+            20,
+        )),
+        'correlation_lookbacks': [
+            int(value) for value in calibration_kwargs.get(
+                'correlation_lookbacks',
+                [20],
+            )
+        ],
+        'cluster_cap_enabled': False,
+        'cluster_correlation_threshold': float(calibration_kwargs.get(
+            'cluster_correlation_threshold',
+            0.60,
+        )),
+        'max_stocks_per_cluster': int(calibration_kwargs.get(
+            'max_stocks_per_cluster',
+            2,
+        )),
+        'cluster_max_raw_rank': int(calibration_kwargs.get(
+            'cluster_max_raw_rank',
+            10,
+        )),
+        'tail_5d_threshold': float(calibration_kwargs.get(
+            'tail_5d_threshold',
+            -0.03,
+        )),
+        'fixed_exposure_baseline': float(calibration_kwargs.get(
+            'fixed_exposure_baseline',
+            0.6231689453125,
+        )),
+        'min_exposure': float(calibration_kwargs['min_exposure']),
+        'max_exposure': float(calibration_kwargs['max_exposure']),
+        'allocation_temperature': float(calibration_kwargs[
+            'allocation_temperature'
+        ]),
+        'top_k': int(calibration_kwargs.get('top_k', 5)),
+        'downside_weight': float(calibration_kwargs.get(
+            'downside_weight',
+            0.5,
+        )),
+    }
+
+
+def _paired_module_gate(
+    candidate_metrics,
+    fallback_metrics,
+    return_key,
+    minimum_positive_fold_fraction,
+):
+    """按配对日收益及折级稳健性判定单一策略模块是否可启用。"""
+    candidate_daily = candidate_metrics['daily']
+    fallback_daily = fallback_metrics['daily']
+    if len(candidate_daily) != len(fallback_daily):
+        raise AssertionError('模块门控的候选与回退日期数量不一致')
+    candidate_by_key = {
+        (int(row['fold']), row['prediction_date']): row
+        for row in candidate_daily
+    }
+    fallback_by_key = {
+        (int(row['fold']), row['prediction_date']): row
+        for row in fallback_daily
+    }
+    if candidate_by_key.keys() != fallback_by_key.keys():
+        raise AssertionError('模块门控的候选与回退日期不一致')
+    ordered_keys = sorted(candidate_by_key)
+    candidate_returns = np.asarray([
+        candidate_by_key[key][return_key] for key in ordered_keys
+    ], dtype=np.float64)
+    fallback_returns = np.asarray([
+        fallback_by_key[key][return_key] for key in ordered_keys
+    ], dtype=np.float64)
+    paired = candidate_returns - fallback_returns
+    fold_contributions = {}
+    for fold in sorted({key[0] for key in ordered_keys}):
+        fold_values = [
+            paired[index]
+            for index, key in enumerate(ordered_keys)
+            if key[0] == fold
+        ]
+        fold_contributions[str(fold)] = float(np.mean(fold_values))
+    required_positive_folds = int(np.ceil(
+        minimum_positive_fold_fraction * len(fold_contributions)
+    ))
+    positive_folds = sum(
+        value > 0.0 for value in fold_contributions.values()
+    )
+    candidate_p10 = float(np.quantile(candidate_returns, 0.10))
+    fallback_p10 = float(np.quantile(fallback_returns, 0.10))
+    candidate_worst_fold = min(
+        float(np.mean([
+            candidate_by_key[key][return_key]
+            for key in ordered_keys
+            if key[0] == fold
+        ]))
+        for fold in {key[0] for key in ordered_keys}
+    )
+    fallback_worst_fold = min(
+        float(np.mean([
+            fallback_by_key[key][return_key]
+            for key in ordered_keys
+            if key[0] == fold
+        ]))
+        for fold in {key[0] for key in ordered_keys}
+    )
+    checks = {
+        'mean_contribution_positive': bool(paired.mean() > 0.0),
+        'positive_fold_fraction': bool(
+            positive_folds >= required_positive_folds
+        ),
+        'p10_not_worse': bool(candidate_p10 >= fallback_p10 - 1e-12),
+        'worst_fold_not_worse': bool(
+            candidate_worst_fold >= fallback_worst_fold - 1e-12
+        ),
+    }
+    return {
+        'enabled': bool(all(checks.values())),
+        'return_key': return_key,
+        'mean_paired_contribution': float(paired.mean()),
+        'fold_contributions': fold_contributions,
+        'positive_folds': int(positive_folds),
+        'required_positive_folds': int(required_positive_folds),
+        'candidate_p10': candidate_p10,
+        'fallback_p10': fallback_p10,
+        'p10_change': candidate_p10 - fallback_p10,
+        'candidate_worst_fold': candidate_worst_fold,
+        'fallback_worst_fold': fallback_worst_fold,
+        'worst_fold_change': candidate_worst_fold - fallback_worst_fold,
+        'checks': checks,
+    }
+
+
+def _choose_simple_candidate(candidates, objective_key, tolerance):
+    """在最优目标容差内优先选择候选声明的低复杂度策略。"""
+    if not candidates:
+        raise ValueError('策略阶段候选不能为空')
+    best_objective = max(
+        candidate['metrics'][objective_key] for candidate in candidates
+    )
+    eligible = [
+        candidate for candidate in candidates
+        if candidate['metrics'][objective_key] >= best_objective - tolerance
+    ]
+    return min(
+        eligible,
+        key=lambda candidate: (
+            candidate['simplicity'],
+            -candidate['metrics'][objective_key],
+        ),
+    )
+
+
+def calibrate_module_gated_policy(
+    ensemble_days,
+    policy_simplicity_tolerance=0.001,
+    module_min_positive_fold_fraction=2 / 3,
+    cluster_cap_grid=(False, True),
+    **calibration_kwargs,
+):
+    """分 Ranking、Allocation、Exposure 三阶段校准并逐模块门控。"""
+    if not ensemble_days:
+        raise ValueError('模块门控策略缺少 OOF 日期')
+    policy = _module_policy_base(calibration_kwargs)
+    baseline_metrics = evaluate_ensemble_policy(
+        ensemble_days,
+        policy,
+        include_daily=True,
+    )
+    stage_reports = {}
+    module_eligibility = {}
+    allocation_grid_size = len({
+        max(
+            float(calibration_kwargs.get(
+                'minimum_allocation_blend',
+                0.25,
+            )),
+            float(value),
+        )
+        for value in calibration_kwargs.get(
+            'allocation_blend_grid',
+            [0.25],
+        )
+    })
+    exposure_grid_size = len({
+        max(
+            float(calibration_kwargs.get(
+                'minimum_exposure_blend',
+                0.25,
+            )),
+            float(value),
+        )
+        for value in calibration_kwargs.get(
+            'exposure_head_blend_grid',
+            [0.25],
+        )
+    })
+    total_candidates = (
+        len(calibration_kwargs.get('risk_score_penalty_grid', [0.0]))
+        * len(calibration_kwargs.get('selection_risk_gamma_grid', [0.0]))
+        * len(tuple(cluster_cap_grid))
+        + allocation_grid_size
+        + exposure_grid_size
+        * len(calibration_kwargs.get(
+            'correlation_exposure_gamma_grid',
+            [0.0],
+        ))
+    )
+    progress = tqdm(
+        total=total_candidates,
+        desc=f'分阶段策略校准({len(ensemble_days)}日)',
+        unit='组',
+        dynamic_ncols=True,
+    )
+
+    ranking_candidates = []
+    for risk_penalty in calibration_kwargs.get(
+        'risk_score_penalty_grid',
+        [0.0],
+    ):
+        for reversal_gamma in calibration_kwargs.get(
+            'selection_risk_gamma_grid',
+            [0.0],
+        ):
+            for cluster_enabled in cluster_cap_grid:
+                candidate_policy = dict(policy)
+                candidate_policy.update({
+                    'risk_score_penalty': float(risk_penalty),
+                    'selection_risk_gamma': float(reversal_gamma),
+                    'cluster_cap_enabled': bool(cluster_enabled),
+                })
+                metrics = evaluate_ensemble_policy(
+                    ensemble_days,
+                    candidate_policy,
+                )
+                ranking_candidates.append({
+                    'policy': candidate_policy,
+                    'metrics': metrics,
+                    'simplicity': (
+                        int(float(risk_penalty) > 0.0)
+                        + int(float(reversal_gamma) > 0.0)
+                        + int(bool(cluster_enabled)),
+                        float(risk_penalty) + float(reversal_gamma),
+                        int(bool(cluster_enabled)),
+                    ),
+                })
+                progress.update()
+    ranking_choice = _choose_simple_candidate(
+        ranking_candidates,
+        'ranking_policy_objective',
+        policy_simplicity_tolerance,
+    )
+    policy.update({
+        field: ranking_choice['policy'][field]
+        for field in (
+            'risk_score_penalty',
+            'selection_risk_gamma',
+            'cluster_cap_enabled',
+        )
+    })
+    for module in ('risk_score', 'reversal', 'correlation_cluster'):
+        field, fallback = _MODULE_POLICY_FIELDS[module]
+        if policy[field] == fallback:
+            module_eligibility[module] = {
+                'enabled': False,
+                'reason': 'simplicity_selected_fallback',
+            }
+            continue
+        candidate_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            policy,
+            include_daily=True,
+        )
+        fallback_policy = dict(policy)
+        fallback_policy[field] = fallback
+        fallback_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            fallback_policy,
+            include_daily=True,
+        )
+        gate = _paired_module_gate(
+            candidate_metrics,
+            fallback_metrics,
+            'top5_return',
+            module_min_positive_fold_fraction,
+        )
+        module_eligibility[module] = gate
+        if not gate['enabled']:
+            policy[field] = fallback
+    ranking_metrics = evaluate_ensemble_policy(
+        ensemble_days,
+        policy,
+        include_daily=True,
+    )
+    stage_reports['ranking'] = {
+        'baseline_metrics': {
+            key: baseline_metrics[key] for key in (
+                'mean_top5_return',
+                'top5_downside_deviation',
+                'ranking_policy_objective',
+                'p10_weighted_portfolio_return',
+                'worst_fold_top5_return',
+            )
+        },
+        'selected_policy': {
+            field: policy[field] for field in (
+                'risk_score_penalty',
+                'selection_risk_gamma',
+                'cluster_cap_enabled',
+            )
+        },
+        'selected_metrics': {
+            key: ranking_metrics[key] for key in (
+                'mean_top5_return',
+                'top5_downside_deviation',
+                'ranking_policy_objective',
+                'mean_positive_correlation',
+                'raw_mean_positive_correlation',
+                'cluster_constraint_application_rate',
+                'cluster_constraint_skip_rate',
+                'max_selected_raw_rank',
+            )
+        },
+    }
+
+    minimum_allocation_blend = _MODULE_POLICY_FIELDS['allocation'][1]
+    allocation_grid = sorted({
+        max(minimum_allocation_blend, float(value))
+        for value in calibration_kwargs.get(
+            'allocation_blend_grid',
+            [minimum_allocation_blend],
+        )
+    })
+    allocation_candidates = []
+    for allocation_blend in allocation_grid:
+        candidate_policy = dict(policy)
+        candidate_policy['allocation_blend'] = allocation_blend
+        metrics = evaluate_ensemble_policy(ensemble_days, candidate_policy)
+        allocation_candidates.append({
+            'policy': candidate_policy,
+            'metrics': metrics,
+            'simplicity': (
+                abs(allocation_blend - minimum_allocation_blend),
+            ),
+        })
+        progress.update()
+    allocation_choice = _choose_simple_candidate(
+        allocation_candidates,
+        'policy_objective',
+        policy_simplicity_tolerance,
+    )
+    policy['allocation_blend'] = allocation_choice['policy'][
+        'allocation_blend'
+    ]
+    if policy['allocation_blend'] > minimum_allocation_blend:
+        candidate_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            policy,
+            include_daily=True,
+        )
+        fallback_policy = dict(policy)
+        fallback_policy['allocation_blend'] = minimum_allocation_blend
+        fallback_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            fallback_policy,
+            include_daily=True,
+        )
+        gate = _paired_module_gate(
+            candidate_metrics,
+            fallback_metrics,
+            'weighted_portfolio_return',
+            module_min_positive_fold_fraction,
+        )
+        module_eligibility['allocation'] = gate
+        if not gate['enabled']:
+            policy['allocation_blend'] = minimum_allocation_blend
+    else:
+        module_eligibility['allocation'] = {
+            'enabled': False,
+            'reason': 'simplicity_selected_fallback',
+        }
+    stage_reports['allocation'] = {
+        'selected_blend': policy['allocation_blend'],
+        'module_gate': module_eligibility['allocation'],
+    }
+
+    minimum_exposure_blend = _MODULE_POLICY_FIELDS['exposure_head'][1]
+    exposure_blend_grid = sorted({
+        max(minimum_exposure_blend, float(value))
+        for value in calibration_kwargs.get(
+            'exposure_head_blend_grid',
+            [minimum_exposure_blend],
+        )
+    })
+    exposure_candidates = []
+    for exposure_blend in exposure_blend_grid:
+        for correlation_gamma in calibration_kwargs.get(
+            'correlation_exposure_gamma_grid',
+            [0.0],
+        ):
+            candidate_policy = dict(policy)
+            candidate_policy.update({
+                'exposure_head_blend': exposure_blend,
+                'correlation_exposure_gamma': float(correlation_gamma),
+            })
+            metrics = evaluate_ensemble_policy(
+                ensemble_days,
+                candidate_policy,
+            )
+            exposure_candidates.append({
+                'policy': candidate_policy,
+                'metrics': metrics,
+                'simplicity': (
+                    int(float(correlation_gamma) > 0.0),
+                    abs(exposure_blend - minimum_exposure_blend),
+                    float(correlation_gamma),
+                ),
+            })
+            progress.update()
+    progress.close()
+    exposure_choice = _choose_simple_candidate(
+        exposure_candidates,
+        'policy_objective',
+        policy_simplicity_tolerance,
+    )
+    policy.update({
+        field: exposure_choice['policy'][field]
+        for field in ('exposure_head_blend', 'correlation_exposure_gamma')
+    })
+    for module in ('exposure_head', 'correlation_exposure'):
+        field, fallback = _MODULE_POLICY_FIELDS[module]
+        if policy[field] == fallback:
+            module_eligibility[module] = {
+                'enabled': False,
+                'reason': 'simplicity_selected_fallback',
+            }
+            continue
+        candidate_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            policy,
+            include_daily=True,
+        )
+        fallback_policy = dict(policy)
+        fallback_policy[field] = fallback
+        fallback_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            fallback_policy,
+            include_daily=True,
+        )
+        gate = _paired_module_gate(
+            candidate_metrics,
+            fallback_metrics,
+            'weighted_portfolio_return',
+            module_min_positive_fold_fraction,
+        )
+        module_eligibility[module] = gate
+        if not gate['enabled']:
+            policy[field] = fallback
+    final_metrics = evaluate_ensemble_policy(
+        ensemble_days,
+        policy,
+        include_daily=True,
+    )
+    stage_reports['exposure'] = {
+        'selected_policy': {
+            field: policy[field] for field in (
+                'exposure_head_blend',
+                'correlation_exposure_gamma',
+            )
+        },
+        'selected_metrics': {
+            key: final_metrics[key] for key in (
+                'mean_weighted_portfolio_return',
+                'downside_deviation',
+                'policy_objective',
+                'p10_weighted_portfolio_return',
+                'worst_fold_weighted_portfolio_return',
+            )
+        },
+    }
+    module_value_grids = {
+        'risk_score': calibration_kwargs.get(
+            'risk_score_penalty_grid',
+            [0.0],
+        ),
+        'reversal': calibration_kwargs.get(
+            'selection_risk_gamma_grid',
+            [0.0],
+        ),
+        'correlation_cluster': tuple(cluster_cap_grid),
+        'allocation': allocation_grid,
+        'exposure_head': exposure_blend_grid,
+        'correlation_exposure': calibration_kwargs.get(
+            'correlation_exposure_gamma_grid',
+            [0.0],
+        ),
+    }
+    alternative_reports = {}
+    for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+        values = [
+            value for value in module_value_grids[module]
+            if value != fallback
+        ]
+        if not values:
+            alternative_reports[module] = {
+                'available': False,
+                'deployed': policy[field] != fallback,
+            }
+            continue
+        return_key = (
+            'top5_return'
+            if module in (
+                'risk_score',
+                'reversal',
+                'correlation_cluster',
+            )
+            else 'weighted_portfolio_return'
+        )
+        objective_key = (
+            'ranking_policy_objective'
+            if return_key == 'top5_return'
+            else 'policy_objective'
+        )
+        alternatives = []
+        for value in values:
+            candidate_policy = dict(policy)
+            candidate_policy[field] = value
+            candidate_metrics = evaluate_ensemble_policy(
+                ensemble_days,
+                candidate_policy,
+                include_daily=True,
+            )
+            alternatives.append((value, candidate_metrics))
+        best_value, best_metrics = max(
+            alternatives,
+            key=lambda row: row[1][objective_key],
+        )
+        fallback_policy = dict(policy)
+        fallback_policy[field] = fallback
+        fallback_metrics = evaluate_ensemble_policy(
+            ensemble_days,
+            fallback_policy,
+            include_daily=True,
+        )
+        alternative_reports[module] = {
+            'available': True,
+            'deployed': policy[field] != fallback,
+            'fallback_value': fallback,
+            'best_alternative_value': best_value,
+            'best_alternative_objective': best_metrics[objective_key],
+            'fallback_objective': fallback_metrics[objective_key],
+            'gate': _paired_module_gate(
+                best_metrics,
+                fallback_metrics,
+                return_key,
+                module_min_positive_fold_fraction,
+            ),
+        }
+    policy.update({
+        'selection_metric': (
+            'staged_ranking_then_allocation_then_exposure_with_module_gates'
+        ),
+        'policy_simplicity_tolerance': float(
+            policy_simplicity_tolerance
+        ),
+        'module_min_positive_fold_fraction': float(
+            module_min_positive_fold_fraction
+        ),
+        'module_eligibility': module_eligibility,
+        'module_alternative_reports': alternative_reports,
+        'module_fallbacks': {
+            module: fallback
+            for module, (_, fallback) in _MODULE_POLICY_FIELDS.items()
+        },
+        'stage_reports': stage_reports,
+        'oof_metrics': final_metrics,
+    })
+    return policy
+
+
+def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
+    """两折分阶段校准、一折评估，并以留出贡献约束最终部署模块。"""
+    fold_ids = sorted({int(day['fold']) for day in ensemble_days})
+    if len(fold_ids) < 3:
+        raise ValueError('模块门控嵌套 OOF 至少需要三折')
+    held_out_daily = []
+    held_module_pairs = {module: [] for module in _MODULE_POLICY_FIELDS}
+    fold_policies = []
+    policy_fields = tuple(
+        field for field, _ in _MODULE_POLICY_FIELDS.values()
+    ) + ('disagreement_gamma',)
+    for held_out_fold in fold_ids:
+        calibration_days = [
+            day for day in ensemble_days if int(day['fold']) != held_out_fold
+        ]
+        evaluation_days = [
+            day for day in ensemble_days if int(day['fold']) == held_out_fold
+        ]
+        calibration_folds = sorted({
+            int(day['fold']) for day in calibration_days
+        })
+        if held_out_fold in calibration_folds:
+            raise AssertionError('留出折泄漏进模块门控校准数据')
+        calibration_dates = {
+            day['prediction_date'] for day in calibration_days
+        }
+        evaluation_dates = {
+            day['prediction_date'] for day in evaluation_days
+        }
+        if calibration_dates.intersection(evaluation_dates):
+            raise AssertionError('留出折日期泄漏进模块门控校准数据')
+        policy = calibrate_module_gated_policy(
+            calibration_days,
+            **calibration_kwargs,
+        )
+        held_metrics = evaluate_ensemble_policy(
+            evaluation_days,
+            policy,
+            include_daily=True,
+        )
+        held_out_daily.extend(held_metrics['daily'])
+        held_module_reports = {}
+        for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+            if policy[field] == fallback:
+                held_module_reports[module] = {
+                    'active': False,
+                    'mean_paired_contribution': 0.0,
+                }
+                continue
+            fallback_policy = dict(policy)
+            fallback_policy[field] = fallback
+            fallback_metrics = evaluate_ensemble_policy(
+                evaluation_days,
+                fallback_policy,
+                include_daily=True,
+            )
+            return_key = (
+                'top5_return'
+                if module in (
+                    'risk_score',
+                    'reversal',
+                    'correlation_cluster',
+                )
+                else 'weighted_portfolio_return'
+            )
+            candidate_returns = np.asarray([
+                row[return_key] for row in held_metrics['daily']
+            ])
+            fallback_returns = np.asarray([
+                row[return_key] for row in fallback_metrics['daily']
+            ])
+            report = {
+                'active': True,
+                'return_key': return_key,
+                'mean_paired_contribution': float(
+                    (candidate_returns - fallback_returns).mean()
+                ),
+                'candidate_returns': candidate_returns.tolist(),
+                'fallback_returns': fallback_returns.tolist(),
+            }
+            held_module_reports[module] = report
+            held_module_pairs[module].append({
+                'fold': held_out_fold,
+                **report,
+            })
+        fold_policies.append({
+            'held_out_fold': held_out_fold,
+            'calibration_folds': calibration_folds,
+            'calibration_dates': sorted(calibration_dates),
+            'evaluation_dates': sorted(evaluation_dates),
+            'policy': {field: policy[field] for field in policy_fields},
+            'calibration_module_eligibility': policy[
+                'module_eligibility'
+            ],
+            'held_out_module_contributions': held_module_reports,
+            'held_out_metrics': {
+                key: value for key, value in held_metrics.items()
+                if key != 'daily'
+            },
+        })
+    downside_weight = float(calibration_kwargs.get(
+        'downside_weight',
+        0.5,
+    ))
+    cross_fitted_metrics = _summarize_cross_fitted_daily(
+        sorted(
+            held_out_daily,
+            key=lambda row: (row['prediction_date'], row['fold']),
+        ),
+        downside_weight,
+    )
+    deployment_eligibility = {}
+    for module, rows in held_module_pairs.items():
+        enabled_count = len(rows)
+        if enabled_count < 2:
+            deployment_eligibility[module] = {
+                'eligible': False,
+                'cross_fitted_enable_count': enabled_count,
+                'reason': 'enabled_in_fewer_than_two_cross_fitted_policies',
+            }
+            continue
+        paired = np.concatenate([
+            np.asarray(row['candidate_returns'])
+            - np.asarray(row['fallback_returns'])
+            for row in rows
+        ])
+        fold_contributions = {
+            str(row['fold']): row['mean_paired_contribution']
+            for row in rows
+        }
+        candidate_returns = np.concatenate([
+            np.asarray(row['candidate_returns']) for row in rows
+        ])
+        fallback_returns = np.concatenate([
+            np.asarray(row['fallback_returns']) for row in rows
+        ])
+        checks = {
+            'mean_contribution_positive': bool(paired.mean() > 0.0),
+            'all_enabled_folds_positive': bool(all(
+                value > 0.0 for value in fold_contributions.values()
+            )),
+            'p10_not_worse': bool(
+                np.quantile(candidate_returns, 0.10)
+                >= np.quantile(fallback_returns, 0.10) - 1e-12
+            ),
+            'worst_fold_not_worse': bool(min(
+                fold_contributions.values()
+            ) >= -1e-12),
+        }
+        deployment_eligibility[module] = {
+            'eligible': bool(all(checks.values())),
+            'cross_fitted_enable_count': enabled_count,
+            'mean_paired_contribution': float(paired.mean()),
+            'fold_contributions': fold_contributions,
+            'checks': checks,
+        }
+    all_oof_candidate = calibrate_module_gated_policy(
+        ensemble_days,
+        **calibration_kwargs,
+    )
+    robust_deployment = dict(all_oof_candidate)
+    for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+        if not deployment_eligibility[module]['eligible']:
+            robust_deployment[field] = fallback
+    robust_deployment['disagreement_gamma'] = 0.0
+    robust_deployment['oof_metrics'] = evaluate_ensemble_policy(
+        ensemble_days,
+        robust_deployment,
+        include_daily=True,
+    )
+    stability = {
+        field: {
+            'values': [row['policy'][field] for row in fold_policies],
+            'num_unique': len({
+                row['policy'][field] for row in fold_policies
+            }),
+        }
+        for field in policy_fields
+    }
+    return {
+        'method': 'module_gated_two_folds_calibrate_one_fold_evaluate',
+        'metrics': cross_fitted_metrics,
+        'fold_policies': fold_policies,
+        'policy_stability': stability,
+        'module_eligibility': deployment_eligibility,
+        'all_oof_candidate_policy': all_oof_candidate,
+        'robust_deployment_policy': robust_deployment,
     }
