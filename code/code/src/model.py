@@ -620,28 +620,29 @@ class StockTransformer(nn.Module):
                         1,
                         top_indices,
                     )
-                    industry_summaries = []
-                    for row in selected_industries:
-                        known = row[row > 0]
-                        if known.numel() == 0:
-                            industry_summaries.append(
-                                exposure_features.new_zeros(2)
-                            )
-                            continue
-                        counts = torch.unique(
-                            known,
-                            return_counts=True,
-                        )[1].to(exposure_features.dtype)
-                        # UNKNOWN 不形成行业桶，但占据 Top-10 分母，和
-                        # 策略层的集中度定义保持一致。
-                        shares = counts / float(top_k)
-                        industry_summaries.append(torch.stack([
-                            shares.square().sum(),
-                            shares.max(),
-                        ]))
+                    known = selected_industries.gt(0)
+                    same_industry = (
+                        selected_industries.unsqueeze(2)
+                        == selected_industries.unsqueeze(1)
+                    ) & known.unsqueeze(2) & known.unsqueeze(1)
+                    member_counts = same_industry.sum(dim=2).to(
+                        exposure_features.dtype
+                    )
+                    # 每个含 c 只股票的行业在 member_counts 中出现 c 次，
+                    # 因而总和恰为 sum(c^2)；UNKNOWN 仍占 Top-10 分母。
+                    industry_hhi = (
+                        member_counts.sum(dim=1) / float(top_k ** 2)
+                    )
+                    max_industry_share = (
+                        member_counts.max(dim=1).values / float(top_k)
+                    )
+                    industry_summaries = torch.stack([
+                        industry_hhi,
+                        max_industry_share,
+                    ], dim=1)
                     exposure_features = torch.cat([
                         exposure_features,
-                        torch.stack(industry_summaries),
+                        industry_summaries,
                     ], dim=-1)
             exposure_logit = self.exposure_head(
                 exposure_features

@@ -720,14 +720,15 @@ class WeightedRankingLoss(nn.Module):
         for batch_index in range(y_pred.size(0)):
             day_industries = industry_indices[batch_index]
             # UNKNOWN=0 不参与行业辅助目标。
-            for industry_index in torch.unique(day_industries):
-                if int(industry_index.item()) <= 0:
+            # 一次性取回当日少量行业 ID，避免每个行业分别触发 CUDA 同步。
+            for industry_index in torch.unique(day_industries).tolist():
+                if industry_index <= 0:
                     continue
                 group_mask = day_industries.eq(industry_index)
-                group_size = int(group_mask.sum().item())
+                group_scores = y_pred[batch_index][group_mask].unsqueeze(0)
+                group_size = group_scores.numel()
                 if group_size < 2:
                     continue
-                group_scores = y_pred[batch_index][group_mask].unsqueeze(0)
                 group_returns = raw_returns[batch_index][group_mask]
                 residual_returns = (
                     group_returns - group_returns.median()
