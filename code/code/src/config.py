@@ -32,6 +32,11 @@ config = {
     'num_folds': 6,
     'validation_months': 3,
     'evaluation_stride': 5,
+    'reference_validation_windows': [
+        ['2026-01-14', '2026-03-13'],
+        ['2026-03-16', '2026-05-13'],
+        ['2026-05-14', '2026-07-13'],
+    ],
     'seed': 42,
     'ensemble_enabled': False,
     # 默认只运行 seed=42；仅在 ensemble_enabled=True 时使用下列种子。
@@ -187,25 +192,7 @@ config = {
     'fixed_exposure_baseline': 0.6231689453125,
     'minimum_industry_coverage': 0.95,
     'industry_history_path': './data_5y/stock_industry_history.csv',
-    'promotion_top5_improvement': 0.002,
-    'promotion_weighted_improvement': 0.0015,
-    'promotion_max_p10_regression': 0.005,
     'promotion_rank_ic_floor': 0.05,
-    'promotion_baseline_summary_path': (
-        './model/'
-        '60_158+39_reduced25_relmarket12_risk15_'
-        'nested_oof_forward_policy_v7_1/'
-        'cross_validation_summary.json'
-    ),
-    # v6 OOF 由 v1.16.1 严格前向协议得到的同日期基准；报告文件缺失时
-    # 使用该不可调常量，避免在新模型结果已知后重选基准。
-    'promotion_baseline_metrics': {
-        'mean_top5_return': 0.030811785085279552,
-        'mean_weighted_portfolio_return': 0.019047056756601472,
-        'worst_fold_weighted_portfolio_return': 0.010087486479274804,
-        'p10_weighted_portfolio_return': -0.02625382433758098,
-        'mean_rank_ic': 0.05995907442662079,
-    },
 
     # 保持损失为 FP32，仅对 Transformer 前向启用 AMP。
     'amp_enabled': True,

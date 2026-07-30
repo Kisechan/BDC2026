@@ -16,7 +16,13 @@ sys.path.insert(0, str(SRC_DIR))
 from config import config  # noqa: E402
 from model import StockTransformer  # noqa: E402
 from predict import validate_result  # noqa: E402
-from train import WeightedRankingLoss, detached_deployment_policy  # noqa: E402
+from train import (  # noqa: E402
+    WeightedRankingLoss,
+    _build_label_and_clean,
+    build_walk_forward_folds,
+    configure_model_for_stage,
+    detached_deployment_policy,
+)
 from utils import (  # noqa: E402
     attach_industry_indices_asof,
     attach_label_end_dates,
@@ -26,6 +32,60 @@ from utils import (  # noqa: E402
 
 
 class PolicyRegressionTests(unittest.TestCase):
+    def test_holding_path_tail_detects_recovered_drawdown(self):
+        rows = []
+        paths = {
+            "000001": [99, 100, 95, 101, 102, 101],
+            "000002": [99, 100, 99, 100, 101, 102],
+        }
+        for stock_id, opens in paths.items():
+            for offset, value in enumerate(opens):
+                rows.append({
+                    "股票代码": stock_id,
+                    "日期": pd.Timestamp("2026-01-01")
+                    + pd.Timedelta(days=offset),
+                    "开盘": value,
+                })
+        processed = _build_label_and_clean(pd.DataFrame(rows))
+        targets = processed.set_index("股票代码")
+        self.assertGreater(targets.loc["000001", "label"], 0.0)
+        self.assertEqual(targets.loc["000001", "tail_5d_target"], 1.0)
+        self.assertEqual(targets.loc["000002", "tail_5d_target"], 0.0)
+
+    def test_six_walk_forward_folds_keep_five_day_purge(self):
+        dates = pd.bdate_range("2021-07-20", "2026-07-13")
+        folds = build_walk_forward_folds(
+            pd.DataFrame({"日期": dates}),
+            num_folds=6,
+            validation_months=3,
+            purge_days=5,
+        )
+        self.assertEqual(len(folds), 6)
+        for fold in folds:
+            train_position = dates.get_loc(fold["train_end"])
+            validation_position = dates.get_loc(fold["val_start"])
+            self.assertEqual(validation_position - train_position - 1, 5)
+        for previous, current in zip(folds, folds[1:]):
+            self.assertLess(previous["val_end"], current["val_start"])
+
+    def test_tail_loss_uses_explicit_path_target(self):
+        criterion = WeightedRankingLoss(tail_5d_weight=1.0)
+        scores = torch.zeros(1, 2)
+        loss, components = criterion(
+            scores,
+            scores,
+            scores,
+            torch.full_like(scores, 0.02),
+            scores,
+            torch.full((1,), 0.5),
+            tail_5d_logits=torch.full_like(scores, 5.0),
+            tail_5d_targets=torch.ones_like(scores),
+            stage="risk",
+            return_components=True,
+        )
+        self.assertIn("tail_5d_loss", components)
+        self.assertLess(loss.item(), 0.01)
+
     def test_deployment_policy_can_embed_cross_fitted_report(self):
         cross_fitted = {
             "robust_deployment_policy": {"allocation_blend": 0.25},
@@ -166,6 +226,38 @@ class PolicyRegressionTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertTrue(torch.isfinite(scores.grad).all())
+
+    def test_disabled_industry_residual_loss_is_not_computed(self):
+        criterion = WeightedRankingLoss(
+            industry_residual_ranking_weight=0.0,
+        )
+        scores = torch.randn(1, 8)
+        returns = torch.randn(1, 8) * 0.02
+        loss, components = criterion(
+            scores,
+            torch.arange(8).float().unsqueeze(0),
+            torch.zeros_like(scores),
+            returns,
+            torch.zeros_like(scores),
+            torch.full((1,), 0.5),
+            industry_indices=torch.ones_like(scores, dtype=torch.long),
+            stage="ranking",
+            return_components=True,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertNotIn("industry_residual_ranking_loss", components)
+
+    def test_risk_stage_keeps_ranking_and_position_heads_frozen(self):
+        model = StockTransformer(input_dim=193, config=config, num_stocks=10)
+        configure_model_for_stage(model, "risk")
+        trainable = {
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(any(name.startswith("risk_") for name in trainable))
+        self.assertFalse(any(name.startswith("transformer") for name in trainable))
+        self.assertFalse(any(name.startswith("allocation_head") for name in trainable))
+        self.assertFalse(any(name.startswith("exposure_head") for name in trainable))
 
     def test_old_structure_loads_and_heads_always_exist(self):
         legacy_config = deepcopy(config)

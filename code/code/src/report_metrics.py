@@ -53,6 +53,13 @@ def print_cross_validation() -> None:
         )
     print(f"平均 Top-5 收益: {_pct(float(summary['mean_top5_return']))}")
     print(f"最差折 Top-5 收益: {_pct(float(summary['worst_fold_top5_return']))}")
+    if "mean_top5_excess_return" in summary:
+        print(
+            "平均市场收益/Top-5超额、最差折超额: "
+            f"{_pct(float(summary['mean_market_return']))} / "
+            f"{_pct(float(summary['mean_top5_excess_return']))} / "
+            f"{_pct(float(summary['worst_fold_top5_excess_return']))}"
+        )
     if "mean_weighted_portfolio_return" in summary:
         print(
             "平均动态权重组合收益: "
@@ -73,6 +80,12 @@ def print_cross_validation() -> None:
                 f"{float(summary['std_weighted_portfolio_return']):.4%} / "
                 f"{float(summary['weighted_portfolio_positive_rate']):.2%}"
             )
+            if "p10_fixed_exposure_return" in summary:
+                print(
+                    "动态/固定仓位 P10: "
+                    f"{_pct(float(summary['p10_weighted_portfolio_return']))} / "
+                    f"{_pct(float(summary['p10_fixed_exposure_return']))}"
+                )
             print(
                 "平均 Allocation贡献/Exposure相对固定仓位贡献: "
                 f"{_pct(float(summary['mean_allocation_contribution']))} / "
@@ -250,11 +263,21 @@ def print_cross_validation() -> None:
         )
         if differences:
             print(
-                "部署策略相对三个留出策略的差值: "
+                "部署策略相对各留出策略的差值: "
                 + ", ".join(
                     f"{name}={['%+.2f' % float(value) for value in values]}"
                     for name, values in differences.items()
                 )
+            )
+    reference_windows = summary.get("reference_validation_windows", [])
+    if reference_windows:
+        print("2026年原三折日期区间参考（不用于晋级）:")
+        for row in reference_windows:
+            print(
+                f"  {row['start']} ~ {row['end']}: "
+                f"Top-5 {_pct(float(row['mean_top5_return']))}, "
+                f"组合 {_pct(float(row['mean_weighted_portfolio_return']))}, "
+                f"Rank IC {float(row['mean_rank_ic']):+.4f}"
             )
     random_baselines = []
     policy_folds = {

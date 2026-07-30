@@ -126,6 +126,26 @@ def _aggregate_probability_diagnostics(daily, head):
     }
 
 
+def _summarize_fold_rows(fold, rows):
+    """统一汇总普通与交叉拟合 OOF 的逐折收益，避免报告口径漂移。"""
+    top5 = np.asarray([row['top5_return'] for row in rows])
+    market = np.asarray([row['market_future_return'] for row in rows])
+    weighted = np.asarray([
+        row['weighted_portfolio_return'] for row in rows
+    ])
+    return {
+        'fold': int(fold),
+        'mean_top5_return': float(top5.mean()),
+        'mean_market_return': float(market.mean()),
+        'mean_top5_excess_return': float((top5 - market).mean()),
+        'mean_weighted_portfolio_return': float(weighted.mean()),
+        'worst_weighted_portfolio_return': float(weighted.min()),
+        'mean_rank_ic': float(np.mean([row['rank_ic'] for row in rows])),
+        'positive_rate': float(np.mean(weighted > 0.0)),
+        'num_evaluation_dates': len(rows),
+    }
+
+
 def load_industry_history(path):
     """读取并校验带生效日期的行业快照。"""
     if not os.path.isfile(path):
@@ -977,6 +997,7 @@ def create_ranking_dataset_vectorized(
         'label',
         'risk_1d_target',
         'risk_3d_target',
+        'tail_5d_target',
         'regime_target',
     ]
     missing_targets = [
@@ -1005,6 +1026,7 @@ def create_ranking_dataset_vectorized(
         labels = group['label'].values.astype(np.float32)           # (T,)
         risk_1d_labels = group['risk_1d_target'].values.astype(np.float32)
         risk_3d_labels = group['risk_3d_target'].values.astype(np.float32)
+        tail_5d_labels = group['tail_5d_target'].values.astype(np.float32)
         regime_labels = group['regime_target'].values.astype(np.float32)
         industry_labels = group['industry_index'].values.astype(np.int64)
         dates = group['datetime'].values                             # (T,)
@@ -1024,6 +1046,7 @@ def create_ranking_dataset_vectorized(
                 target,
                 risk_1d_labels[end_idx],
                 risk_3d_labels[end_idx],
+                tail_5d_labels[end_idx],
                 regime_labels[end_idx],
                 industry_labels[end_idx],
             ))
@@ -1039,6 +1062,7 @@ def create_ranking_dataset_vectorized(
             'target',
             'risk_1d_target',
             'risk_3d_target',
+            'tail_5d_target',
             'regime_target',
             'industry_index',
         ],
@@ -1052,6 +1076,7 @@ def create_ranking_dataset_vectorized(
     prediction_dates = []
     risk_1d_targets = []
     risk_3d_targets = []
+    tail_5d_targets = []
     regime_targets = []
     industry_indices = []
 
@@ -1094,6 +1119,9 @@ def create_ranking_dataset_vectorized(
         risk_3d_targets.append(
             group['risk_3d_target'].to_numpy(dtype=np.float32)
         )
+        tail_5d_targets.append(
+            group['tail_5d_target'].to_numpy(dtype=np.float32)
+        )
         regime_targets.append(
             group['regime_target'].to_numpy(dtype=np.float32)
         )
@@ -1119,6 +1147,7 @@ def create_ranking_dataset_vectorized(
         prediction_dates,
         risk_1d_targets,
         risk_3d_targets,
+        tail_5d_targets,
         regime_targets,
         industry_indices,
     )
@@ -2231,9 +2260,7 @@ def summarize_ensemble_days(
             day['targets'][portfolio['raw_top_indices']].mean()
         )
         market_future_return = float(day['targets'].mean())
-        market_tail_share = float(
-            np.mean(day['targets'] <= tail_5d_threshold)
-        )
+        market_tail_share = float(np.mean(day['tail_5d_targets']))
         allocation_only_return = float(
             np.dot(portfolio['relative_weights'], selected_returns)
         )
@@ -2468,30 +2495,16 @@ def summarize_ensemble_days(
     for row in daily:
         fold_rows.setdefault(row['fold'], []).append(row)
     fold_summaries = [
-        {
-            'fold': int(fold),
-            'mean_top5_return': float(np.mean([
-                row['top5_return'] for row in rows
-            ])),
-            'mean_weighted_portfolio_return': float(np.mean([
-                row['weighted_portfolio_return'] for row in rows
-            ])),
-            'worst_weighted_portfolio_return': float(np.min([
-                row['weighted_portfolio_return'] for row in rows
-            ])),
-            'mean_rank_ic': float(np.mean([
-                row['rank_ic'] for row in rows
-            ])),
-            'positive_rate': float(np.mean(np.asarray([
-                row['weighted_portfolio_return'] for row in rows
-            ]) > 0.0)),
-            'num_evaluation_dates': len(rows),
-        }
+        _summarize_fold_rows(fold, rows)
         for fold, rows in sorted(fold_rows.items())
     ]
     summary = {
         'num_evaluation_dates': len(daily),
         'mean_top5_return': mean('top5_return'),
+        'mean_market_return': mean('market_future_return'),
+        'mean_top5_excess_return': mean('top5_return') - mean(
+            'market_future_return'
+        ),
         'mean_raw_top5_return': mean('raw_top5_return'),
         'mean_diversification_return_contribution': mean(
             'diversification_return_contribution'
@@ -2504,6 +2517,9 @@ def summarize_ensemble_days(
         'worst_weighted_portfolio_return': float(weighted_returns.min()),
         'p10_weighted_portfolio_return': float(
             np.quantile(weighted_returns, 0.10)
+        ),
+        'p10_fixed_exposure_return': float(
+            np.quantile(fixed_exposure_returns, 0.10)
         ),
         'std_weighted_portfolio_return': float(weighted_returns.std()),
         'positive_rate': float(np.mean(weighted_returns > 0.0)),
@@ -2621,6 +2637,9 @@ def summarize_ensemble_days(
         )),
         'worst_fold_top5_return': float(min(
             row['mean_top5_return'] for row in fold_summaries
+        )),
+        'worst_fold_top5_excess_return': float(min(
+            row['mean_top5_excess_return'] for row in fold_summaries
         )),
         'policy_objective': float(
             weighted_returns.mean() - downside_weight * downside_deviation
@@ -2942,25 +2961,10 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
     fold_rows = {}
     for row in daily:
         fold_rows.setdefault(int(row['fold']), []).append(row)
-    folds = [{
-        'fold': fold,
-        'mean_top5_return': float(np.mean([
-            row['top5_return'] for row in rows
-        ])),
-        'mean_weighted_portfolio_return': float(np.mean([
-            row['weighted_portfolio_return'] for row in rows
-        ])),
-        'worst_weighted_portfolio_return': float(np.min([
-            row['weighted_portfolio_return'] for row in rows
-        ])),
-        'mean_rank_ic': float(np.mean([
-            row['rank_ic'] for row in rows
-        ])),
-        'positive_rate': float(np.mean([
-            row['weighted_portfolio_return'] > 0.0 for row in rows
-        ])),
-        'num_evaluation_dates': len(rows),
-    } for fold, rows in sorted(fold_rows.items())]
+    folds = [
+        _summarize_fold_rows(fold, rows)
+        for fold, rows in sorted(fold_rows.items())
+    ]
     scalar_mean_keys = (
         'top5_return',
         'raw_top5_return',
@@ -3034,6 +3038,9 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'p10_weighted_portfolio_return': float(
             np.quantile(weighted_returns, 0.10)
         ),
+        'p10_fixed_exposure_return': float(
+            np.quantile(fixed_returns, 0.10)
+        ),
         'std_weighted_portfolio_return': float(
             weighted_returns.std()
         ),
@@ -3050,6 +3057,13 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         )),
         'worst_fold_top5_return': float(min(
             row['mean_top5_return'] for row in folds
+        )),
+        'mean_market_return': mean('market_future_return'),
+        'mean_top5_excess_return': (
+            mean('top5_return') - mean('market_future_return')
+        ),
+        'worst_fold_top5_excess_return': float(min(
+            row['mean_top5_excess_return'] for row in folds
         )),
         'exposure_std': float(values('gross_exposure').std()),
         'regime_gate_std': float(values('regime_gate').std()),

@@ -121,7 +121,7 @@ def forward_model_batch(model, batch, sequences, stock_indices, masks, device):
 def dense_stage_loss(
     criterion, model, outputs, relevance, return_outputs, targets,
     allocation_outputs, exposures, auxiliary_outputs, risk_1d_targets,
-    risk_3d_targets, regime_targets, industry_indices, stage,
+    risk_3d_targets, tail_5d_targets, regime_targets, industry_indices, stage,
     return_components=False,
 ):
     """无 padding 的完整 batch 一次计算辅助阶段损失，避免逐日期 Python 循环。"""
@@ -140,6 +140,7 @@ def dense_stage_loss(
         regime_gate=auxiliary_outputs['regime_gate'],
         risk_1d_targets=risk_1d_targets,
         risk_3d_targets=risk_3d_targets,
+        tail_5d_targets=tail_5d_targets,
         regime_targets=regime_targets,
         industry_indices=industry_indices,
         stage=stage,
@@ -321,6 +322,7 @@ def _build_label_and_clean(processed, drop_small_open=True):
     """统一构建标签并清洗无效样本。"""
     processed['open_t1'] = processed.groupby('股票代码')['开盘'].shift(-1)
     processed['open_t2'] = processed.groupby('股票代码')['开盘'].shift(-2)
+    processed['open_t3'] = processed.groupby('股票代码')['开盘'].shift(-3)
     processed['open_t4'] = processed.groupby('股票代码')['开盘'].shift(-4)
     processed['open_t5'] = processed.groupby('股票代码')['开盘'].shift(-5)
 
@@ -353,17 +355,41 @@ def _build_label_and_clean(processed, drop_small_open=True):
             30.0,
         ))
     )
+    tail_threshold = float(config.get('tail_5d_threshold', -0.03))
+    if tail_threshold >= 0:
+        raise ValueError('5日尾部风险阈值必须小于0')
+    tail_target_mode = config.get('tail_5d_target_mode', 'endpoint_return')
+    if tail_target_mode == 'holding_path_min':
+        holding_path_min = processed[
+            ['open_t1', 'open_t2', 'open_t3', 'open_t4', 'open_t5']
+        ].min(axis=1, skipna=False)
+        tail_return = (
+            (holding_path_min - processed['open_t1'])
+            / (processed['open_t1'] + 1e-12)
+        )
+    elif tail_target_mode == 'endpoint_return':
+        tail_return = processed['label']
+    else:
+        raise ValueError(f'不支持的 tail_5d_target_mode: {tail_target_mode}')
+    processed['tail_5d_target'] = np.where(
+        tail_return.notna(),
+        tail_return.le(tail_threshold),
+        np.nan,
+    )
     processed = processed.dropna(subset=[
         'label',
         'risk_1d_target',
         'risk_3d_target',
+        'tail_5d_target',
     ])
+    processed['tail_5d_target'] = processed['tail_5d_target'].astype(
+        np.float32
+    )
 
     dates = processed['日期']
-    tail_threshold = float(config.get('tail_5d_threshold', -0.03))
     market_future_return = processed['label'].groupby(dates).transform('mean')
     market_tail_share = (
-        processed['label'].le(tail_threshold).groupby(dates).transform('mean')
+        processed['tail_5d_target'].groupby(dates).transform('mean')
     )
     market_return_temperature = float(
         config.get('regime_market_return_temperature', 0.01)
@@ -388,7 +414,7 @@ def _build_label_and_clean(processed, drop_small_open=True):
     )
 
     processed.drop(
-        columns=['open_t1', 'open_t2', 'open_t4', 'open_t5'],
+        columns=['open_t1', 'open_t2', 'open_t3', 'open_t4', 'open_t5'],
         inplace=True,
     )
     return processed
@@ -466,7 +492,6 @@ class WeightedRankingLoss(nn.Module):
                  risk_5d_weight=0.0,
                  risk_5d_target_temperature=0.03,
                  tail_5d_weight=0.0,
-                 tail_5d_threshold=-0.03,
                  regime_weight=0.0,
                  industry_residual_ranking_weight=0.0):
         super(WeightedRankingLoss, self).__init__()
@@ -510,7 +535,6 @@ class WeightedRankingLoss(nn.Module):
             risk_5d_target_temperature
         )
         self.tail_5d_weight = float(tail_5d_weight)
-        self.tail_5d_threshold = float(tail_5d_threshold)
         self.regime_weight = float(regime_weight)
         self.industry_residual_ranking_weight = float(
             industry_residual_ranking_weight
@@ -553,8 +577,6 @@ class WeightedRankingLoss(nn.Module):
             raise ValueError('风险头、状态门控和行业残差损失权重不能为负')
         if self.risk_5d_target_temperature <= 0:
             raise ValueError('5日风险目标 temperature 必须大于0')
-        if self.tail_5d_threshold >= 0:
-            raise ValueError('5日尾部风险阈值必须小于0')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -862,6 +884,7 @@ class WeightedRankingLoss(nn.Module):
         regime_gate=None,
         risk_1d_targets=None,
         risk_3d_targets=None,
+        tail_5d_targets=None,
         regime_targets=None,
         industry_indices=None,
         stage='joint',
@@ -948,10 +971,11 @@ class WeightedRankingLoss(nn.Module):
                         risk_5d_targets,
                     )
                 )
-            if tail_5d_logits is not None and self.tail_5d_weight > 0:
-                tail_5d_targets = (
-                    raw_returns <= self.tail_5d_threshold
-                ).to(raw_returns.dtype)
+            if (
+                tail_5d_logits is not None
+                and tail_5d_targets is not None
+                and self.tail_5d_weight > 0
+            ):
                 components['tail_5d_loss'] = (
                     self.tail_5d_weight
                     * F.binary_cross_entropy_with_logits(
@@ -1176,6 +1200,7 @@ class RankingDataset(torch.utils.data.Dataset):
         prediction_dates,
         risk_1d_targets=None,
         risk_3d_targets=None,
+        tail_5d_targets=None,
         regime_targets=None,
         industry_indices=None,
     ):
@@ -1184,21 +1209,15 @@ class RankingDataset(torch.utils.data.Dataset):
         self.relevance_scores = relevance_scores
         self.stock_indices = stock_indices
         self.prediction_dates = prediction_dates
-        self.risk_1d_targets = (
-            risk_1d_targets
-            if risk_1d_targets is not None
-            else [np.full_like(target, 0.5) for target in targets]
-        )
-        self.risk_3d_targets = (
-            risk_3d_targets
-            if risk_3d_targets is not None
-            else [np.full_like(target, 0.5) for target in targets]
-        )
-        self.regime_targets = (
-            regime_targets
-            if regime_targets is not None
-            else [np.full_like(target, 0.5) for target in targets]
-        )
+        for name, values, default in (
+            ('risk_1d_targets', risk_1d_targets, 0.5),
+            ('risk_3d_targets', risk_3d_targets, 0.5),
+            ('tail_5d_targets', tail_5d_targets, 0.0),
+            ('regime_targets', regime_targets, 0.5),
+        ):
+            setattr(self, name, values if values is not None else [
+                np.full_like(target, default) for target in targets
+            ])
         self.industry_indices = (
             industry_indices
             if industry_indices is not None
@@ -1215,6 +1234,7 @@ class RankingDataset(torch.utils.data.Dataset):
             len(prediction_dates),
             len(self.risk_1d_targets),
             len(self.risk_3d_targets),
+            len(self.tail_5d_targets),
             len(self.regime_targets),
             len(self.industry_indices),
         }
@@ -1271,27 +1291,19 @@ class RankingDataset(torch.utils.data.Dataset):
                 dtype=torch.long,
             ),
             'prediction_date': self.prediction_dates[idx],
-            'risk_1d_targets': torch.from_numpy(
-                np.array(
-                    self.risk_1d_targets[idx],
+            **{
+                name: torch.from_numpy(np.array(
+                    getattr(self, name)[idx],
                     dtype=np.float32,
                     copy=True,
+                ))
+                for name in (
+                    'risk_1d_targets',
+                    'risk_3d_targets',
+                    'tail_5d_targets',
+                    'regime_targets',
                 )
-            ),
-            'risk_3d_targets': torch.from_numpy(
-                np.array(
-                    self.risk_3d_targets[idx],
-                    dtype=np.float32,
-                    copy=True,
-                )
-            ),
-            'regime_targets': torch.from_numpy(
-                np.array(
-                    self.regime_targets[idx],
-                    dtype=np.float32,
-                    copy=True,
-                )
-            ),
+            },
             'industry_indices': torch.from_numpy(
                 np.array(
                     self.industry_indices[idx],
@@ -1366,6 +1378,7 @@ def collate_fn(batch):
     stock_indices = [item['stock_indices'] for item in batch]
     risk_1d_targets = [item['risk_1d_targets'] for item in batch]
     risk_3d_targets = [item['risk_3d_targets'] for item in batch]
+    tail_5d_targets = [item['tail_5d_targets'] for item in batch]
     regime_targets = [item['regime_targets'] for item in batch]
     industry_indices = [item['industry_indices'] for item in batch]
     prediction_dates = [item['prediction_date'] for item in batch]
@@ -1392,6 +1405,7 @@ def collate_fn(batch):
     padded_stock_indices = []
     padded_risk_1d_targets = []
     padded_risk_3d_targets = []
+    padded_tail_5d_targets = []
     padded_regime_targets = []
     padded_industry_indices = []
     masks = []
@@ -1404,6 +1418,7 @@ def collate_fn(batch):
         stock_idx,
         risk_1d,
         risk_3d,
+        tail_5d,
         regime,
         industry,
     ) in zip(
@@ -1413,6 +1428,7 @@ def collate_fn(batch):
         stock_indices,
         risk_1d_targets,
         risk_3d_targets,
+        tail_5d_targets,
         regime_targets,
         industry_indices,
     ):
@@ -1428,6 +1444,7 @@ def collate_fn(batch):
             rel_pad = torch.zeros(pad_size, dtype=torch.long)
             stock_pad = torch.zeros(pad_size, dtype=torch.long)
             risk_target_pad = torch.full((pad_size,), 0.5)
+            tail_target_pad = torch.zeros(pad_size)
             industry_pad = torch.zeros(pad_size, dtype=torch.long)
             
             seq = torch.cat([seq, seq_pad], dim=0)
@@ -1436,6 +1453,7 @@ def collate_fn(batch):
             stock_idx = torch.cat([stock_idx, stock_pad], dim=0)
             risk_1d = torch.cat([risk_1d, risk_target_pad], dim=0)
             risk_3d = torch.cat([risk_3d, risk_target_pad], dim=0)
+            tail_5d = torch.cat([tail_5d, tail_target_pad], dim=0)
             regime = torch.cat([regime, risk_target_pad], dim=0)
             industry = torch.cat([industry, industry_pad], dim=0)
 
@@ -1462,6 +1480,7 @@ def collate_fn(batch):
         padded_stock_indices.append(stock_idx)
         padded_risk_1d_targets.append(risk_1d)
         padded_risk_3d_targets.append(risk_3d)
+        padded_tail_5d_targets.append(tail_5d)
         padded_regime_targets.append(regime)
         padded_industry_indices.append(industry)
         masks.append(mask)
@@ -1474,6 +1493,7 @@ def collate_fn(batch):
         'masks': torch.stack(masks),                     # [batch, max_stocks]
         'risk_1d_targets': torch.stack(padded_risk_1d_targets),
         'risk_3d_targets': torch.stack(padded_risk_3d_targets),
+        'tail_5d_targets': torch.stack(padded_tail_5d_targets),
         'regime_targets': torch.stack(padded_regime_targets),
         'industry_indices': torch.stack(padded_industry_indices),
         'prediction_dates': prediction_dates,
@@ -1561,6 +1581,10 @@ def train_ranking_model(
             batch['risk_3d_targets'],
             device,
         )
+        tail_5d_targets = move_batch_tensor(
+            batch['tail_5d_targets'],
+            device,
+        )
         regime_targets = move_batch_tensor(
             batch['regime_targets'],
             device,
@@ -1611,7 +1635,7 @@ def train_ranking_model(
                 criterion, model, outputs, masked_relevance,
                 return_outputs, targets, allocation_outputs, exposures,
                 auxiliary_outputs, risk_1d_targets, risk_3d_targets,
-                regime_targets, industry_indices, stage,
+                tail_5d_targets, regime_targets, industry_indices, stage,
                 return_components=True,
             )
             batch_weight_total = batch_loss.new_tensor(1.0)
@@ -1634,6 +1658,7 @@ def train_ranking_model(
                 valid_raw_return = masked_targets[i][valid_indices]
                 valid_risk_1d_targets = risk_1d_targets[i][valid_indices]
                 valid_risk_3d_targets = risk_3d_targets[i][valid_indices]
+                valid_tail_5d_targets = tail_5d_targets[i][valid_indices]
                 valid_regime_targets = regime_targets[i][valid_indices]
                 valid_industry_indices = industry_indices[i][valid_indices]
             
@@ -1684,6 +1709,7 @@ def train_ranking_model(
                     ].reshape(1),
                     risk_1d_targets=valid_risk_1d_targets.unsqueeze(0),
                     risk_3d_targets=valid_risk_3d_targets.unsqueeze(0),
+                    tail_5d_targets=valid_tail_5d_targets.unsqueeze(0),
                     regime_targets=valid_regime_targets.unsqueeze(0),
                     industry_indices=valid_industry_indices.unsqueeze(0),
                     stage=stage,
@@ -1801,6 +1827,10 @@ def evaluate_ranking_model(
                 batch['risk_3d_targets'],
                 device,
             )
+            tail_5d_targets = move_batch_tensor(
+                batch['tail_5d_targets'],
+                device,
+            )
             regime_targets = move_batch_tensor(
                 batch['regime_targets'],
                 device,
@@ -1915,6 +1945,10 @@ def evaluate_ranking_model(
                             valid_indices,
                         ].unsqueeze(0),
                         risk_3d_targets=risk_3d_targets[
+                            i,
+                            valid_indices,
+                        ].unsqueeze(0),
+                        tail_5d_targets=tail_5d_targets[
                             i,
                             valid_indices,
                         ].unsqueeze(0),
@@ -2045,13 +2079,10 @@ def evaluate_ranking_model(
                                 0.03,
                             ))
                         ).detach().cpu().numpy(),
-                        'tail_5d_targets': (
-                            masked_targets[i][valid_indices]
-                            <= float(config.get(
-                                'tail_5d_threshold',
-                                -0.03,
-                            ))
-                        ).float().detach().cpu().numpy(),
+                        'tail_5d_targets': tail_5d_targets[
+                            i,
+                            valid_indices,
+                        ].detach().cpu().numpy(),
                         'regime_target': float(
                             regime_targets[
                                 i,
@@ -2491,7 +2522,6 @@ def build_training_components(model, stage='ranking'):
             0.03,
         ),
         tail_5d_weight=config.get('tail_5d_weight', 0.0),
-        tail_5d_threshold=config.get('tail_5d_threshold', -0.03),
         regime_weight=config.get('regime_weight', 0.0),
         industry_residual_ranking_weight=config.get(
             'industry_residual_ranking_weight',
@@ -3778,7 +3808,8 @@ def main():
         device = torch.device('cpu')
     configure_accelerator(device)
     print(
-        f"训练模式: {'多种子 ensemble' if ensemble_enabled else '单种子三折'}; "
+        f"训练模式: {'多种子 ensemble' if ensemble_enabled else '单种子'}"
+        f"{config['num_folds']}折; "
         f"seeds={ensemble_seeds}; 设备: {device}; AMP={use_amp(device)}; "
         f"TF32={device.type == 'cuda' and config.get('tf32_enabled', True)}; "
         f"batch_size={config['batch_size']}"
@@ -3934,6 +3965,30 @@ def main():
     # forms a circular reference that json.dump cannot serialize.
     policy = detached_deployment_policy(cross_fitted_policy)
     ensemble_metrics = cross_fitted_policy['metrics']
+    reference_window_metrics = []
+    for start, end in config.get('reference_validation_windows', []):
+        rows = [
+            row for row in ensemble_metrics.get('daily', [])
+            if start <= row['prediction_date'] <= end
+        ]
+        if rows:
+            reference_window_metrics.append({
+                'start': start,
+                'end': end,
+                'num_evaluation_dates': len(rows),
+                'mean_top5_return': float(np.mean([
+                    row['top5_return'] for row in rows
+                ])),
+                'mean_market_return': float(np.mean([
+                    row['market_future_return'] for row in rows
+                ])),
+                'mean_weighted_portfolio_return': float(np.mean([
+                    row['weighted_portfolio_return'] for row in rows
+                ])),
+                'mean_rank_ic': float(np.mean([
+                    row['rank_ic'] for row in rows
+                ])),
+            })
     single_seed_summaries = {}
     for seed in ensemble_seeds:
         single_seed_summaries[str(seed)] = evaluate_ensemble_policy(
@@ -3945,59 +4000,24 @@ def main():
         for metrics in single_seed_summaries.values()
     ]))
     identity_sensitivity = summarize_identity_sensitivity(fold_results)
-    baseline_summary_path = config['promotion_baseline_summary_path']
-    if os.path.isfile(baseline_summary_path):
-        with open(baseline_summary_path, encoding='utf-8') as file:
-            baseline_metrics = json.load(file)
-        baseline_source = baseline_summary_path
-    else:
-        baseline_metrics = config.get('promotion_baseline_metrics')
-        if not baseline_metrics:
-            raise FileNotFoundError(
-                '缺少同协议 v6 严格前向基准报告和配置快照: '
-                f'{baseline_summary_path}'
-            )
-        baseline_source = 'config.promotion_baseline_metrics'
-        print(
-            '未找到 v1.16.1 基准报告，使用配置中冻结的同协议基准指标'
-        )
-    rank_ic_threshold = max(
-        float(config.get('promotion_rank_ic_floor', 0.05)),
-        float(baseline_metrics['mean_rank_ic']) - 0.005,
-    )
-    concentration_enabled = bool(
-        policy.get('industry_penalty', 0.0) > 0.0
-        or policy.get('soft_correlation_penalty', 0.0) > 0.0
-    )
-    concentration_improved = bool(
-        ensemble_metrics['mean_industry_hhi']
-        < ensemble_metrics['mean_raw_industry_hhi'] - 1e-12
-        or ensemble_metrics['mean_positive_correlation']
-        < ensemble_metrics['raw_mean_positive_correlation'] - 1e-12
-    )
+    rank_ic_threshold = float(config.get('promotion_rank_ic_floor', 0.05))
     promotion_criteria = {
         'applicable': True,
-        'mean_top5_improvement': bool(
-            ensemble_metrics['mean_top5_return']
-            >= baseline_metrics['mean_top5_return']
-            + config.get('promotion_top5_improvement', 0.002)
+        'mean_top5_excess_positive': bool(
+            ensemble_metrics['mean_top5_excess_return'] > 0.0
         ),
-        'mean_weighted_improvement': bool(
-            ensemble_metrics['mean_weighted_portfolio_return']
-            >= baseline_metrics['mean_weighted_portfolio_return']
-            + config.get('promotion_weighted_improvement', 0.0015)
+        'worst_fold_top5_excess_nonnegative': bool(
+            ensemble_metrics['worst_fold_top5_excess_return'] >= 0.0
         ),
-        'worst_fold_weighted_positive': bool(
-            ensemble_metrics['worst_fold_weighted_portfolio_return']
-            > 0.0
-        ),
-        'p10_not_materially_worse': bool(
+        'exposure_p10_not_worse': bool(
             ensemble_metrics['p10_weighted_portfolio_return']
-            >= baseline_metrics['p10_weighted_portfolio_return']
-            - config.get('promotion_max_p10_regression', 0.005)
+            >= ensemble_metrics['p10_fixed_exposure_return'] - 1e-12
         ),
         'mean_rank_ic': bool(
             ensemble_metrics['mean_rank_ic'] >= rank_ic_threshold
+        ),
+        'worst_fold_rank_ic_positive': bool(
+            ensemble_metrics['worst_fold_mean_rank_ic'] > 0.0
         ),
         'allocation_at_exposure_nonnegative': bool(
             ensemble_metrics[
@@ -4007,17 +4027,27 @@ def main():
         'exposure_objective_not_worse': bool(
             ensemble_metrics['exposure_policy_objective_delta'] >= -1e-12
         ),
-        'soft_concentration_effective_if_enabled': bool(
-            not concentration_enabled or concentration_improved
+        'tail_brier_skill_positive': bool(
+            ensemble_metrics['mean_tail_5d_brier_skill'] > 0.0
         ),
-        'baseline_source': baseline_source,
+        'tail_roc_auc_above_random': bool(
+            ensemble_metrics['mean_tail_5d_roc_auc'] > 0.5
+        ),
+        'tail_pr_auc_above_event_rate': bool(
+            ensemble_metrics['mean_tail_5d_pr_auc']
+            > ensemble_metrics['mean_tail_5d_event_rate']
+        ),
+        'combined_risk_direction': bool(
+            ensemble_metrics['combined_risk_return_spearman'] < 0.0
+        ),
+        'comparison_basis': 'same_dates_internal_baselines',
         'rank_ic_threshold': rank_ic_threshold,
     }
     promotion_criteria['passed'] = all(
         value for key, value in promotion_criteria.items()
         if key not in {
             'applicable',
-            'baseline_source',
+            'comparison_basis',
             'rank_ic_threshold',
         }
     )
@@ -4109,7 +4139,7 @@ def main():
 
     summary = {
         'training_mode': (
-            'rank_ensemble' if ensemble_enabled else 'single_seed_3fold'
+            'rank_ensemble' if ensemble_enabled else 'single_seed_walk_forward'
         ),
         'num_folds': len(folds),
         'evaluation_stride': int(config.get('evaluation_stride', 5)),
@@ -4141,8 +4171,15 @@ def main():
             1.0,
         )),
         'mean_top5_return': ensemble_metrics['mean_top5_return'],
+        'mean_market_return': ensemble_metrics['mean_market_return'],
+        'mean_top5_excess_return': ensemble_metrics[
+            'mean_top5_excess_return'
+        ],
         'worst_fold_top5_return': ensemble_metrics[
             'worst_fold_top5_return'
+        ],
+        'worst_fold_top5_excess_return': ensemble_metrics[
+            'worst_fold_top5_excess_return'
         ],
         'mean_weighted_portfolio_return': ensemble_metrics[
             'mean_weighted_portfolio_return'
@@ -4152,6 +4189,9 @@ def main():
         ],
         'p10_weighted_portfolio_return': ensemble_metrics[
             'p10_weighted_portfolio_return'
+        ],
+        'p10_fixed_exposure_return': ensemble_metrics[
+            'p10_fixed_exposure_return'
         ],
         'std_weighted_portfolio_return': ensemble_metrics[
             'std_weighted_portfolio_return'
@@ -4191,10 +4231,20 @@ def main():
         'mean_selected_combined_risk': ensemble_metrics[
             'mean_selected_combined_risk'
         ],
-        'mean_risk_1d_brier': ensemble_metrics['mean_risk_1d_brier'],
-        'mean_risk_3d_brier': ensemble_metrics['mean_risk_3d_brier'],
-        'mean_risk_5d_brier': ensemble_metrics['mean_risk_5d_brier'],
-        'mean_tail_5d_brier': ensemble_metrics['mean_tail_5d_brier'],
+        **{
+            f'mean_{head}_{metric}': ensemble_metrics[
+                f'mean_{head}_{metric}'
+            ]
+            for head in ('risk_1d', 'risk_3d', 'risk_5d', 'tail_5d')
+            for metric in (
+                'event_rate',
+                'brier',
+                'baseline_brier',
+                'brier_skill',
+                'roc_auc',
+                'pr_auc',
+            )
+        },
         'mean_regime_brier': ensemble_metrics['mean_regime_brier'],
         'regime_return_spearman': ensemble_metrics[
             'regime_return_spearman'
@@ -4292,6 +4342,7 @@ def main():
                 'exposure_head_blend',
             )
         },
+        'reference_validation_windows': reference_window_metrics,
         'single_seed_oof': single_seed_summaries,
         'single_seed_mean_weighted_return': mean_single_return,
         'promotion_criteria': promotion_criteria,
