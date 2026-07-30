@@ -10,10 +10,11 @@ seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
 market-pressure features. The active model experiment is
-`industryalpha_softconcentration_v8`. It keeps the 193 continuous inputs and
-does not feed industry codes or names into the Transformer. Historical
-industry snapshots are joined as-of for an industry-residual ranking objective,
-two Exposure portfolio summaries, and soft Top-10 concentration selection.
+`multiregime_pathrisk_v9`. It keeps the 193 continuous inputs and does not feed
+industry codes or names into the Transformer. Historical industry snapshots
+are joined as-of for two Exposure portfolio summaries and soft Top-10
+concentration selection; the expensive industry-residual ranking objective is
+disabled. Its tail head predicts a causal five-day holding-path loss event.
 Strategy changes are calibrated in Ranking, Allocation, and Exposure stages
 using strictly earlier, fully resolved OOF labels. Allocation and Exposure
 heads are mandatory and must not be removed by ablations.
@@ -39,6 +40,15 @@ checkpoints from different architectures or input dimensions are incompatible.
 - Avoid adding new files unless the change cannot reasonably fit an existing
   module. Prefer extending the closest existing module and document why any new
   file is necessary.
+- Prefer replacing, deleting, or reusing existing logic over adding parallel
+  implementations for the same behavior.
+- Before committing, inspect production-code changes with `git diff --numstat`.
+  If the added/deleted line ratio exceeds 1.5, explain why and make another
+  consolidation and deduplication pass. This is a review trigger, not a reason
+  to compress readable code. Count tests and documentation separately, while
+  still avoiding duplicated implementations.
+- Add a helper only when it removes duplication or makes the main flow
+  materially shorter.
 
 ## Runtime observability
 

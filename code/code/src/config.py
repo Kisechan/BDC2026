@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'industryalpha_softconcentration_v8'
+experiment_name = 'multiregime_pathrisk_v9'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -29,12 +29,12 @@ config = {
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'grad_clip': True,
-    'num_folds': 3,
-    'validation_months': 2,
+    'num_folds': 6,
+    'validation_months': 3,
     'evaluation_stride': 5,
     'seed': 42,
     'ensemble_enabled': False,
-    # 默认只运行 seed=42 的三折；仅在 ensemble_enabled=True 时使用下列种子。
+    # 默认只运行 seed=42；仅在 ensemble_enabled=True 时使用下列种子。
     'ensemble_seeds': [42, 142, 242],
     'checkpoint_metric': 'top5_return_plus_rank_ic',
     'checkpoint_rank_ic_weight': 0.2,
@@ -90,6 +90,7 @@ config = {
     'risk_5d_weight': 0.20,
     'tail_5d_weight': 0.20,
     'tail_5d_threshold': -0.03,
+    'tail_5d_target_mode': 'holding_path_min',
     'regime_gate_enabled': True,
     'regime_market_hidden_size': 16,
     'regime_market_feature_indices': [
@@ -136,7 +137,8 @@ config = {
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
     'pairwise_weight': 0.3, # 降低 LambdaRank@5 对排序主目标的支配
-    'industry_residual_ranking_weight': 0.15,
+    # v9关闭逐行业LambdaRank：保留行业Exposure汇总和组合集中度诊断。
+    'industry_residual_ranking_weight': 0.0,
     'lambdarank_candidate_k': 20,
     'lambdarank_hard_negative_k': 20,
     'lambdarank_return_gap_scale': 0.02,
