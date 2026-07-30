@@ -16,7 +16,7 @@ sys.path.insert(0, str(SRC_DIR))
 from config import config  # noqa: E402
 from model import StockTransformer  # noqa: E402
 from predict import validate_result  # noqa: E402
-from train import WeightedRankingLoss  # noqa: E402
+from train import WeightedRankingLoss, detached_deployment_policy  # noqa: E402
 from utils import (  # noqa: E402
     attach_industry_indices_asof,
     attach_label_end_dates,
@@ -26,6 +26,20 @@ from utils import (  # noqa: E402
 
 
 class PolicyRegressionTests(unittest.TestCase):
+    def test_deployment_policy_can_embed_cross_fitted_report(self):
+        cross_fitted = {
+            "robust_deployment_policy": {"allocation_blend": 0.25},
+            "metrics": {"mean_top5_return": 0.01},
+        }
+        policy = detached_deployment_policy(cross_fitted)
+        policy["cross_fitted_oof"] = cross_fitted
+        serialized = json.dumps(policy)
+        self.assertIn("cross_fitted_oof", serialized)
+        self.assertIsNot(
+            policy,
+            cross_fitted["robust_deployment_policy"],
+        )
+
     def test_label_end_dates_follow_trading_calendar(self):
         records = [{"prediction_date": "2026-01-05"}]
         trading_dates = pd.bdate_range("2026-01-05", periods=7)

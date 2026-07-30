@@ -161,6 +161,14 @@ def resume_training_enabled():
     return os.environ.get('RESUME_TRAINING', '0') == '1'
 
 
+def detached_deployment_policy(cross_fitted_policy):
+    """返回可安全附加交叉拟合报告的部署策略副本。"""
+    deployment_policy = cross_fitted_policy.get('robust_deployment_policy')
+    if not isinstance(deployment_policy, dict):
+        raise ValueError('交叉拟合结果缺少 robust_deployment_policy')
+    return dict(deployment_policy)
+
+
 TRAINING_STAGES = ('ranking', 'risk', 'allocation', 'exposure')
 
 
@@ -3921,7 +3929,10 @@ def main():
         )),
         **policy_calibration_kwargs,
     )
-    policy = cross_fitted_policy['robust_deployment_policy']
+    # Detach the deployment policy before attaching the full cross-fitted report.
+    # Otherwise policy -> cross_fitted_policy -> robust_deployment_policy -> policy
+    # forms a circular reference that json.dump cannot serialize.
+    policy = detached_deployment_policy(cross_fitted_policy)
     ensemble_metrics = cross_fitted_policy['metrics']
     single_seed_summaries = {}
     for seed in ensemble_seeds:
