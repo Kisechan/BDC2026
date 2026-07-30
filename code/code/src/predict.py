@@ -481,7 +481,7 @@ def main():
 		for industry, index in industry2idx.items()
 	}
 	industry_index_tensor = torch.as_tensor(
-		industry_indices_np,
+		industry_indices_np.copy(),
 		dtype=torch.long,
 		device=device,
 	).unsqueeze(0)
