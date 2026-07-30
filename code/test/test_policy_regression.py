@@ -20,6 +20,7 @@ from train import (  # noqa: E402
     WeightedRankingLoss,
     _build_label_and_clean,
     build_walk_forward_folds,
+    calculate_checkpoint_score,
     configure_model_for_stage,
     detached_deployment_policy,
 )
@@ -27,6 +28,7 @@ from utils import (  # noqa: E402
     attach_industry_indices_asof,
     attach_label_end_dates,
     build_industry_mapping,
+    create_ranking_dataset_vectorized,
     select_risk_aware_top_indices,
 )
 
@@ -51,6 +53,53 @@ class PolicyRegressionTests(unittest.TestCase):
         self.assertGreater(targets.loc["000001", "label"], 0.0)
         self.assertEqual(targets.loc["000001", "tail_5d_target"], 1.0)
         self.assertEqual(targets.loc["000002", "tail_5d_target"], 0.0)
+        self.assertLess(
+            targets.loc["000001", "ranking_target"],
+            targets.loc["000001", "label"],
+        )
+        self.assertEqual(
+            targets.loc["000002", "ranking_target"],
+            targets.loc["000002", "label"],
+        )
+
+    def test_ranking_checkpoint_penalizes_top5_downside(self):
+        base_metrics = {
+            "top5_return": 0.02,
+            "rank_ic": 0.05,
+            "top5_downside_deviation": 0.0,
+        }
+        safe_score = calculate_checkpoint_score(
+            base_metrics,
+            "risk_adjusted_top5_plus_rank_ic",
+        )
+        risky_score = calculate_checkpoint_score(
+            {**base_metrics, "top5_downside_deviation": 0.04},
+            "risk_adjusted_top5_plus_rank_ic",
+        )
+        self.assertGreater(safe_score, risky_score)
+
+    def test_dataset_relevance_uses_downside_adjusted_target(self):
+        data = pd.DataFrame({
+            "instrument": np.arange(10),
+            "日期": pd.Timestamp("2026-01-05"),
+            "feature": 0.0,
+            "label": np.arange(10, dtype=np.float32),
+            "ranking_target": -np.arange(10, dtype=np.float32),
+            "risk_1d_target": 0.5,
+            "risk_3d_target": 0.5,
+            "tail_5d_target": 0.0,
+            "regime_target": 0.5,
+        })
+        parts = create_ranking_dataset_vectorized(
+            data,
+            ["feature"],
+            sequence_length=1,
+            minimum_industry_coverage=0.0,
+        )
+        self.assertNotEqual(
+            int(np.argmax(parts[1][0])),
+            int(np.argmax(parts[2][0])),
+        )
 
     def test_six_walk_forward_folds_keep_five_day_purge(self):
         dates = pd.bdate_range("2021-07-20", "2026-07-13")
