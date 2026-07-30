@@ -376,8 +376,15 @@ def _build_label_and_clean(processed, drop_small_open=True):
         tail_return.le(tail_threshold),
         np.nan,
     )
+    downside_excess = (tail_threshold - tail_return).clip(lower=0.0)
+    processed['ranking_target'] = (
+        processed['label']
+        - float(config.get('ranking_downside_penalty', 0.0))
+        * downside_excess
+    )
     processed = processed.dropna(subset=[
         'label',
+        'ranking_target',
         'risk_1d_target',
         'risk_3d_target',
         'tail_5d_target',
@@ -600,7 +607,7 @@ class WeightedRankingLoss(nn.Module):
         return -(weighted_target_probs * log_pred_probs).sum(dim=1).mean()
 
     def lambda_rank_loss(self, y_pred, y_true, raw_returns, weights):
-        """以收益差和交换后的 ΔNDCG@5 加权困难候选股票对。"""
+        """以排序效用方向、收益差和交换后的 ΔNDCG@5 加权困难股票对。"""
         day_losses = []
         for batch_index in range(y_pred.size(0)):
             scores = y_pred[batch_index]
@@ -679,6 +686,10 @@ class WeightedRankingLoss(nn.Module):
             return_difference = (
                 local_returns[:, None] - local_returns[None, :]
             )
+            relevance_difference = (
+                relevance[candidate_indices, None]
+                - relevance[candidate_indices][None, :]
+            )
             delta_ndcg = (
                 (local_gains[:, None] - local_gains[None, :]).abs()
                 * (
@@ -705,7 +716,7 @@ class WeightedRankingLoss(nn.Module):
                 * 0.5
             )
             valid_pairs = torch.triu(
-                return_difference.ne(0),
+                relevance_difference.ne(0),
                 diagonal=1,
             )
             pair_weight = pair_weight * valid_pairs
@@ -714,7 +725,7 @@ class WeightedRankingLoss(nn.Module):
                 day_losses.append(scores.sum() * 0.0)
                 continue
             pair_loss = F.softplus(
-                -score_difference * torch.sign(return_difference)
+                -score_difference * torch.sign(relevance_difference)
             )
             day_losses.append(
                 (pair_loss * pair_weight).sum() / weight_sum
@@ -1162,6 +1173,7 @@ def summarize_ranking_metric_records(records):
             'weighted_portfolio_return_worst': 0.0,
             'weighted_portfolio_positive_rate': 0.0,
             'weighted_portfolio_downside_deviation': 0.0,
+            'top5_downside_deviation': 0.0,
             'num_evaluation_dates': 0,
         }
     keys = records[0].keys()
@@ -1173,6 +1185,9 @@ def summarize_ranking_metric_records(records):
         record['weighted_portfolio_return'] for record in records
     ], dtype=np.float64)
     negative_returns = np.minimum(weighted_returns, 0.0)
+    top5_returns = np.asarray([
+        record['top5_return'] for record in records
+    ], dtype=np.float64)
     metrics.update({
         'weighted_portfolio_return_std': float(weighted_returns.std()),
         'weighted_portfolio_return_p10': float(
@@ -1184,6 +1199,9 @@ def summarize_ranking_metric_records(records):
         ),
         'weighted_portfolio_downside_deviation': float(
             np.sqrt(np.mean(negative_returns ** 2))
+        ),
+        'top5_downside_deviation': float(
+            np.sqrt(np.mean(np.minimum(top5_returns, 0.0) ** 2))
         ),
         'num_evaluation_dates': len(records),
     })
@@ -1813,6 +1831,7 @@ def evaluate_ranking_model(
                 if 'cached_ranking_features' not in batch else None
             )
             targets = move_batch_tensor(batch['targets'], device)
+            relevance = move_batch_tensor(batch['relevance'], device)
             stock_indices = move_batch_tensor(batch['stock_indices'], device)
             masks = move_batch_tensor(batch['masks'], device)
             industry_indices = move_batch_tensor(
@@ -1861,6 +1880,7 @@ def evaluate_ranking_model(
             # 应用mask
             masked_outputs = outputs * masks + (1 - masks) * (-1e9)
             masked_targets = targets * masks
+            masked_relevance = relevance.float() * masks
             masked_return_outputs = return_outputs * masks
             masked_allocation_outputs = allocation_outputs * masks
             
@@ -1880,18 +1900,14 @@ def evaluate_ranking_model(
                 
                 valid_pred = masked_outputs[i][valid_indices]
                 valid_true = masked_targets[i][valid_indices]
+                valid_relevance = masked_relevance[i][valid_indices]
                 valid_return_pred = masked_return_outputs[i][valid_indices]
                 valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
                 
                 if len(valid_pred) > 1:
-                    _, sorted_indices = torch.sort(valid_true, descending=True)
-                    relevance_scores = torch.zeros_like(valid_true, requires_grad=False)
-                    relevance_scores[sorted_indices] = torch.arange(len(valid_true), 0, -1, device=device, dtype=torch.float32)
-                    relevance_scores = relevance_scores.detach()
-                    
                     loss = criterion(
                         valid_pred.unsqueeze(0),
-                        relevance_scores.unsqueeze(0),
+                        valid_relevance.unsqueeze(0),
                         valid_return_pred.unsqueeze(0),
                         valid_true.unsqueeze(0),
                         valid_allocation_logits.unsqueeze(0),
@@ -2575,6 +2591,14 @@ def build_training_components(model, stage='ranking'):
 
 def calculate_checkpoint_score(metrics, checkpoint_metric):
     """计算单折 checkpoint 分数，支持 Top-5 与 Rank IC 的组合目标。"""
+    if checkpoint_metric == 'risk_adjusted_top5_plus_rank_ic':
+        return (
+            metrics.get('top5_return', 0.0)
+            - config.get('checkpoint_top5_downside_weight', 0.25)
+            * metrics.get('top5_downside_deviation', 0.0)
+            + config.get('checkpoint_rank_ic_weight', 0.2)
+            * metrics.get('rank_ic', 0.0)
+        )
     if checkpoint_metric == 'top5_return_plus_rank_ic':
         return (
             metrics.get('top5_return', 0.0)
@@ -3310,6 +3334,10 @@ def build_policy_calibration_kwargs(runtime_config, ensemble_enabled):
             'module_min_positive_fold_fraction',
             2 / 3,
         )),
+        risk_module_max_return_spearman=float(runtime_config.get(
+            'risk_module_max_return_spearman',
+            0.0,
+        )),
         cluster_cap_grid=runtime_config.get(
             'cluster_cap_grid',
             [False, True],
@@ -4038,7 +4066,12 @@ def main():
             > ensemble_metrics['mean_tail_5d_event_rate']
         ),
         'combined_risk_direction': bool(
-            ensemble_metrics['combined_risk_return_spearman'] < 0.0
+            ensemble_metrics[
+                'candidate_combined_risk_return_spearman'
+            ] <= float(config.get(
+                'risk_module_max_return_spearman',
+                -0.05,
+            ))
         ),
         'comparison_basis': 'same_dates_internal_baselines',
         'rank_ic_threshold': rank_ic_threshold,
@@ -4261,6 +4294,12 @@ def main():
         'combined_risk_return_spearman': ensemble_metrics[
             'combined_risk_return_spearman'
         ],
+        'candidate_tail_risk_return_spearman': ensemble_metrics[
+            'candidate_tail_risk_return_spearman'
+        ],
+        'candidate_combined_risk_return_spearman': ensemble_metrics[
+            'candidate_combined_risk_return_spearman'
+        ],
         'mean_allocation_contribution': ensemble_metrics[
             'mean_allocation_contribution'
         ],
@@ -4269,6 +4308,9 @@ def main():
         ],
         'mean_exposure_contribution': ensemble_metrics[
             'mean_exposure_contribution'
+        ],
+        'mean_exposure_policy_contribution': ensemble_metrics[
+            'mean_exposure_policy_contribution'
         ],
         'mean_positive_correlation': ensemble_metrics[
             'mean_positive_correlation'

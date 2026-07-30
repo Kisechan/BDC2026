@@ -1024,6 +1024,10 @@ def create_ranking_dataset_vectorized(
         # 提取特征和 label
         feature_values = group[features].values.astype(np.float32)  # (T, F)
         labels = group['label'].values.astype(np.float32)           # (T,)
+        ranking_labels = group.get(
+            'ranking_target',
+            group['label'],
+        ).values.astype(np.float32)
         risk_1d_labels = group['risk_1d_target'].values.astype(np.float32)
         risk_3d_labels = group['risk_3d_target'].values.astype(np.float32)
         tail_5d_labels = group['tail_5d_target'].values.astype(np.float32)
@@ -1044,6 +1048,7 @@ def create_ranking_dataset_vectorized(
                 stock_code,
                 seq,
                 target,
+                ranking_labels[end_idx],
                 risk_1d_labels[end_idx],
                 risk_3d_labels[end_idx],
                 tail_5d_labels[end_idx],
@@ -1060,6 +1065,7 @@ def create_ranking_dataset_vectorized(
             'stock_code',
             'seq',
             'target',
+            'ranking_target',
             'risk_1d_target',
             'risk_3d_target',
             'tail_5d_target',
@@ -1103,7 +1109,8 @@ def create_ranking_dataset_vectorized(
         day_stocks = group['stock_code'].tolist()         # [str]
 
         # 计算 relevance（与原逻辑一致）
-        sorted_indices = np.argsort(day_targets)[::-1]
+        day_ranking_targets = group['ranking_target'].values
+        sorted_indices = np.argsort(day_ranking_targets)[::-1]
         relevance = np.zeros_like(day_targets, dtype=np.float32)
         for rank, idx in enumerate(sorted_indices):
             relevance[idx] = len(day_targets) - rank
@@ -2235,6 +2242,22 @@ def summarize_ensemble_days(
         mean_risk_3d_prediction = day['risk_3d_probabilities'].mean(axis=0)
         mean_risk_5d_prediction = day['risk_5d_probabilities'].mean(axis=0)
         mean_tail_5d_prediction = day['tail_5d_probabilities'].mean(axis=0)
+        candidate_indices = np.argsort(
+            -portfolio['ensemble_scores'],
+            kind='stable',
+        )[:min(20, day['targets'].size)]
+        candidate_returns = day['targets'][candidate_indices]
+        candidate_tail_risk = mean_tail_5d_prediction[candidate_indices]
+        candidate_combined_risk = combined_risk_probabilities[
+            :, candidate_indices
+        ].mean(axis=0)
+
+        def candidate_spearman(values):
+            if np.std(values) < 1e-12 or np.std(candidate_returns) < 1e-12:
+                return 0.0
+            correlation = spearmanr(values, candidate_returns).statistic
+            return float(correlation) if np.isfinite(correlation) else 0.0
+
         risk_diagnostics = {
             'risk_1d': probability_diagnostics(
                 mean_risk_1d_prediction,
@@ -2332,6 +2355,12 @@ def summarize_ensemble_days(
             'selected_risk_5d': float(selected_risk_5d),
             'selected_tail_5d': float(selected_tail_5d),
             'selected_combined_risk': float(selected_combined_risk),
+            'candidate_tail_risk_return_spearman': candidate_spearman(
+                candidate_tail_risk
+            ),
+            'candidate_combined_risk_return_spearman': candidate_spearman(
+                candidate_combined_risk
+            ),
             'risk_1d_brier': float(np.mean(
                 (
                     mean_risk_1d_prediction
@@ -2568,6 +2597,12 @@ def summarize_ensemble_days(
         'combined_risk_return_spearman': safe_spearman(
             selected_combined_risks,
             top5_returns,
+        ),
+        'candidate_tail_risk_return_spearman': mean(
+            'candidate_tail_risk_return_spearman'
+        ),
+        'candidate_combined_risk_return_spearman': mean(
+            'candidate_combined_risk_return_spearman'
         ),
         'mean_allocation_contribution': mean('allocation_contribution'),
         'mean_allocation_at_exposure_contribution': mean(
@@ -3010,6 +3045,8 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'tail_5d_brier_skill',
         'tail_5d_roc_auc',
         'tail_5d_pr_auc',
+        'candidate_tail_risk_return_spearman',
+        'candidate_combined_risk_return_spearman',
         'mean_positive_correlation',
         'raw_mean_positive_correlation',
         'industry_hhi',
@@ -3090,6 +3127,12 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'combined_risk_return_spearman': safe_spearman(
             'selected_combined_risk',
             'top5_return',
+        ),
+        'candidate_tail_risk_return_spearman': mean(
+            'candidate_tail_risk_return_spearman'
+        ),
+        'candidate_combined_risk_return_spearman': mean(
+            'candidate_combined_risk_return_spearman'
         ),
         'max_selected_cluster_count': int(max(
             row['max_selected_cluster_count'] for row in daily
@@ -3699,6 +3742,21 @@ def calibrate_module_gated_policy(
             'top5_return',
             module_min_positive_fold_fraction,
         )
+        if module == 'risk_score':
+            maximum_correlation = float(calibration_kwargs.get(
+                'risk_module_max_return_spearman',
+                0.0,
+            ))
+            gate['checks']['candidate_risk_direction'] = bool(
+                candidate_metrics[
+                    'candidate_combined_risk_return_spearman'
+                ] <= maximum_correlation
+            )
+            gate['candidate_risk_return_spearman'] = candidate_metrics[
+                'candidate_combined_risk_return_spearman'
+            ]
+            gate['maximum_risk_return_spearman'] = maximum_correlation
+            gate['enabled'] = bool(all(gate['checks'].values()))
         module_eligibility[module] = gate
         if not gate['enabled']:
             policy[field] = fallback

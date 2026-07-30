@@ -134,6 +134,12 @@ def print_cross_validation() -> None:
                 f"{float(summary['mean_risk_3d_brier_skill']):+.4f} / "
                 f"{float(summary['mean_risk_5d_brier_skill']):+.4f}"
             )
+            if "candidate_tail_risk_return_spearman" in summary:
+                print(
+                    "Ranking Top-20风险与未来收益相关（尾部/融合）: "
+                    f"{float(summary['candidate_tail_risk_return_spearman']):+.4f} / "
+                    f"{float(summary['candidate_combined_risk_return_spearman']):+.4f}"
+                )
         print(
             "Regime Gate 与 Top-5/市场收益/尾部扩散相关: "
             f"{float(summary['regime_return_spearman']):+.4f} / "

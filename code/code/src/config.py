@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'multiregime_pathrisk_v9'
+experiment_name = 'threefold_downside_ranking_v10'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -29,8 +29,8 @@ config = {
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'grad_clip': True,
-    'num_folds': 6,
-    'validation_months': 3,
+    'num_folds': 3,
+    'validation_months': 2,
     'evaluation_stride': 5,
     'reference_validation_windows': [
         ['2026-01-14', '2026-03-13'],
@@ -41,8 +41,9 @@ config = {
     'ensemble_enabled': False,
     # 默认只运行 seed=42；仅在 ensemble_enabled=True 时使用下列种子。
     'ensemble_seeds': [42, 142, 242],
-    'checkpoint_metric': 'top5_return_plus_rank_ic',
+    'checkpoint_metric': 'risk_adjusted_top5_plus_rank_ic',
     'checkpoint_rank_ic_weight': 0.2,
+    'checkpoint_top5_downside_weight': 0.25,
     'purge_days': 5,
 
     'regression_weight': 0.05,
@@ -96,6 +97,9 @@ config = {
     'tail_5d_weight': 0.20,
     'tail_5d_threshold': -0.03,
     'tail_5d_target_mode': 'holding_path_min',
+    # 排序效用对持有期内超过 3% 的额外回撤做轻量惩罚；原始收益仍用于
+    # 回归头、收益评估和 Allocation/Exposure 监督。
+    'ranking_downside_penalty': 0.25,
     'regime_gate_enabled': True,
     'regime_market_hidden_size': 16,
     'regime_market_feature_indices': [
@@ -134,6 +138,8 @@ config = {
     'policy_only_experiment': False,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
+    # 风险模块必须在候选股票中呈现明确的反向收益关系，才允许参与选股。
+    'risk_module_max_return_spearman': -0.05,
     'forward_module_max_fold_loss': 0.0025,
     'forward_module_max_p10_loss': 0.005,
     'minimum_allocation_deployment_blend': 0.25,
@@ -142,7 +148,7 @@ config = {
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
     'pairwise_weight': 0.3, # 降低 LambdaRank@5 对排序主目标的支配
-    # v9关闭逐行业LambdaRank：保留行业Exposure汇总和组合集中度诊断。
+    # 保持关闭逐行业LambdaRank：保留行业Exposure汇总和组合集中度诊断。
     'industry_residual_ranking_weight': 0.0,
     'lambdarank_candidate_k': 20,
     'lambdarank_hard_negative_k': 20,
@@ -157,7 +163,7 @@ config = {
     'ranking_learning_rate': 3e-5,
     'ranking_max_epochs': 50,
     'ranking_patience': 12,
-    'ranking_checkpoint_metric': 'top5_return_plus_rank_ic',
+    'ranking_checkpoint_metric': 'risk_adjusted_top5_plus_rank_ic',
     'ranking_min_final_epochs': 5,
     'risk_learning_rate': 1e-4,
     'risk_max_epochs': 12,
