@@ -1,6 +1,7 @@
 docs
-data
+data*
 model
 output
 temp
 test
+*.log
