@@ -3878,7 +3878,9 @@ def main():
 
     ensemble_days = []
     single_seed_days = {seed: [] for seed in ensemble_seeds}
-    full_trading_dates = full_data['日期'].dropna().unique()
+    # full_data 已去掉末尾无法形成完整 5 日标签的日期，不能拿它当
+    # 标签结束日历；原始行情仍包含这些未来开盘日。
+    full_trading_dates = full_df['日期'].dropna().unique()
     for fold in folds:
         fold_number = int(fold['fold'])
         ensemble_days.extend(align_oof_prediction_records(
