@@ -12,10 +12,10 @@
 核心目标是学习“当天应优先持有哪些股票”的排序函数，而不是单只股票二分类。
 
 训练与推理主流程如下：
-1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）；
-2. 做单股量价特征工程，并增加短期反转、下行波动和市场压力特征；
+1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）与行业历史快照；
+2. 做单股量价特征工程，并增加短期反转、下行波动、市场压力和行业 as-of 残差特征；
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
-4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
+4. v1.17 用固定随机种子 `42` 构造六折 walk-forward 验证、2个月 lockbox，每折训练/验证之间 purge 5 日；
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
    回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
@@ -99,13 +99,29 @@
 共178个连续输入。横截面只使用同一交易日可观测股票，市场状态值广播给当天所有股票；
 每折 StandardScaler 仍只使用该折训练期拟合。
 
-当前 `158+39_reduced25_relmarket12_risk15` 在上述178维上继续增加：
+`158+39_reduced25_relmarket12_risk15` 在上述178维上继续增加：
 
 - 1/3日收益、5日相对20/60日动量差、5/20日下行波动和20日回撤的横截面百分位；
 - 市场1/3日收益、5/20日下行波动、20日回撤、5日宽度变化、5日MA20宽度变化和
   20日市场拥挤度。
 
 共193个连续输入，全部只依赖预测日及以前行情。
+
+当前 v1.17 的 `158+39_reduced25_relmarket12_risk15_indresid12` 保留这193项，再增加12项
+行业 as-of 输入，共205维：相对市场、相对所属行业的1/3/5日收益残差，以及它们各自的同日横截面百分位。
+字段固定为 `indresid_market_return_{1,3,5}`、`indresid_industry_return_{1,3,5}`、
+`indresid_market_return_{1,3,5}_pct` 和 `indresid_industry_return_{1,3,5}_pct`。行业代码、名称和
+未来快照不进入 Transformer；每条记录只连接 `effective_date <= 日期` 的最后一份行业快照。
+
+### v1.17 工件复现协议
+
+205维 v1.17 工件根目录必须包含 `artifact_manifest.json`，并与 `config.json`、`scaler.pkl`、
+`stockid2idx.json` 和每个 checkpoint 一起保留。manifest 至少包含：
+`feature_num`、`feature_count`（205）、`sequence_length`、`stock_mapping_size`，以及
+`architecture` 中的 `d_model`、`nhead`、`num_layers`、`dim_feedforward`。推理会交叉检查
+manifest、Scaler 宽度、checkpoint 的 `input_proj.weight` 宽度和股票 embedding 行数；任意一项
+不一致即拒绝运行。旧 v1.16 的193维工件没有 manifest 时仍可推理，但不能与205维策略、Scaler
+或 checkpoint 混用。
 
 ### [train.py](train.py)
 训练主脚本，关键内容：
@@ -158,7 +174,7 @@
 - `config.json`：训练时配置快照；
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
-当前策略输出目录为
+v1.16 的历史策略输出目录为
 `model/60_158+39_reduced25_relmarket12_risk15_nested_oof_forward_policy_v7_1/`。
 该目录不复制模型；`artifact_source_dir` 指向
 `nested_oof_diverse_tailregime_v6_decay5y` 的 checkpoint、scaler、股票映射和
@@ -170,7 +186,7 @@ Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
 推理主脚本，流程：
 1. 加载历史数据，取最新交易日；
 2. 执行与训练一致的特征工程；
-3. 从策略目录加载部署参数，并通过 `artifact_source_dir` 从 v6 产物目录加载
+3. 从策略目录加载部署参数，并通过 `artifact_source_dir` 从训练工件目录加载
    训练配置、全量 `scaler.pkl`、股票映射与 checkpoint；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
@@ -182,11 +198,14 @@ Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
 	 - `stock_id`
 	 - `weight`（5只股票之和严格位于 `[0.20, 0.999999]`）
 
-写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
+v1.17 在特征工程前还会验证 manifest、205维特征表、Scaler、股票映射和 checkpoint，防止
+不同输入维度的工件混用。写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
 Top-5、原始 Top-5、选择前后名次、相关簇编号、ID 消融、反转风险、组合相关性、
-策略参数、1/3/5日软风险、5日尾部事件风险、市场状态门控、股票仓位和现金。
+策略参数、1/3/5日软风险、5日尾部事件风险、市场状态门控、股票仓位和现金。v1.17 另记录逐日
+组合状态、行业集中度（as-of 行业 HHI/权重）、资金约束和融合风险诊断；缺少行业历史时只跳过该
+诊断，不改变选股结果。
 
 `sequence_length=60` 不代表模型只看到两个月的信息：单日输入已包含最长60日窗口
 特征，再拼接60个时点后，最早的显式输入可追溯到`t-119`，覆盖约120个行情观测；
@@ -224,11 +243,15 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 用既有 v6 OOF 重放 v7.1 严格前向策略（不会训练模型）
+3) 训练当前 v1.17 工件（会生成205维 manifest、Scaler 和 checkpoint）
 
 ```
-POLICY_ONLY=1 ./train.sh
+./train.sh
 ```
+
+开发比较先运行 `V17_PROFILE=baseline ./train.sh`，再运行默认 candidate；二者都冻结末两
+个自然月。只有锁箱验收完成后，才允许以固定配置执行
+`V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh` 的部署重训，禁止据此再调参。
 
 4) 生成预测结果
 

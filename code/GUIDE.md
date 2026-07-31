@@ -49,11 +49,16 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v7.1 是复用 v6 模型产物的严格前向策略实验，不重新训练模型。运行
-`POLICY_ONLY=1 ./train.sh` 重放嵌套 OOF 并生成策略目录；随后运行
-`./test.sh` 生成预测。
+当前 v1.17 从头训练205维 `158+39_reduced25_relmarket12_risk15_indresid12` 工件。除五年
+行情外，需准备 `data_5y/stock_industry_history.csv`，其中必须包含
+`effective_date,stock_id,industry`；特征只使用预测日期当日或之前的行业快照。运行
+`./train.sh` 后，模型工件根目录必须同时保留 `config.json`、`scaler.pkl`、
+`stockid2idx.json`、checkpoint 和 `artifact_manifest.json`。
 
-若要从头训练模型，应先切回对应的模型训练配置；当前 v7.1 配置会拒绝误触发正式训练。
+`artifact_manifest.json` 的 `feature_count` 必须为205，且记录 `feature_num`、
+`sequence_length`、`stock_mapping_size` 和模型结构。`./test.sh` 会在特征工程前检查
+manifest、Scaler、checkpoint 输入宽度和股票 embedding；不得把 v1.16 的193维工件接入 v1.17。
+旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
 
 成功完成训练
 
@@ -67,7 +72,9 @@ windows可以直接运行`python code/src/predict.py`
 
 <img src="./asset/predict.png" alt="predict" width="50%">
 
-训练和测试都完成之后，会在output目录下生成result.csv，即为预测的后五个交易日收益率最高的五个股票及权重
+训练和测试都完成之后，会在output目录下生成 `result.csv` 与
+`prediction_diagnostics.json`。后者记录提交日状态、行业集中度、资金约束和风险诊断，供
+`report_metrics.py` 展示；它不参与赛事提交。
 
 得到result.csv之后，可以运行`python test/score_self.py`，将选手的预测股票与测试集比较，在计算出最终的加权收益率，作为选手可自行参考的得分，默认保存在/temp/tmp.csv。
 
@@ -75,7 +82,8 @@ windows可以直接运行`python code/src/predict.py`
 
 <img src="./asset/score.png" alt="score" width="50%">
 
-**注意**目前代码中直接选择排序得分最高的五个股票，平均权重。选手可以自行更改代码逻辑，只要满足最多五个股票，权重之和为1即可。
+**注意**当前策略从 ranking score 选择最多五只股票，再使用 Allocation/Exposure 头和策略校准
+分配权重；权重和不得超过1，现金权重为 `1 - sum(weight)`。
 
 # 打包docker
 在训练与测试完成之后，需要首先将项目整体打包成一个docker镜像（打包），再将该镜像导出为一个.tar文件（导出），最终提交该tar文件即可，里面需要包含运行时的所有环境及依赖，具体可以参考或修改Dockerfile

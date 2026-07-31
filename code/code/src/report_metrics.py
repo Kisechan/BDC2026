@@ -266,6 +266,122 @@ def print_cross_validation() -> None:
         )
 
 
+def _number(value, digits: int = 4) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _legacy_prediction_day(diagnostics: dict) -> dict:
+    """让 v1.16 diagnostics 在新增逐日报告下仍可展示。"""
+    ensemble = diagnostics.get("ensemble", {})
+    risks = ensemble.get("selected_combined_risk", [])
+    return {
+        "date": diagnostics.get("prediction_date", "-"),
+        "stock_ids": ensemble.get("top5", []),
+        "portfolio_state": {
+            "raw_top5_changed": ensemble.get("top5") != ensemble.get("raw_top5"),
+            "cluster_constraint_applied": ensemble.get("cluster_constraint_applied"),
+            "head_base_exposure": ensemble.get("head_base_exposure"),
+            "base_exposure": ensemble.get("base_exposure"),
+        },
+        "funding_constraints": {
+            "gross_exposure": ensemble.get("final_exposure"),
+            "cash_weight": ensemble.get("cash_weight"),
+            "max_position": max(ensemble.get("weights", []), default=None),
+        },
+        "risk_state": {
+            "regime_gate": ensemble.get("regime_gate"),
+            "combined_risk_mean": float(np.mean(risks)) if risks else None,
+            "combined_risk_max": float(np.max(risks)) if risks else None,
+            "mean_positive_correlation": ensemble.get("mean_positive_correlation"),
+        },
+    }
+
+
+def print_prediction_diagnostics() -> None:
+    """打印预测日的工件、状态、行业、资金和风险诊断。"""
+    path = os.path.join("output", "prediction_diagnostics.json")
+    if not os.path.exists(path):
+        print(f"\n[推理诊断] 未找到: {path}")
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            diagnostics = json.load(handle)
+    except (OSError, ValueError) as error:
+        print(f"\n[推理诊断] 无法读取: {error}")
+        return
+
+    artifact = diagnostics.get("artifact_validation")
+    if artifact:
+        print(
+            "\n[推理工件校验] "
+            f"{artifact.get('status', '-')}: "
+            f"{artifact.get('feature_num', '-')} / "
+            f"{artifact.get('feature_count', '-')}维，"
+            f"Scaler {artifact.get('scaler_feature_count', '-')}维，"
+            f"股票映射 {artifact.get('stock_mapping_size', '-')}"
+        )
+    lgbm = diagnostics.get("lgbm")
+    if lgbm:
+        print(
+            "[LightGBM排序融合] "
+            f"启用={lgbm.get('enabled', False)}, "
+            f"权重={_number(lgbm.get('weight'))}, "
+            f"特征数={lgbm.get('feature_count', '-')}, "
+            f"工件={lgbm.get('model_path', '-') or '-'}"
+        )
+    daily = diagnostics.get("daily")
+    if not isinstance(daily, list) or not daily:
+        daily = [_legacy_prediction_day(diagnostics)]
+    print("\n[推理逐日状态]")
+    for day in daily:
+        state = day.get("portfolio_state", {})
+        funding = day.get("funding_constraints", {})
+        risk = day.get("risk_state", {})
+        print(f"{day.get('date', '-')}: {', '.join(day.get('stock_ids', [])) or '-'}")
+        print(
+            "  状态—"
+            f"Top-5变化={state.get('raw_top5_changed', '-')}, "
+            f"相关簇约束={state.get('cluster_constraint_applied', '-')}, "
+            f"Head/基准仓位={_number(state.get('head_base_exposure'))} / "
+            f"{_number(state.get('base_exposure'))}"
+        )
+        print(
+            "  资金—"
+            f"股票/现金={_number(funding.get('gross_exposure'))} / "
+            f"{_number(funding.get('cash_weight'))}, "
+            f"最大单股={_number(funding.get('max_position'))}, "
+            f"边界/非负={funding.get('within_exposure_bounds', '-')} / "
+            f"{funding.get('non_negative', '-')}"
+        )
+        print(
+            "  风险—"
+            f"Regime={_number(risk.get('regime_gate'))}, "
+            f"融合风险均值/最大={_number(risk.get('combined_risk_mean'))} / "
+            f"{_number(risk.get('combined_risk_max'))}, "
+            f"正相关={_number(risk.get('mean_positive_correlation'))}"
+        )
+        industry = day.get("industry_concentration", {})
+        if industry.get("available"):
+            print(
+                "  行业集中度—"
+                f"行业数={industry.get('industry_count', '-')}, "
+                f"HHI={_number(industry.get('hhi'))}, "
+                f"最大行业={_number(industry.get('max_industry_weight'))}, "
+                f"覆盖/未分类={industry.get('covered_stocks', '-')} / "
+                f"{industry.get('unclassified_stocks', '-')}"
+            )
+            for item in industry.get("weights", []):
+                print(
+                    f"    {item['industry']}: {_pct(item['weight'])} "
+                    f"({', '.join(item['stock_ids'])})"
+                )
+        elif industry:
+            print(f"  行业集中度—未启用: {industry.get('reason', '-')}")
+
+
 def _normalize_ids(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True).str.zfill(6)
 
@@ -438,4 +554,5 @@ def print_realized_return() -> None:
 
 if __name__ == "__main__":
     print_cross_validation()
+    print_prediction_diagnostics()
     print_realized_return()

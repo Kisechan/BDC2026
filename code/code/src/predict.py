@@ -12,6 +12,7 @@ from scipy.stats import spearmanr
 from config import config
 from model import StockTransformer
 from utils import add_relative_market_features
+from utils import add_industry_residual_features
 from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import extract_selection_risk_context
@@ -65,6 +66,23 @@ LINEAR_REDUNDANT_FEATURES = {
 	'high_low_spread', 'open_close_spread', 'high_close_spread',
 	'low_close_spread', 'kdj_j',
 }
+INDUSTRY_RESIDUAL_FEATURE_SET = (
+	'158+39_reduced25_relmarket12_risk15_indresid12'
+)
+INDUSTRY_RESIDUAL_FEATURES = (
+	'indresid_market_return_1',
+	'indresid_market_return_3',
+	'indresid_market_return_5',
+	'indresid_industry_return_1',
+	'indresid_industry_return_3',
+	'indresid_industry_return_5',
+	'indresid_market_return_1_pct',
+	'indresid_market_return_3_pct',
+	'indresid_market_return_5_pct',
+	'indresid_industry_return_1_pct',
+	'indresid_industry_return_3_pct',
+	'indresid_industry_return_5_pct',
+)
 feature_cloums_map['158+39_reduced25'] = [
 	name for name in feature_cloums_map['158+39_reduced20']
 	if name not in LINEAR_REDUNDANT_FEATURES
@@ -80,10 +98,155 @@ feature_cloums_map[RISK_MARKET_FEATURE_SET] = [
 	*RISK_MARKET_FEATURES,
 ]
 feature_engineer_func_map[RISK_MARKET_FEATURE_SET] = engineer_features_158plus39
+feature_cloums_map[INDUSTRY_RESIDUAL_FEATURE_SET] = [
+	*feature_cloums_map[RISK_MARKET_FEATURE_SET],
+	*INDUSTRY_RESIDUAL_FEATURES,
+]
+feature_engineer_func_map[INDUSTRY_RESIDUAL_FEATURE_SET] = engineer_features_158plus39
 assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
 assert len(feature_cloums_map[RELATIVE_MARKET_FEATURE_SET]) == 178
 assert len(feature_cloums_map[RISK_MARKET_FEATURE_SET]) == 193
+assert len(feature_cloums_map[INDUSTRY_RESIDUAL_FEATURE_SET]) == 205
+
+
+def validate_artifact_compatibility(
+	trained_config,
+	policy,
+	artifact_source_dir,
+	feature_columns,
+	stockid2idx,
+	scaler,
+	model_paths,
+):
+	"""以同一份 manifest、scaler 和 checkpoint 防止 193/205 维工件混用。"""
+	feature_count = len(feature_columns)
+	manifest_path = policy.get('manifest_path', 'artifact_manifest.json')
+	if not os.path.isabs(manifest_path):
+		manifest_path = os.path.join(artifact_source_dir, manifest_path)
+	require_manifest = bool(
+		feature_count == 205
+		or policy.get('require_artifact_manifest', False)
+		or trained_config.get('require_artifact_manifest', False)
+	)
+	manifest = None
+	if os.path.exists(manifest_path):
+		with open(manifest_path, 'r', encoding='utf-8') as handle:
+			manifest = json.load(handle)
+		if not isinstance(manifest, dict):
+			raise ValueError(f'artifact_manifest.json 必须是 JSON 对象: {manifest_path}')
+	elif require_manifest:
+		raise FileNotFoundError(
+			f'205维工件必须包含 artifact_manifest.json: {manifest_path}'
+		)
+
+	if manifest is not None:
+		for key, expected in {
+			'feature_num': trained_config['feature_num'],
+			'feature_count': feature_count,
+			'sequence_length': trained_config['sequence_length'],
+			'stock_mapping_size': len(stockid2idx),
+		}.items():
+			if key not in manifest:
+				raise ValueError(f'artifact_manifest.json 缺少 {key}: {manifest_path}')
+			if manifest[key] != expected:
+				raise ValueError(
+					f'artifact_manifest.json 的 {key} 与推理工件不一致: '
+					f'{manifest[key]} != {expected}'
+				)
+		architecture = manifest.get('architecture', manifest)
+		for key in ('d_model', 'nhead', 'num_layers', 'dim_feedforward'):
+			if key in architecture and architecture[key] != trained_config[key]:
+				raise ValueError(
+					f'artifact_manifest.json 的 {key} 与训练配置不一致: '
+					f'{architecture[key]} != {trained_config[key]}'
+				)
+
+	scaler_feature_count = getattr(scaler, 'n_features_in_', len(scaler.mean_))
+	if int(scaler_feature_count) != feature_count:
+		raise ValueError(
+			'Scaler 与当前特征表维度不一致，禁止混用工件: '
+			f'{scaler_feature_count} != {feature_count}'
+		)
+	checkpoint_dimensions = []
+	for model_path in model_paths:
+		state_dict = torch.load(
+			model_path,
+			map_location='cpu',
+			weights_only=True,
+		)
+		if 'model_state_dict' in state_dict:
+			state_dict = state_dict['model_state_dict']
+		input_projection = state_dict.get('input_proj.weight')
+		stock_embedding = state_dict.get('stock_embedding.weight')
+		if input_projection is None or input_projection.ndim != 2:
+			raise ValueError(f'模型缺少 input_proj.weight: {model_path}')
+		if int(input_projection.shape[1]) != feature_count:
+			raise ValueError(
+				'模型输入维度与当前特征表不一致，禁止混用工件: '
+				f'{input_projection.shape[1]} != {feature_count} ({model_path})'
+			)
+		if (
+			stock_embedding is None
+			or stock_embedding.ndim != 2
+			or int(stock_embedding.shape[0]) != len(stockid2idx) + 2
+		):
+			raise ValueError(
+				f'股票映射与模型 embedding 不兼容: {model_path}'
+			)
+		checkpoint_dimensions.append(int(input_projection.shape[1]))
+	return {
+		'status': 'validated' if manifest is not None else 'legacy_no_manifest',
+		'manifest_path': manifest_path if manifest is not None else None,
+		'feature_num': trained_config['feature_num'],
+		'feature_count': feature_count,
+		'scaler_feature_count': int(scaler_feature_count),
+		'stock_mapping_size': len(stockid2idx),
+		'checkpoint_input_dimensions': checkpoint_dimensions,
+	}
+
+
+def cross_sectional_percentiles(scores):
+	"""将单日分数标准化为 [0, 1] 百分位，供异构排序器融合。"""
+	scores = np.asarray(scores, dtype=np.float64)
+	if scores.ndim != 1 or scores.size == 0 or not np.isfinite(scores).all():
+		raise ValueError('排序融合分数必须是非空且有限的一维数组')
+	if scores.size == 1:
+		return np.ones(1, dtype=np.float64)
+	return (
+		pd.Series(scores).rank(method='average').to_numpy(dtype=np.float64) - 1.0
+	) / (scores.size - 1.0)
+
+
+def resolve_lgbm_ranker(policy, artifact_source_dir):
+	"""解析可选 LightGBM 排序器；零权重时不要求本地工件。"""
+	weight = float(policy.get('lgbm_weight', 0.0))
+	if not 0.0 <= weight <= 1.0:
+		raise ValueError('lgbm_weight 必须位于 [0, 1]')
+	configured_path = policy.get('lgbm_model_path')
+	if weight == 0.0:
+		return None, weight, None
+	if not configured_path:
+		raise ValueError('lgbm_weight 大于 0 时必须设置 lgbm_model_path')
+	model_path = configured_path
+	if not os.path.isabs(model_path):
+		model_path = os.path.join(artifact_source_dir, model_path)
+	if not os.path.exists(model_path):
+		raise FileNotFoundError(f'未找到 LightGBM 排序器: {model_path}')
+	return joblib.load(model_path), weight, model_path
+
+
+def validate_lgbm_feature_count(rank_model, feature_count):
+	"""LightGBM 同样必须使用当前完整特征表，避免 193/205 维混接。"""
+	model_feature_count = getattr(rank_model, 'n_features_in_', None)
+	if model_feature_count is None and hasattr(rank_model, 'booster_'):
+		model_feature_count = rank_model.booster_.num_feature()
+	if model_feature_count is not None and int(model_feature_count) != feature_count:
+		raise ValueError(
+			'LightGBM 输入维度与当前特征表不一致，禁止混用工件: '
+			f'{model_feature_count} != {feature_count}'
+		)
+	return int(model_feature_count) if model_feature_count is not None else None
 
 
 def preprocess_predict_data(df, stockid2idx, runtime_config=None):
@@ -105,8 +268,17 @@ def preprocess_predict_data(df, stockid2idx, runtime_config=None):
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))
 
 	processed = pd.concat(processed_list).reset_index(drop=True)
-	if feature_num in {RELATIVE_MARKET_FEATURE_SET, RISK_MARKET_FEATURE_SET}:
+	if feature_num in {
+		RELATIVE_MARKET_FEATURE_SET,
+		RISK_MARKET_FEATURE_SET,
+		INDUSTRY_RESIDUAL_FEATURE_SET,
+	}:
 		processed = add_relative_market_features(processed)
+	if feature_num == INDUSTRY_RESIDUAL_FEATURE_SET:
+		processed = add_industry_residual_features(
+			processed,
+			runtime_config['industry_history_path'],
+		)
 	processed['instrument'] = processed['股票代码'].map(stockid2idx).fillna(1)
 	processed['instrument'] = processed['instrument'].astype(np.int64)
 	processed['日期'] = pd.to_datetime(processed['日期'])
@@ -238,6 +410,103 @@ def make_serialization_safe_positions(portfolio, runtime_config):
 	return positions, safe_exposure
 
 
+def build_industry_concentration(stock_ids, weights, latest_date, history_path):
+	"""按预测日期 as-of 连接行业快照；行业文件缺失不影响旧工件推理。"""
+	if not history_path or not os.path.exists(history_path):
+		return {'available': False, 'reason': f'未找到行业历史: {history_path}'}
+	try:
+		history = pd.read_csv(history_path, dtype={'stock_id': str})
+		required = {'effective_date', 'stock_id', 'industry'}
+		if not required.issubset(history.columns):
+			return {
+				'available': False,
+				'reason': f'行业历史缺少字段: {sorted(required - set(history.columns))}',
+			}
+		history['effective_date'] = pd.to_datetime(history['effective_date'])
+		history['stock_id'] = history['stock_id'].astype(str).str.zfill(6)
+		history = history.loc[history['effective_date'] <= pd.Timestamp(latest_date)]
+		history = history.sort_values(['stock_id', 'effective_date'])
+		industry_by_stock = history.groupby('stock_id', sort=False)['industry'].last()
+	except (OSError, ValueError, pd.errors.ParserError) as error:
+		return {'available': False, 'reason': f'行业历史读取失败: {error}'}
+
+	selected = pd.DataFrame({
+		'stock_id': pd.Series(stock_ids, dtype=str).str.zfill(6),
+		'weight': np.asarray(weights, dtype=np.float64),
+	})
+	selected['industry'] = selected['stock_id'].map(industry_by_stock).fillna('UNCLASSIFIED')
+	by_industry = selected.groupby('industry', sort=True).agg(
+		weight=('weight', 'sum'),
+		stock_count=('stock_id', 'size'),
+		stock_ids=('stock_id', list),
+	).reset_index().sort_values(['weight', 'industry'], ascending=[False, True])
+	industry_weights = by_industry['weight'].to_numpy(dtype=np.float64)
+	return {
+		'available': True,
+		'as_of_date': pd.Timestamp(latest_date).strftime('%Y-%m-%d'),
+		'history_path': history_path,
+		'industry_count': int(len(by_industry)),
+		'covered_stocks': int(selected['industry'].ne('UNCLASSIFIED').sum()),
+		'unclassified_stocks': int(selected['industry'].eq('UNCLASSIFIED').sum()),
+		'hhi': float(np.square(industry_weights).sum()),
+		'max_industry_weight': float(industry_weights.max()),
+		'weights': by_industry.to_dict(orient='records'),
+	}
+
+
+def build_prediction_day_diagnostics(
+	top5,
+	weights,
+	exposure,
+	portfolio,
+	latest_date,
+	trained_config,
+	model_regime_gates,
+	combined_risk,
+):
+	"""为报告提供提交日的状态、资金约束与风险字段。"""
+	weights = np.asarray(weights, dtype=np.float64)
+	return {
+		'date': pd.Timestamp(latest_date).strftime('%Y-%m-%d'),
+		'stock_ids': list(top5),
+		'portfolio_state': {
+			'raw_top5_changed': bool(np.any(
+				portfolio['top_indices'] != portfolio['raw_top_indices']
+			)),
+			'cluster_constraint_applied': bool(
+				portfolio['cluster_constraint_applied']
+			),
+			'head_base_exposure': float(portfolio['head_base_exposure']),
+			'base_exposure': float(portfolio['base_exposure']),
+		},
+		'funding_constraints': {
+			'gross_exposure': float(exposure),
+			'cash_weight': float(1.0 - exposure),
+			'max_position': float(weights.max()),
+			'weights_sum': float(weights.sum(dtype=np.float64)),
+			'within_exposure_bounds': bool(
+				float(trained_config['min_exposure']) - 1e-9 <= exposure
+				<= float(trained_config['max_exposure']) + 1e-9
+			),
+			'non_negative': bool((weights >= 0).all()),
+		},
+		'risk_state': {
+			'regime_gate': float(np.median(model_regime_gates)),
+			'combined_risk_mean': float(np.mean(combined_risk)),
+			'combined_risk_max': float(np.max(combined_risk)),
+			'mean_positive_correlation': float(
+				portfolio['mean_positive_correlation']
+			),
+		},
+		'industry_concentration': build_industry_concentration(
+			top5,
+			weights,
+			latest_date,
+			trained_config.get('industry_history_path'),
+		),
+	}
+
+
 def compare_runtime_configs(saved_config, live_config):
 	"""报告源码配置与训练快照漂移；推理始终以训练快照为准。"""
 	ignored_keys = {
@@ -359,6 +628,27 @@ def main():
 	stock_ids = sorted(raw_df['股票代码'].unique())
 	with open(stock_mapping_path, 'r', encoding='utf-8') as f:
 		stockid2idx = json.load(f)
+	if trained_config['feature_num'] not in feature_cloums_map:
+		raise ValueError(
+			'当前推理源码不支持训练工件的 feature_num: '
+			f'{trained_config["feature_num"]}'
+		)
+	scaler = joblib.load(scaler_path)
+	artifact_validation = validate_artifact_compatibility(
+		trained_config,
+		policy,
+		artifact_source_dir,
+		feature_cloums_map[trained_config['feature_num']],
+		stockid2idx,
+		scaler,
+		model_paths,
+	)
+	print(
+		'工件兼容性校验通过: '
+		f'{artifact_validation["feature_num"]} / '
+		f'{artifact_validation["feature_count"]}维 / '
+		f'{artifact_validation["status"]}'
+	)
 
 	processed, features = preprocess_predict_data(
 		raw_df,
@@ -387,8 +677,11 @@ def main():
 					f'{configured_indices} != {expected_market_indices}'
 				)
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-	scaler = joblib.load(scaler_path)
+	# LightGBM 使用未经 StandardScaler 变换的预测日表格输入；仅保留最后
+	# 时点，避免复制整张五年特征表或把 Transformer 专用缩放误喂给树模型。
+	lgbm_raw_latest_by_stock = processed.sort_values(
+		['股票代码', '日期'],
+	).groupby('股票代码', sort=False).tail(1).set_index('股票代码')[features]
 	processed[features] = scaler.transform(processed[features])
 
 	sequence_length = trained_config['sequence_length']
@@ -400,6 +693,11 @@ def main():
 		latest_date,
 		stockid2idx,
 	)
+	lgbm_raw_latest = lgbm_raw_latest_by_stock.reindex(
+		sequence_stock_ids,
+	)[features].to_numpy(dtype=np.float32)
+	if not np.isfinite(lgbm_raw_latest).all():
+		raise ValueError('LightGBM 预测日特征与可用序列股票集合不一致')
 	selection_risk_context = None
 	if (
 		'selection_risk_gamma' in policy
@@ -617,6 +915,49 @@ def main():
 			})
 			del model
 
+	lgbm_ranker, lgbm_weight, lgbm_model_path = resolve_lgbm_ranker(
+		policy,
+		artifact_source_dir,
+	)
+	lgbm_diagnostics = {
+		'enabled': False,
+		'weight': lgbm_weight,
+		'model_path': lgbm_model_path,
+	}
+	if lgbm_ranker is not None:
+		if len(features) != 205:
+			raise ValueError(
+				'LightGBM 排序融合只允许使用205维 v1.17 特征工件'
+			)
+		lgbm_feature_count = validate_lgbm_feature_count(
+			lgbm_ranker,
+			len(features),
+		)
+		lgbm_scores = np.asarray(
+		lgbm_ranker.predict(lgbm_raw_latest),
+			dtype=np.float64,
+		).reshape(-1)
+		if lgbm_scores.shape != (len(sequence_stock_ids),):
+			raise ValueError(
+				'LightGBM 排序器输出长度与可预测股票数不一致: '
+				f'{lgbm_scores.shape} != {(len(sequence_stock_ids),)}'
+			)
+		if not np.isfinite(lgbm_scores).all():
+			raise ValueError('LightGBM 排序器输出包含 NaN 或无穷值')
+		lgbm_percentiles = cross_sectional_percentiles(lgbm_scores)
+		# 两侧先转为同日百分位，避免模型 logit 与树模型分数尺度互相主导。
+		model_scores = [
+			(1.0 - lgbm_weight) * cross_sectional_percentiles(scores)
+			+ lgbm_weight * lgbm_percentiles
+			for scores in model_scores
+		]
+		lgbm_top = np.argsort(lgbm_percentiles, kind='stable')[::-1][:5]
+		lgbm_diagnostics.update({
+			'enabled': True,
+			'feature_count': lgbm_feature_count,
+			'top5': [sequence_stock_ids[index] for index in lgbm_top],
+		})
+
 	risk_blends = np.asarray([
 		float(policy.get(
 			'risk_1d_blend',
@@ -722,12 +1063,31 @@ def main():
 		stock_ids,
 		runtime_config=trained_config,
 	)
+	combined_risk = (
+		risk_blends[0] * np.mean(np.stack(model_risk_1d), axis=0)
+		+ risk_blends[1] * np.mean(np.stack(model_risk_3d), axis=0)
+		+ risk_blends[2] * np.mean(np.stack(model_risk_5d), axis=0)
+		+ risk_blends[3] * np.mean(np.stack(model_tail_5d), axis=0)
+	)
+	prediction_day = build_prediction_day_diagnostics(
+		top5,
+		written_df['weight'].to_numpy(dtype=np.float64),
+		weight_sum,
+		portfolio,
+		latest_date,
+		trained_config,
+		model_regime_gates,
+		combined_risk[top_indices],
+	)
 	diagnostics = {
 		'prediction_date': latest_date.strftime('%Y-%m-%d'),
 		'num_ranked_stocks': len(sequence_stock_ids),
 		'artifact_source_dir': artifact_source_dir,
+		'artifact_validation': artifact_validation,
+		'lgbm': lgbm_diagnostics,
 		'config_drift': config_drift,
 		'promotion_criteria': policy.get('promotion_criteria', {}),
+		'daily': [prediction_day],
 		'policy': {
 			'allocation_blend': float(policy['allocation_blend']),
 			'disagreement_gamma': float(policy['disagreement_gamma']),
