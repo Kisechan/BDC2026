@@ -2279,6 +2279,9 @@ def summarize_ensemble_days(
             'prediction_date': day['prediction_date'],
             'label_end_date': day['label_end_date'],
             'top5_return': equal_full_return,
+            'selected_stock_indices': [
+                int(value) for value in day['stock_indices'][selected]
+            ],
             'raw_top5_return': raw_top5_return,
             'diversification_return_contribution': (
                 equal_full_return - raw_top5_return

@@ -161,6 +161,12 @@ def validate_artifact_compatibility(
 					f'artifact_manifest.json 的 {key} 与训练配置不一致: '
 					f'{architecture[key]} != {trained_config[key]}'
 				)
+		if trained_config.get('score_head_variant', 'mlp_v1') != 'mlp_v1':
+			for key in ('score_head_variant', 'rankglu_bottleneck', 'rankglu_gamma_max'):
+				if manifest.get(key) != trained_config.get(key):
+					raise ValueError(
+						f'artifact_manifest.json 的 {key} 与 RankGLU 训练配置不一致'
+					)
 
 	scaler_feature_count = getattr(scaler, 'n_features_in_', len(scaler.mean_))
 	if int(scaler_feature_count) != feature_count:
@@ -536,11 +542,14 @@ def compare_runtime_configs(saved_config, live_config):
 
 
 def main():
-	output_dir = config['output_dir']
+	# 锁箱回放通过环境变量固定 as-of 日期与临时输出，默认行为仍是当前目录最新日推理。
+	output_dir = os.environ.get('MODEL_OUTPUT_DIR', config['output_dir'])
+	prediction_output_dir = os.environ.get('PREDICTION_OUTPUT_DIR', './output')
 	strategy_config_path = os.path.join(output_dir, 'config.json')
 	policy_path = os.path.join(output_dir, 'ensemble_policy.json')
-	output_path = os.path.join('./output/', 'result.csv')
-	diagnostics_path = os.path.join('./output/', 'prediction_diagnostics.json')
+	output_path = os.path.join(prediction_output_dir, 'result.csv')
+	diagnostics_path = os.path.join(prediction_output_dir, 'prediction_diagnostics.json')
+	os.makedirs(prediction_output_dir, exist_ok=True)
 
 	for path, description in [
 		(strategy_config_path, '策略配置快照'),
@@ -623,6 +632,14 @@ def main():
 	raw_df = pd.read_csv(data_file, dtype={'股票代码': str})
 	raw_df['股票代码'] = raw_df['股票代码'].astype(str).str.zfill(6)
 	raw_df['日期'] = pd.to_datetime(raw_df['日期'])
+	requested_date = os.environ.get('PREDICTION_DATE')
+	if requested_date:
+		as_of_date = pd.Timestamp(requested_date)
+		raw_df = raw_df.loc[raw_df['日期'] <= as_of_date].copy()
+		if raw_df.empty or raw_df['日期'].max() != as_of_date:
+			raise ValueError(
+				f'PREDICTION_DATE 必须是可用交易日: {requested_date}'
+			)
 	latest_date = raw_df['日期'].max()
 
 	stock_ids = sorted(raw_df['股票代码'].unique())

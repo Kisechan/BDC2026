@@ -60,6 +60,36 @@ class FeatureAttention(nn.Module):
         attended = torch.sum(x * attention_weights, dim=1)  # [batch*num_stocks, d_model]
         return self.dropout(attended)
 
+
+class RankGLUHead(nn.Module):
+    """线性排序基线加受限 GLU 残差，保持输出为每股一个分数。"""
+    def __init__(self, input_dim, bottleneck, gamma_init, gamma_max):
+        super().__init__()
+        if bottleneck < 1 or not 0.0 < gamma_init < gamma_max:
+            raise ValueError('RankGLU bottleneck 或 gamma 配置不合法')
+        self.norm = nn.LayerNorm(input_dim)
+        self.base = nn.Linear(input_dim, 1)
+        self.value = nn.Linear(input_dim, bottleneck)
+        self.gate = nn.Linear(input_dim, bottleneck)
+        self.residual = nn.Linear(bottleneck, 1)
+        self.gamma_max = float(gamma_max)
+        initial_ratio = float(gamma_init) / self.gamma_max
+        self.gamma_raw = nn.Parameter(torch.tensor(
+            math.atanh(initial_ratio), dtype=torch.float32,
+        ))
+
+    @property
+    def gamma(self):
+        """有界残差系数，暴露为属性便于 manifest/测试审计。"""
+        return self.gamma_max * torch.tanh(self.gamma_raw)
+
+    def forward(self, features):
+        normalized = self.norm(features)
+        residual = self.residual(
+            self.value(normalized) * torch.sigmoid(self.gate(normalized))
+        )
+        return self.base(normalized) + self.gamma * residual
+
 class StockTransformer(nn.Module):
     def __init__(self, input_dim, config, num_stocks, emb_dim=None):
         super(StockTransformer, self).__init__()
@@ -115,13 +145,25 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'])
         )
         
-        # 最终排序分数输出
-        self.score_head = nn.Sequential(
-            nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
-            nn.ReLU(),
-            nn.Dropout(config['dropout'] * 0.5),
-            nn.Linear(config['d_model'] // 4, 1)
-        )
+        # v1.19 仅替换排序头；旧工件仍按原始 MLP 头加载。
+        rank_dim = config['d_model'] // 2
+        self.score_head_variant = config.get('score_head_variant', 'mlp_v1')
+        if self.score_head_variant == 'rankglu_v1':
+            self.score_head = RankGLUHead(
+                rank_dim,
+                int(config.get('rankglu_bottleneck', 32)),
+                float(config.get('rankglu_gamma_init', 0.05)),
+                float(config.get('rankglu_gamma_max', 0.5)),
+            )
+        elif self.score_head_variant == 'mlp_v1':
+            self.score_head = nn.Sequential(
+                nn.Linear(rank_dim, config['d_model'] // 4),
+                nn.ReLU(),
+                nn.Dropout(config['dropout'] * 0.5),
+                nn.Linear(config['d_model'] // 4, 1),
+            )
+        else:
+            raise ValueError(f'不支持的 score_head_variant: {self.score_head_variant}')
         self.risk_heads_enabled = bool(
             config.get('risk_heads_enabled', False)
         )

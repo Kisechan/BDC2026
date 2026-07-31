@@ -269,6 +269,36 @@ def print_cross_validation() -> None:
             "Ensemble promotion criteria: "
             f"{'PASS' if promotion.get('passed') else 'FAIL'}"
         )
+    candidates = summary.get('pre_registered_candidates', {})
+    if candidates:
+        print('v1.19 预注册纯模型候选（无中间融合）:')
+        for name, candidate in candidates.items():
+            metrics = candidate.get('metrics', {})
+            gate = candidate.get('promotion_criteria', {})
+            print(
+                f"  {name}: LGBM权重={float(candidate.get('lgbm_weight', 0.0)):.2f}, "
+                f"动态收益={_pct(float(metrics.get('mean_weighted_portfolio_return', 0.0)))}, "
+                f"P10={_pct(float(metrics.get('p10_weighted_portfolio_return', 0.0)))}, "
+                f"Rank IC={float(metrics.get('mean_rank_ic', 0.0)):+.4f}, "
+                f"晋级={'PASS' if gate.get('passed') else 'FAIL'}"
+            )
+        pair_rows = summary.get('lgbm_pair_report', [])
+        if pair_rows:
+            paired_return = np.mean([
+                row['weighted_return_delta_lgbm_minus_transformer']
+                for row in pair_rows
+            ])
+            paired_ic = np.mean([
+                row['rank_ic_delta_lgbm_minus_transformer']
+                for row in pair_rows
+            ])
+            overlap = np.mean([row['top5_overlap'] for row in pair_rows])
+            print(
+                '  LGBM−Transformer 配对：'
+                f'收益 {_pct(float(paired_return))}，'
+                f'Rank IC {float(paired_ic):+.4f}，'
+                f'Top-5 重合率 {float(overlap):.2%}'
+            )
 
 
 def _number(value, digits: int = 4) -> str:
@@ -518,6 +548,17 @@ def print_realized_return() -> None:
         test = pd.read_csv(test_path, dtype={"股票代码": str})
         test["股票代码"] = _normalize_ids(test["股票代码"])
         test["日期"] = pd.to_datetime(test["日期"])
+        diagnostics_path = os.path.join("output", "prediction_diagnostics.json")
+        if not os.path.exists(diagnostics_path):
+            raise ValueError('缺少预测日期诊断，拒绝把 test.csv 当作未来收益')
+        with open(diagnostics_path, "r", encoding="utf-8") as handle:
+            prediction_date = pd.Timestamp(json.load(handle)['prediction_date'])
+        if test['日期'].max() <= prediction_date:
+            print(
+                '\n[本地后验评分] 拒绝：test.csv 不含预测日之后的未来标签；'
+                '仅完成工件与资金约束验证。'
+            )
+            return
         returns = (
             test.sort_values("日期")
             .groupby("股票代码", sort=False)["开盘"]
