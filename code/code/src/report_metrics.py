@@ -6,6 +6,7 @@ submission those future prices are unavailable and the report deliberately
 does not fabricate a score.
 """
 
+import hashlib
 import json
 import os
 
@@ -15,12 +16,20 @@ import pandas as pd
 from config import config
 
 
+def model_output_dir() -> str:
+    return os.environ.get("MODEL_OUTPUT_DIR", config["output_dir"])
+
+
+def prediction_output_dir() -> str:
+    return os.environ.get("PREDICTION_OUTPUT_DIR", "./output")
+
+
 def _pct(value: float) -> str:
     return f"{value:+.4%}"
 
 
 def print_cross_validation() -> None:
-    summary_path = os.path.join(config["output_dir"], "cross_validation_summary.json")
+    summary_path = os.path.join(model_output_dir(), "cross_validation_summary.json")
     if not os.path.exists(summary_path):
         print(f"\n[模型验证] 未找到交叉验证报告: {summary_path}")
         return
@@ -354,7 +363,7 @@ def _legacy_prediction_day(diagnostics: dict) -> dict:
 
 def print_prediction_diagnostics() -> None:
     """打印预测日的工件、状态、行业、资金和风险诊断。"""
-    path = os.path.join("output", "prediction_diagnostics.json")
+    path = os.path.join(prediction_output_dir(), "prediction_diagnostics.json")
     if not os.path.exists(path):
         print(f"\n[推理诊断] 未找到: {path}")
         return
@@ -471,14 +480,19 @@ def print_portfolio_return_breakdown(
     selected = selected.sort_values("weight", ascending=False)
 
     print("\n[模型组合逐股收益]")
+    display_columns = [
+        "stock_id", "stock_name", "weight", "entry_open", "exit_open", "return",
+        "weighted_return", "cash_adjusted_all_in_return",
+    ]
     print(
         selected[[
-            "stock_id", "stock_name", "weight", "return", "weighted_return",
-            "cash_adjusted_all_in_return",
+            *display_columns,
         ]].rename(columns={
             "stock_id": "股票代码",
             "stock_name": "股票名称",
             "weight": "模型权重",
+            "entry_open": "T+1开盘",
+            "exit_open": "T+5开盘",
             "return": "股票实际收益",
             "weighted_return": "加权收益贡献",
             "cash_adjusted_all_in_return": "同仓位全仓收益",
@@ -486,6 +500,8 @@ def print_portfolio_return_breakdown(
             index=False,
             formatters={
                 "模型权重": _pct,
+                "T+1开盘": lambda value: f"{float(value):.4f}",
+                "T+5开盘": lambda value: f"{float(value):.4f}",
                 "股票实际收益": _pct,
                 "加权收益贡献": _pct,
                 "同仓位全仓收益": _pct,
@@ -543,76 +559,137 @@ def print_portfolio_return_breakdown(
         )
 
 
+def _load_prediction_result() -> tuple[pd.DataFrame, pd.Timestamp]:
+    output_dir = prediction_output_dir()
+    result_path = os.path.join(output_dir, "result.csv")
+    diagnostics_path = os.path.join(output_dir, "prediction_diagnostics.json")
+    if not os.path.exists(result_path) or not os.path.exists(diagnostics_path):
+        raise FileNotFoundError('缺少 result.csv 或 prediction_diagnostics.json')
+    result = pd.read_csv(result_path)
+    id_column = "stock_id" if "stock_id" in result.columns else "股票代码"
+    weight_column = "weight" if "weight" in result.columns else "权重"
+    result = result[[id_column, weight_column]].copy()
+    result.columns = ["stock_id", "weight"]
+    result["stock_id"] = _normalize_ids(result["stock_id"])
+    result["weight"] = pd.to_numeric(result["weight"], errors="raise")
+    if result["stock_id"].duplicated().any() or len(result) > 5:
+        raise ValueError('预测结果违反股票唯一性或 Top-5 约束')
+    with open(diagnostics_path, encoding="utf-8") as handle:
+        prediction_date = pd.Timestamp(json.load(handle)['prediction_date'])
+    return result, prediction_date
+
+
+def _official_open_window(
+    prices: pd.DataFrame, prediction_date: pd.Timestamp, strict_calendar: bool,
+) -> tuple[pd.DataFrame, pd.Timestamp, pd.Timestamp]:
+    prices = prices.copy()
+    prices['股票代码'] = _normalize_ids(prices['股票代码'])
+    prices['日期'] = pd.to_datetime(prices['日期'])
+    dates = pd.DatetimeIndex(sorted(prices['日期'].dropna().unique()))
+    if strict_calendar:
+        index = dates.get_indexer([prediction_date])
+        if index[0] < 0 or index[0] + 5 >= len(dates):
+            raise ValueError('缺少预测日或完整的 T+1 至 T+5 交易日')
+        entry_date, exit_date = dates[index[0] + 1], dates[index[0] + 5]
+    else:
+        future_dates = dates[dates > prediction_date]
+        if len(future_dates) < 5:
+            raise ValueError('test.csv 不含预测日之后完整的五个交易日')
+        entry_date, exit_date = future_dates[0], future_dates[4]
+    entry = prices.loc[prices['日期'] == entry_date, ['股票代码', '开盘']].rename(
+        columns={'股票代码': 'stock_id', '开盘': 'entry_open'},
+    )
+    exit_prices = prices.loc[prices['日期'] == exit_date, ['股票代码', '开盘']].rename(
+        columns={'股票代码': 'stock_id', '开盘': 'exit_open'},
+    )
+    realized = entry.merge(exit_prices, on='stock_id', how='inner')
+    if realized.empty or (realized[['entry_open', 'exit_open']] <= 0).any().any():
+        raise ValueError('官方收益窗口存在缺失或非正开盘价')
+    realized['return'] = realized['exit_open'] / realized['entry_open'] - 1.0
+    return realized, pd.Timestamp(entry_date), pd.Timestamp(exit_date)
+
+
+def _write_historical_audit(path: str, payload: dict) -> None:
+    if os.path.exists(path):
+        raise FileExistsError(f'历史审计已存在，拒绝覆盖: {path}')
+    with open(path, 'x', encoding='utf-8') as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
 def print_realized_return() -> None:
-    result_path = os.path.join("output", "result.csv")
-    test_path = os.path.join(config["data_path"], "test.csv")
-    if not os.path.exists(test_path):
-        print("\n[本地后验评分] 未找到 data/test.csv；未来行情未知，跳过真实收益与基线比较。")
-        return
-    if not os.path.exists(result_path):
-        print(f"\n[本地后验评分] 未找到预测文件: {result_path}")
-        return
-
     try:
-        result = pd.read_csv(result_path)
-        id_column = "stock_id" if "stock_id" in result.columns else "股票代码"
-        weight_column = "weight" if "weight" in result.columns else "权重"
-        result = result[[id_column, weight_column]].copy()
-        result.columns = ["stock_id", "weight"]
-        result["stock_id"] = _normalize_ids(result["stock_id"])
-        result["weight"] = pd.to_numeric(result["weight"], errors="raise")
-
-        test = pd.read_csv(test_path, dtype={"股票代码": str})
-        test["股票代码"] = _normalize_ids(test["股票代码"])
-        test["日期"] = pd.to_datetime(test["日期"])
-        diagnostics_path = os.path.join("output", "prediction_diagnostics.json")
-        if not os.path.exists(diagnostics_path):
-            raise ValueError('缺少预测日期诊断，拒绝把 test.csv 当作未来收益')
-        with open(diagnostics_path, "r", encoding="utf-8") as handle:
-            prediction_date = pd.Timestamp(json.load(handle)['prediction_date'])
-        if test['日期'].max() <= prediction_date:
-            print(
-                '\n[本地后验评分] 拒绝：test.csv 不含预测日之后的未来标签；'
-                '仅完成工件与资金约束验证。'
+        selected, prediction_date = _load_prediction_result()
+        requested = os.environ.get('HISTORICAL_SCORE_DATE')
+        if requested:
+            requested_date = pd.Timestamp(requested)
+            if prediction_date != requested_date:
+                raise ValueError(
+                    f'HISTORICAL_SCORE_DATE={requested_date.date()} 与推理日期 '
+                    f'{prediction_date.date()} 不一致'
+                )
+            source_path = os.path.join(config['data_path'], 'train.csv')
+            prices = pd.read_csv(source_path, dtype={'股票代码': str})
+            realized, entry_date, exit_date = _official_open_window(
+                prices, prediction_date, strict_calendar=True,
             )
-            return
-        returns = (
-            test.sort_values("日期")
-            .groupby("股票代码", sort=False)["开盘"]
-            .agg(lambda prices: prices.iloc[-1] / prices.iloc[0] - 1.0)
-            .rename("return")
-        )
-        stock_names = load_stock_names(config["data_path"])
+            audit_path = os.path.join(
+                model_output_dir(),
+                f'historical_score_{prediction_date:%Y-%m-%d}.json',
+            )
+        else:
+            source_path = os.path.join(config['data_path'], 'test.csv')
+            if not os.path.exists(source_path):
+                print('\n[本地后验评分] 未找到 test.csv；未来行情未知，仅完成工件与资金约束验证。')
+                return
+            prices = pd.read_csv(source_path, dtype={'股票代码': str})
+            realized, entry_date, exit_date = _official_open_window(
+                prices, prediction_date, strict_calendar=False,
+            )
+            audit_path = None
 
-        selected = result.merge(returns, left_on="stock_id", right_index=True, how="left")
-        if selected["return"].isna().any():
-            missing = ", ".join(selected.loc[selected["return"].isna(), "stock_id"])
-            raise ValueError(f"测试集缺少预测股票: {missing}")
-
-        gross_exposure = float(selected["weight"].sum())
-        portfolio_return = float((selected["weight"] * selected["return"]).sum())
+        stock_names = load_stock_names(config['data_path'])
+        selected = selected.merge(realized, on='stock_id', how='left')
+        if selected[['entry_open', 'exit_open', 'return']].isna().any().any():
+            missing = ', '.join(selected.loc[selected['return'].isna(), 'stock_id'])
+            raise ValueError(f'官方收益窗口缺少预测股票: {missing}')
+        returns = realized.set_index('stock_id')['return']
+        gross_exposure = float(selected['weight'].sum())
+        portfolio_return = float((selected['weight'] * selected['return']).sum())
         universe_return = float(returns.mean()) * gross_exposure
-        oracle_top5_return = float(returns.nlargest(5).mean()) * gross_exposure
-        start_date = test["日期"].min().date()
-        end_date = test["日期"].max().date()
+        oracle_single = float(returns.max()) * gross_exposure
+        oracle_top5 = float(returns.nlargest(min(5, len(returns))).mean()) * gross_exposure
 
-        print(f"\n[本地后验评分：{start_date} ~ {end_date}]")
-        print(
-            f"模型组合收益: {_pct(portfolio_return)} "
-            f"(股票 {gross_exposure:.2%}, 现金 {1.0 - gross_exposure:.2%})"
-        )
-        print_portfolio_return_breakdown(
-            selected,
-            returns,
-            gross_exposure,
-            stock_names,
-        )
-        print(f"基线—全股票等权: {_pct(universe_return)}")
-        print(f"基线—现金: {_pct(0.0)}")
-        print(f"事后上界—全池 Top-5 等权: {_pct(oracle_top5_return)}")
-        print(f"相对全股票等权超额: {_pct(portfolio_return - universe_return)}")
-    except (KeyError, ValueError, TypeError, pd.errors.ParserError) as error:
-        print(f"\n[本地后验评分] 无法计算: {error}")
+        print(f'\n[官方口径后验评分：{prediction_date.date()} → {entry_date.date()} 开盘买入，{exit_date.date()} 开盘卖出]')
+        print(f'模型组合收益: {_pct(portfolio_return)} (股票 {gross_exposure:.2%}, 现金 {1.0 - gross_exposure:.2%})')
+        print_portfolio_return_breakdown(selected, returns, gross_exposure, stock_names)
+        print(f'基线—全股票等权: {_pct(universe_return)}')
+        print(f'严格事后最优（单股全仓）: {_pct(oracle_single)}；模型差距 {_pct(portfolio_return - oracle_single)}')
+        print(f'可比 oracle（全池 Top-5 等权）: {_pct(oracle_top5)}；模型差距 {_pct(portfolio_return - oracle_top5)}')
+
+        if audit_path is not None:
+            with open(os.path.join(prediction_output_dir(), 'result.csv'), 'rb') as handle:
+                result_hash = hashlib.sha256(handle.read()).hexdigest()
+            with open(source_path, 'rb') as handle:
+                source_hash = hashlib.sha256(handle.read()).hexdigest()
+            with open(os.path.join(model_output_dir(), 'ensemble_policy.json'), 'rb') as handle:
+                policy_hash = hashlib.sha256(handle.read()).hexdigest()
+            _write_historical_audit(audit_path, {
+                'protocol': 'official_t_plus_1_open_to_t_plus_5_open',
+                'prediction_date': prediction_date.strftime('%Y-%m-%d'),
+                'entry_date': entry_date.strftime('%Y-%m-%d'),
+                'exit_date': exit_date.strftime('%Y-%m-%d'),
+                'official_window_valid': True,
+                'result_sha256': result_hash,
+                'source_data_sha256': source_hash,
+                'policy_sha256': policy_hash,
+                'portfolio_return': portfolio_return,
+                'oracle_single_all_in_return': oracle_single,
+                'oracle_top5_equal_return': oracle_top5,
+                'holdings': selected.to_dict(orient='records'),
+            })
+            print(f'历史审计已写入: {audit_path}')
+    except (FileExistsError, FileNotFoundError, KeyError, ValueError, TypeError, pd.errors.ParserError) as error:
+        print(f'\n[本地后验评分] 拒绝：{error}')
 
 
 if __name__ == "__main__":

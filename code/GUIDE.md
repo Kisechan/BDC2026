@@ -49,7 +49,7 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v1.20 训练独立的 205维 `158+39_reduced25_relmarket12_risk15_indresid12` RankGLU
+当前 v1.20.1 训练独立的 205维 `158+39_reduced25_relmarket12_risk15_indresid12` RankGLU
 Transformer 和近期窗口 `rank_xendcg` LightGBM，不复用或覆盖 v1.17/v1.19 工件。除五年行情外，需准备
 `data_5y/stock_industry_history.csv`，其中必须包含 `effective_date,stock_id,industry`；特征只使用
 预测日期当日或之前的行业快照。运行 `./train.sh` 后，模型工件根目录必须同时保留 `config.json`、
@@ -61,12 +61,12 @@ Transformer 和近期窗口 `rank_xendcg` LightGBM，不复用或覆盖 v1.17/v1
 不得把 v1.16 的193维或旧 MLP score-head 工件接入 v1.20。
 旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
 
-在 `code/` 目录执行 `./train.sh` 开始 v1.20 单种子三折训练和全开发期重训。树模型每折和全开发期
+在 `code/` 目录执行 `./train.sh` 开始 v1.20.1 单种子三折训练和全开发期重训。树模型每折和全开发期
 重训都只使用最近 504 个交易日；主选股固定为纯 `rank_xendcg` LightGBM，禁止中间融合搜索。原始
-Top-10 会按预测日 as-of 行业标签贪心选出 Top-5（每行业最多两只），选不满则回退原始 Top-5。
-风险惩罚、反转、相关性策略和相关簇替换固定关闭；Allocation 保留 Head 25%，Exposure 保留 Head
-25%，其余 Exposure 使用近满仓 fallback。训练完成后查看 `promotion_criteria.passed`：除均值、折级
-收益、P10 和 Rank IC 外，最差单日和最大回撤也必须满足 10bp 护栏。
+LightGBM 使用官方 T+1 开盘至 T+5 开盘的绝对收益做日期内 `rank_xendcg` relevance，固定原始
+Top-5、每只等权和近满仓。行业约束、风险、Allocation 与 Exposure 调整均关闭；辅助 Head 仍保留训练
+诊断。训练完成后查看 `promotion_criteria.passed`：平均收益、折级收益、P10 和 Rank IC 必须满足门槛；
+最大回撤只作诊断。
 
 v1.19 已消费 2026-06-01～2026-07-29，v1.20 只能将其作为一次性压力诊断，且不会训练模型：
 
@@ -87,9 +87,19 @@ LOCKBOX_EVAL=1 ./train.sh
 V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh
 ```
 
-最终重训会复用锁箱前冻结的候选策略、LightGBM 中位迭代数和四阶段 epoch，不重新执行 OOF 或策略标定，
-并写入独立 `v1.20_full_history_deployment` 目录。之后运行 `./test.sh` 做工件、推理、股票唯一性和
-资金约束验证；若 `test.csv` 最大日期不晚于预测日，报告会明确拒绝计算本地后验收益。
+最终重训会复用锁箱前冻结的候选策略、LightGBM 中位迭代数和四阶段 epoch，不重新执行 OOF 或策略标定。
+`test.sh` 只在具有完整未来五日开盘价时计算官方收益；输出股票名称、逐股收益、严格单股最优和 Top-5
+等权 oracle。7 月 30/31 数据到齐后，先执行一次不可用于调参的历史审计：
+
+```bash
+HISTORICAL_SCORE_DATE=2026-07-24 ./test.sh
+```
+
+审计完成且 candidate 晋级后，最终提交拟合只能执行一次：
+
+```bash
+FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh
+```
 
 成功完成训练
 

@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'threefold_recent504_rankxendcg_indcap_v20'
+experiment_name = 'threefold_recent504_rankxendcg_officialraw_v20_1'
 # v1.20 从独立目录训练 RankGLU；仅 v1.17 基线用于三折晋级对照，
 # 不把不同 score head 的 checkpoint、scaler 或 manifest 混用。
 artifact_experiment_name = (
@@ -82,7 +82,8 @@ config = {
     # 排序主干输出原始分数；风险惩罚强度只用 OOF 网格校准。
     'risk_penalty_scale': 0.0,
     'oof_risk_penalty_enabled': True,
-    # v1.20 收益优先：这些可选风险/相关模块固定关闭，不再搜索。
+    # v1.20.1 按赛事的五日开盘到开盘绝对收益最大化：可选风险/相关
+    # 模块固定关闭，不参与任何搜索。
     'risk_score_penalty_grid': [0.0],
     'risk_1d_target_temperature': 0.01,
     'risk_3d_target_temperature': 0.02,
@@ -112,14 +113,14 @@ config = {
     'exposure_risk_penalty_init': 0.25,
     'min_exposure': 0.20,
     'max_exposure': 0.999999,
-    'allocation_blend_grid': [0.25],
+    'allocation_blend_grid': [0.0],
     'allocation_weight_floor': 0.05,
     'allocation_weight_cap': 0.35,
     'disagreement_gamma_grid': [0.0],
     'selection_risk_gamma_grid': [0.0],
     'correlation_exposure_gamma_grid': [0.0],
-    # Exposure Head 必须保留；OOF 只校准其相对固定基线的占比。
-    'exposure_head_blend_grid': [0.25],
+    # 比赛现金收益为零；v1.20.1 固定等权近满仓，不让辅助头改变提交。
+    'exposure_head_blend_grid': [0.0],
     'selection_candidate_k': 30,
     'selection_risk_lookback': 60,
     'selection_correlation_lookbacks': [20, 60],
@@ -129,10 +130,12 @@ config = {
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
     'lgbm_enabled': True,
-    # v1.20 的主选股固定为近期窗口 rank_xendcg；不搜索模型融合权重。
+    # 主选股固定为近期窗口 rank_xendcg；relevance 直接来自赛事官方
+    # T+1 开盘至 T+5 开盘绝对收益，而非行业中性辅助标签。
     'lgbm_blend_grid': [1.0],
     'lgbm_objective': 'rank_xendcg',
     'lgbm_relevance_levels': 10,
+    'lgbm_target_column': 'label',
     'lgbm_learning_rate': 0.03,
     'lgbm_num_leaves': 31,
     'lgbm_min_child_samples': 80,
@@ -144,8 +147,8 @@ config = {
     'lgbm_n_jobs': -1,
     # 只限制树模型的训练日期，Transformer 仍按既有 504 日半衰期使用开发期。
     'lgbm_train_window_days': 504,
-    # 原始 Top-10 内最多保留同一行业两只；缺行业快照的股票不受约束。
-    'industry_cap_enabled': True,
+    # 行业约束在 v1.20 OOF 中拖累官方收益；v1.20.1 固定原始 Top-5。
+    'industry_cap_enabled': False,
     'max_stocks_per_industry': 2,
     'industry_candidate_k': 10,
     'nested_oof_enabled': True,
@@ -156,8 +159,8 @@ config = {
     'module_min_positive_fold_fraction': 2 / 3,
     'forward_module_max_fold_loss': 0.0025,
     'forward_module_max_p10_loss': 0.005,
-    'minimum_allocation_deployment_blend': 0.25,
-    'minimum_exposure_deployment_blend': 0.25,
+    'minimum_allocation_deployment_blend': 0.0,
+    'minimum_exposure_deployment_blend': 0.0,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
@@ -207,7 +210,7 @@ config = {
     'promotion_id_top5_overlap': 0.40,
     'promotion_min_exposure_std': 0.01,
     'promotion_min_regime_gate_std': 0.01,
-    # Exposure Head 始终占 25%，其余为近满仓收益优先 fallback。
+    # 固定纯 LGBM Top-5、等权与近满仓；辅助 Head 仍训练用于诊断。
     'fixed_exposure_baseline': 0.999999,
     'score_head_variant': 'rankglu_v1',
     'rankglu_bottleneck': 32,
@@ -235,7 +238,10 @@ config = {
         'threefold_industryresidual_lgbmblend_pathrisk_v17_baseline'
     ),
     'full_deployment_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.20_full_history_deployment'
+        f'./model/{sequence_length}_{feature_num}_v1.20.1_full_history_deployment'
+    ),
+    'final_submission_output_dir': (
+        f'./model/{sequence_length}_{feature_num}_v1.20.1_submission_2026-07-31'
     ),
     # v1.19 已消费这段压力期；它只能做诊断，不能充当 v1.20 新锁箱。
     'known_stress_start': '2026-06-01',

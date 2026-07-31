@@ -3682,7 +3682,9 @@ def calibrate_module_gated_policy(
         },
     }
 
-    minimum_allocation_blend = _MODULE_POLICY_FIELDS['allocation'][1]
+    minimum_allocation_blend = float(calibration_kwargs.get(
+        'minimum_allocation_blend', _MODULE_POLICY_FIELDS['allocation'][1],
+    ))
     allocation_grid = sorted({
         max(minimum_allocation_blend, float(value))
         for value in calibration_kwargs.get(
@@ -3743,7 +3745,9 @@ def calibrate_module_gated_policy(
         'module_gate': module_eligibility['allocation'],
     }
 
-    minimum_exposure_blend = _MODULE_POLICY_FIELDS['exposure_head'][1]
+    minimum_exposure_blend = float(calibration_kwargs.get(
+        'minimum_exposure_blend', _MODULE_POLICY_FIELDS['exposure_head'][1],
+    ))
     exposure_blend_grid = sorted({
         max(minimum_exposure_blend, float(value))
         for value in calibration_kwargs.get(
@@ -3788,6 +3792,8 @@ def calibrate_module_gated_policy(
     })
     for module in ('exposure_head', 'correlation_exposure'):
         field, fallback = _MODULE_POLICY_FIELDS[module]
+        if module == 'exposure_head':
+            fallback = minimum_exposure_blend
         if policy[field] == fallback:
             module_eligibility[module] = {
                 'enabled': False,

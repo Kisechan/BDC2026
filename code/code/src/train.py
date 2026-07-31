@@ -208,6 +208,9 @@ def apply_v17_profile():
     if os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1':
         # 最终部署训练是一次性例外；其目录永远不能覆盖策略重放或开发期 OOF。
         config['output_dir'] = config['full_deployment_output_dir']
+    if os.environ.get('FINAL_SUBMISSION_FIT', '0') == '1':
+        # 比赛提交拟合是单独的、显式日期绑定的工件，绝不覆盖开发期候选。
+        config['output_dir'] = config['final_submission_output_dir']
     return profile
 
 
@@ -215,6 +218,9 @@ def split_v17_lockbox(df):
     """冻结最后 N 个自然月；开发期之外的数据不参与训练或选型。"""
     dated = df.copy()
     dated['日期'] = pd.to_datetime(dated['日期'])
+    if os.environ.get('FINAL_SUBMISSION_FIT', '0') == '1':
+        print('阶段 最终提交拟合：使用截至指定日期的全部已知历史，不执行 OOF 或策略标定')
+        return dated, None
     if os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1':
         if os.environ.get('LOCKBOX_ACCEPTED', '0') != '1':
             raise ValueError('仅在锁箱验收后设置 LOCKBOX_ACCEPTED=1 才可纳入最终重训')
@@ -258,7 +264,7 @@ def lockbox_return_stats(returns):
 
 
 def lockbox_realized_return(result_path, raw, entry_date, exit_date):
-    """以 t+1 开盘买入、t+5 收盘卖出评估单日锁箱持仓。"""
+    """按赛事口径以 t+1 开盘买入、t+5 开盘卖出评估单日持仓。"""
     holdings = pd.read_csv(result_path, dtype={'stock_id': str})
     required = {'stock_id', 'weight'}
     if not required.issubset(holdings):
@@ -271,15 +277,22 @@ def lockbox_realized_return(result_path, raw, entry_date, exit_date):
         or weights.sum() > 1.0 + 1e-9
     ):
         raise ValueError(f'锁箱预测违反 Top-5/资金约束: {result_path}')
-    entry = raw.loc[raw['日期'] == entry_date, ['股票代码', '开盘']].copy()
-    exit_prices = raw.loc[raw['日期'] == exit_date, ['股票代码', '收盘']].copy()
+    entry = raw.loc[raw['日期'] == entry_date, ['股票代码', '开盘']].rename(
+        columns={'开盘': 'entry_open'},
+    )
+    exit_prices = raw.loc[raw['日期'] == exit_date, ['股票代码', '开盘']].rename(
+        columns={'开盘': 'exit_open'},
+    )
     prices = entry.merge(exit_prices, on='股票代码', how='inner').set_index('股票代码')
     prices = prices.reindex(holdings['stock_id'])
-    if prices.isna().any().any() or (prices['开盘'] <= 0).any():
+    if prices.isna().any().any() or (prices['entry_open'] <= 0).any():
         raise ValueError(
-            f'锁箱缺少 {entry_date.date()} 开盘或 {exit_date.date()} 收盘价格'
+            f'锁箱缺少 {entry_date.date()} 或 {exit_date.date()} 的开盘价格'
         )
-    realized = prices['收盘'].to_numpy(dtype=np.float64) / prices['开盘'].to_numpy(dtype=np.float64) - 1.0
+    realized = (
+        prices['exit_open'].to_numpy(dtype=np.float64)
+        / prices['entry_open'].to_numpy(dtype=np.float64) - 1.0
+    )
     return float(np.dot(weights, realized)), {
         'stocks': holdings['stock_id'].tolist(),
         'weights': [float(weight) for weight in weights],
@@ -446,8 +459,8 @@ def run_lockbox_eval(output_dir, stress=False):
     )
     report = {
         'protocol': (
-            'v1.20_observed_stress_t_plus_1_open_to_t_plus_5_close_stride_5'
-            if stress else 'v1.20_fresh_lockbox_t_plus_1_open_to_t_plus_5_close_stride_5'
+            'v1.20.1_observed_stress_t_plus_1_open_to_t_plus_5_open_stride_5'
+            if stress else 'v1.20.1_fresh_lockbox_t_plus_1_open_to_t_plus_5_open_stride_5'
         ),
         'lockbox_start': lockbox_start.strftime('%Y-%m-%d'),
         'lockbox_end': (
@@ -499,8 +512,44 @@ def require_accepted_lockbox_for_deployment():
         raise ValueError('最终部署只接受 2026-07-29 之后的新锁箱报告')
 
 
-def run_frozen_final_deployment(output_dir):
-    """用新锁箱前已冻结的策略和轮数作全历史重训，绝不再做 OOF 选型。"""
+def require_final_submission_audit():
+    """最终比赛拟合只允许在冻结 candidate 通过并完成历史审计后执行一次。"""
+    requested = os.environ.get('FINAL_SUBMISSION_DATE', '').strip()
+    if not requested:
+        raise ValueError('FINAL_SUBMISSION_FIT=1 需要 FINAL_SUBMISSION_DATE=YYYY-MM-DD')
+    submission_date = pd.Timestamp(requested)
+    expected = pd.Timestamp('2026-07-31')
+    if submission_date != expected:
+        raise ValueError(
+            f'v1.20.1 最终提交日期固定为 {expected.date()}，当前为 {submission_date.date()}'
+        )
+    candidate_dir = (
+        f"./model/{config['sequence_length']}_{config['feature_num']}_"
+        f"{config['experiment_name']}_candidate"
+    )
+    policy_path = os.path.join(candidate_dir, 'ensemble_policy.json')
+    audit_path = os.path.join(candidate_dir, 'historical_score_2026-07-24.json')
+    for path, label in ((policy_path, '冻结 candidate 策略'), (audit_path, '7月24日历史审计')):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'最终提交拟合缺少{label}: {path}')
+    with open(policy_path, encoding='utf-8') as handle:
+        policy = json.load(handle)
+    if not policy.get('promotion_criteria', {}).get('passed', False):
+        raise ValueError('v1.20.1 candidate 未通过三折晋级，禁止最终提交拟合')
+    with open(audit_path, encoding='utf-8') as handle:
+        audit = json.load(handle)
+    if audit.get('prediction_date') != '2026-07-24' or not audit.get('official_window_valid'):
+        raise ValueError('历史审计不是完整的 2026-07-24 官方五日开盘收益')
+    if audit.get('policy_sha256') != sha256_file(policy_path):
+        raise ValueError('历史审计与当前冻结 candidate 策略不匹配')
+    if os.path.exists(config['final_submission_output_dir']):
+        raise FileExistsError(
+            f'最终提交目录已存在，拒绝覆盖: {config["final_submission_output_dir"]}'
+        )
+
+
+def run_frozen_final_deployment(output_dir, submission_date=None):
+    """用冻结策略和轮数作全历史重训，绝不再做 OOF 选型。"""
     candidate_dir = (
         f"./model/{config['sequence_length']}_{config['feature_num']}_"
         f"{config['experiment_name']}_candidate"
@@ -544,6 +593,14 @@ def run_frozen_final_deployment(output_dir):
     data_file = os.path.join(config['data_path'], 'train.csv')
     full_df = pd.read_csv(data_file, dtype={'股票代码': str})
     full_df['股票代码'] = full_df['股票代码'].astype(str).str.zfill(6)
+    full_df['日期'] = pd.to_datetime(full_df['日期'])
+    if submission_date is not None:
+        submission_date = pd.Timestamp(submission_date)
+        if full_df['日期'].max() != submission_date:
+            raise ValueError(
+                'FINAL_SUBMISSION_DATE 必须等于当前数据最后一个交易日，'
+                f'当前为 {full_df["日期"].max().date()}'
+            )
     stockid2idx = {
         stock_id: index + 2
         for index, stock_id in enumerate(sorted(full_df['股票代码'].unique()))
@@ -572,7 +629,11 @@ def run_frozen_final_deployment(output_dir):
         full_data, features, source_lgbm_folds, output_dir,
     )
     policy.update({
-        'policy_role': 'frozen_v1.20_policy_full_history_retrained',
+        'policy_role': (
+            'frozen_v1.20.1_submission_policy_full_history_retrained'
+            if submission_date is not None
+            else 'frozen_v1.20_policy_full_history_retrained'
+        ),
         'model_paths': [os.path.join(f"seed_{int(config['seed'])}", 'best_model.pth')],
         'ensemble_enabled': False,
         'ensemble_seeds': [int(config['seed'])],
@@ -592,8 +653,15 @@ def run_frozen_final_deployment(output_dir):
             'source_dir': os.path.relpath(candidate_dir, output_dir),
             'source_policy_sha256': sha256_file(source_policy_path),
             'source_summary_sha256': sha256_file(source_summary_path),
-            'lockbox_report_sha256': sha256_file(os.path.join(candidate_dir, 'lockbox_report.json')),
+            'lockbox_report_sha256': (
+                sha256_file(os.path.join(candidate_dir, 'lockbox_report.json'))
+                if submission_date is None else None
+            ),
             'recalibrated_on_lockbox': False,
+            'submission_date': (
+                None if submission_date is None
+                else submission_date.strftime('%Y-%m-%d')
+            ),
         },
     })
     with open(os.path.join(output_dir, 'cross_validation_summary.json'), 'w', encoding='utf-8') as handle:
@@ -624,15 +692,18 @@ def write_v17_manifest(output_dir, features, folds, lockbox_start, stock_count):
         json.dump(manifest, file, indent=2, ensure_ascii=False)
 
 
-def lgbm_relevance_labels(frame):
-    """将每日行业中性收益排序映射为固定档位的日期内 relevance。"""
+def lgbm_relevance_labels(frame, target_column=None):
+    """将赛事目标收益按交易日排序映射为固定档位 relevance。"""
+    target_column = target_column or config.get('lgbm_target_column', 'label')
+    if target_column not in frame:
+        raise ValueError(f'LightGBM relevance 缺少目标列: {target_column}')
     levels = int(config.get('lgbm_relevance_levels', 31))
     if levels < 2:
         raise ValueError('lgbm_relevance_levels 必须至少为2')
-    ranks = frame.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].rank(
+    ranks = frame.groupby('日期', sort=False)[target_column].rank(
         method='first', ascending=True,
     ).sub(1)
-    group_sizes = frame.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].transform('size')
+    group_sizes = frame.groupby('日期', sort=False)[target_column].transform('size')
     return np.floor(ranks * levels / group_sizes).clip(
         0, levels - 1,
     ).astype(np.int32)
@@ -817,8 +888,9 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
         from lightgbm import LGBMRanker, early_stopping
     except ImportError as exc:
         raise RuntimeError('v1.20 需要 lightgbm；请在 code 目录运行 uv sync') from exc
-    if INDUSTRY_NEUTRAL_TARGET not in data:
-        raise ValueError('LightGBM 需要行业中性标签')
+    target_column = str(config.get('lgbm_target_column', 'label'))
+    if target_column not in data:
+        raise ValueError(f'LightGBM 需要目标列: {target_column}')
     results = []
     lgbm_dir = os.path.join(output_dir, 'lgbm')
     os.makedirs(lgbm_dir, exist_ok=True)
@@ -846,8 +918,8 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
             validate_lgbm_checkpoint(model, features, checkpoint_path)
             print(f"恢复 LightGBM Fold {fold['fold']} checkpoint")
         else:
-            train_labels = lgbm_relevance_labels(train)
-            valid_labels = lgbm_relevance_labels(valid)
+            train_labels = lgbm_relevance_labels(train, target_column)
+            valid_labels = lgbm_relevance_labels(valid, target_column)
             print(
                 f"阶段 LightGBM：Fold {fold['fold']}，近期 {window_days} 日 "
                 f"({pd.Timestamp(train_dates[0]).date()} ~ {pd.Timestamp(train_dates[-1]).date()})，"
@@ -916,7 +988,9 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         data, data['日期'].max(), window_days,
     )
     groups = data.groupby('日期', sort=False).size().to_numpy()
-    labels = lgbm_relevance_labels(data)
+    labels = lgbm_relevance_labels(
+        data, str(config.get('lgbm_target_column', 'label')),
+    )
     model = LGBMRanker(
         objective=config.get('lgbm_objective', 'lambdarank'), learning_rate=config['lgbm_learning_rate'],
         n_estimators=iterations, num_leaves=config['lgbm_num_leaves'],
@@ -1131,7 +1205,7 @@ def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_fo
 
 
 def promotion_against_baseline(metrics, baseline_metrics):
-    """v1.20 的唯一晋级门槛：收益增益和逐日/回撤 10bp 护栏。"""
+    """v1.20.1 晋级门槛：官方收益优先，回撤仅保留诊断。"""
     tolerance = 1e-12
     def max_drawdown(source):
         if 'max_drawdown' in source:
@@ -1188,12 +1262,6 @@ def promotion_against_baseline(metrics, baseline_metrics):
         'worst_fold_not_worse_than_10bp': (
             deltas['worst_fold_weighted_portfolio_return'] >= -0.001 - tolerance
         ),
-        'worst_day_not_worse_than_10bp': (
-            deltas['worst_weighted_portfolio_return'] >= -0.001 - tolerance
-        ),
-        'max_drawdown_not_worse_than_10bp': (
-            deltas['max_drawdown'] >= -0.001 - tolerance
-        ),
         'rank_ic_not_worse_than_0_005': (
             deltas['mean_rank_ic'] >= -0.005 - tolerance
         ),
@@ -1204,8 +1272,8 @@ def promotion_against_baseline(metrics, baseline_metrics):
     }
 
 
-def calibrate_v20_recent_lgbm_candidate(ensemble_days, calibration_kwargs):
-    """v1.20 的唯一预注册选股：近期 504 日 rank_xendcg，不做模型融合。"""
+def calibrate_v20_1_official_raw_candidate(ensemble_days, calibration_kwargs):
+    """v1.20.1 的唯一预注册选股：官方原始收益纯 LightGBM。"""
     replay = forward_fit_module_gated_policy(
         fuse_lgbm_scores(ensemble_days, 1.0),
         forward_module_max_fold_loss=float(config.get(
@@ -1218,7 +1286,7 @@ def calibrate_v20_recent_lgbm_candidate(ensemble_days, calibration_kwargs):
     )
     policy = dict(replay['robust_deployment_policy'])
     policy.update({
-        'candidate_name': 'recent504_rankxendcg_lgbm_indcap',
+        'candidate_name': 'recent504_rankxendcg_lgbm_officialraw_equal',
         'lgbm_weight': 1.0,
         'pre_registered': True,
     })
@@ -4902,9 +4970,18 @@ def main():
         os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1'
         and os.environ.get('LOCKBOX_ACCEPTED', '0') == '1'
     )
+    final_submission = os.environ.get('FINAL_SUBMISSION_FIT', '0') == '1'
+    if final_deployment and final_submission:
+        raise ValueError('最终部署重训与 FINAL_SUBMISSION_FIT 不能同时启用')
     if final_deployment:
         require_accepted_lockbox_for_deployment()
         return run_frozen_final_deployment(config['output_dir'])
+    if final_submission:
+        require_final_submission_audit()
+        return run_frozen_final_deployment(
+            config['output_dir'],
+            submission_date=os.environ['FINAL_SUBMISSION_DATE'],
+        )
     if config.get('policy_only_experiment', False) and not final_deployment:
         raise ValueError(
             '当前配置是策略重放实验，不允许重新训练；'
@@ -5099,6 +5176,9 @@ def main():
             'allocation_blend_grid',
             [0.0, 0.25, 0.5, 0.75, 1.0],
         ),
+        minimum_allocation_blend=float(config.get(
+            'minimum_allocation_deployment_blend', 0.25,
+        )),
         disagreement_gamma_grid=(
             config.get(
                 'disagreement_gamma_grid',
@@ -5126,6 +5206,9 @@ def main():
             'exposure_head_blend_grid',
             [1.0],
         ),
+        minimum_exposure_blend=float(config.get(
+            'minimum_exposure_deployment_blend', 0.25,
+        )),
         selection_candidate_k=int(config.get(
             'selection_candidate_k',
             20,
@@ -5175,8 +5258,8 @@ def main():
         else:
             print('OOF 策略校准 checkpoint 与当前工件不匹配，将重新校准')
     if calibration is None:
-        print('阶段 OOF 策略校准：固定近期 504 日纯 LightGBM + 行业最多两只')
-        candidate = calibrate_v20_recent_lgbm_candidate(
+        print('阶段 OOF 策略校准：固定近期 504 日官方原始收益纯 LightGBM 等权')
+        candidate = calibrate_v20_1_official_raw_candidate(
             ensemble_days, policy_calibration_kwargs,
         )
         calibration = {'candidate': candidate}
@@ -5294,7 +5377,10 @@ def main():
         'lgbm_model_path': lgbm_model_path,
         'lgbm_weight': deployment_lgbm_weight,
         'lgbm_train_window_days': int(config['lgbm_train_window_days']),
-        'max_stocks_per_industry': int(config['max_stocks_per_industry']),
+        'max_stocks_per_industry': (
+            int(config['max_stocks_per_industry'])
+            if config.get('industry_cap_enabled', False) else None
+        ),
         'industry_candidate_k': int(config['industry_candidate_k']),
         'pre_registered_candidates': {
             selected_name: {

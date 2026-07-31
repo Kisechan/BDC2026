@@ -27,7 +27,7 @@
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
 
-### v1.20 近期窗口 RankXENDCG + 行业分散
+### v1.20.1 官方开盘收益 + 原始收益选股
 
 当前实验 `threefold_recent504_rankxendcg_indcap_v20` 保持 205 维
 `158+39_reduced25_relmarket12_risk15_indresid12` 输入、单种子 42、三折和 5 日 purge。
@@ -35,15 +35,13 @@ Transformer 仅将排序头替换为 RankGLU：`LayerNorm → Linear` 的基础�
 的 GLU 残差；可学习 `gamma` 经 `0.5*tanh()` 限制在 `[-0.5, 0.5]`。manifest 会记录
 `score_head_variant=rankglu_v1`、bottleneck 和上界，推理拒绝旧 MLP checkpoint。
 
-LightGBM 使用 `rank_xendcg`，每个交易日一个 query group，五日行业中性收益固定离散成 10 档
-relevance；每个验证折只使用 `train_end` 前最后 **504 个交易日**，全开发期树模型也使用最后
-504 个开发交易日。选股固定为纯 LightGBM（权重 1.0），不搜索融合权重。原始 Top-10 按行业
-as-of 标签贪心选择 Top-5，每行业最多两只；无法选满时完整回退原始 Top-5，行业名称不输入模型。
-Allocation 固定为 Head 25% + 等权 75%，Exposure 固定为 Head 25% + `0.999999` fallback 75%；
-风险惩罚、反转、相关性降仓和相关簇替换均关闭。
+LightGBM 使用 `rank_xendcg`，每个交易日一个 query group，并将赛事官方的五日绝对收益
+`(open_t5-open_t1)/open_t1` 固定离散成 10 档 relevance；每个验证折只使用 `train_end` 前最后
+**504 个交易日**，全开发期树模型也使用最后 504 个开发交易日。选股固定为纯 LightGBM、原始
+Top-5、等权与近满仓；行业约束、Allocation、Exposure、风险惩罚、反转和相关性调整均关闭。
 
-候选相对冻结 v1.17 三折 baseline 的晋级条件为：动态组合平均收益至少 +10bp、至少两折正增益、
-P10、最差折、最差单日和最大回撤均不差于 -10bp、平均 Rank IC 不低于 -0.005。
+候选相对冻结 v1.17 三折 baseline 的晋级条件为：官方口径组合平均收益至少 +10bp、至少两折正增益、
+P10 与最差折均不差于 -10bp、平均 Rank IC 不低于 -0.005；最差单日和最大回撤只作诊断。
 `cross_validation_summary.json` 还会写入行业约束的收益差/集中度，以及按每折训练期中位数划分的四类
 市场状态诊断；这些状态不参与选型。`test.csv` 若不含预测日之后的价格会被硬拒绝，不作为收益结论。
 
@@ -264,7 +262,7 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 训练当前 v1.20 工件（RankGLU、近期504日 `rank_xendcg`、行业最多两只、205维 manifest、Scaler 和 checkpoint）
+3) 训练当前 v1.20.1 工件（RankGLU、近期504日官方绝对收益 `rank_xendcg`、205维 manifest、Scaler 和 checkpoint）
 
 ```
 ./train.sh
@@ -275,13 +273,25 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 只能用 `STRESS_EVAL=1 ./train.sh` 写入压力诊断，不能授权部署。新的最后两自然月数据到来后，
 `LOCKBOX_EVAL=1 ./train.sh` 才可产生可授权的 `lockbox_report.json`；通过后才可运行
 `V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh`。最终重训始终写入独立
-`v1.20_full_history_deployment` 目录，并复用新锁箱前冻结的策略、epoch 与 LightGBM 迭代数，不再执行
+`v1.20.1_full_history_deployment` 目录，并复用新锁箱前冻结的策略、epoch 与 LightGBM 迭代数，不再执行
 OOF 或策略标定；禁止据此再调参。
 
 4) 生成预测结果
 
 ```
 ./test.sh
+```
+
+数据补齐至 2026-07-31 后，先运行不可用于调参的官方口径审计：
+
+```
+HISTORICAL_SCORE_DATE=2026-07-24 ./test.sh
+```
+
+candidate 晋级且审计完成后，可执行一次截至 7 月 31 日的最终提交拟合：
+
+```
+FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh
 ```
 
 ---
