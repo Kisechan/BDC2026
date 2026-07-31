@@ -31,6 +31,7 @@ import os
 import json
 import multiprocessing as mp
 import random
+import time
 
 
 def policy_only_enabled():
@@ -1222,7 +1223,14 @@ class RankingDataset(torch.utils.data.Dataset):
         regime_targets=None,
         industry_indices=None,
     ):
-        self.sequences = sequences
+        self.sequences = [
+            np.require(
+                sequence,
+                dtype=np.float32,
+                requirements=('C', 'W'),
+            )
+            for sequence in sequences
+        ]
         self.targets = targets
         self.relevance_scores = relevance_scores
         self.stock_indices = stock_indices
@@ -1288,12 +1296,9 @@ class RankingDataset(torch.utils.data.Dataset):
     
     def __len__(self):
         return len(self.sequences)
-    
-    def __getitem__(self, idx):
-        return {
-            'sequences': torch.from_numpy(
-                np.array(self.sequences[idx], dtype=np.float32, copy=True)
-            ),
+
+    def get_item(self, idx, include_sequence=True):
+        item = {
             'targets': torch.from_numpy(
                 np.array(self.targets[idx], dtype=np.float32, copy=True)
             ),
@@ -1334,6 +1339,12 @@ class RankingDataset(torch.utils.data.Dataset):
                 dtype=torch.float32,
             ),
         }
+        if include_sequence:
+            item['sequences'] = torch.from_numpy(self.sequences[idx])
+        return item
+
+    def __getitem__(self, idx):
+        return self.get_item(idx, include_sequence=True)
 
 
 class FrozenBackboneDataset(torch.utils.data.Dataset):
@@ -1348,7 +1359,17 @@ class FrozenBackboneDataset(torch.utils.data.Dataset):
         return len(self.base_dataset)
 
     def __getitem__(self, index):
-        item = dict(self.base_dataset[index])
+        if isinstance(self.base_dataset, Subset):
+            source_index = self.base_dataset.indices[index]
+            item = self.base_dataset.dataset.get_item(
+                source_index,
+                include_sequence=False,
+            )
+        else:
+            item = self.base_dataset.get_item(
+                index,
+                include_sequence=False,
+            )
         item.update(self.cached_samples[index])
         return item
 
@@ -1357,6 +1378,7 @@ def cache_frozen_backbone_dataset(model, dataset, device):
     """一次性缓存已冻结的主干输出，避免后三个阶段重复 Transformer 前向。"""
     if not config.get('cache_frozen_backbone', True):
         return dataset
+    started_at = time.perf_counter()
     cache_loader = build_data_loader(dataset, False, device)
     cached_samples = []
     model.eval()
@@ -1386,11 +1408,21 @@ def cache_frozen_backbone_dataset(model, dataset, device):
                         else torch.empty(sequences.size(2), 0)
                     ),
                 })
+    elapsed = time.perf_counter() - started_at
+    print(
+        f'冻结主干缓存完成: {len(cached_samples)} 个样本, '
+        f'耗时 {elapsed:.1f}s'
+    )
     return FrozenBackboneDataset(dataset, cached_samples)
 
 def collate_fn(batch):
     """自定义collate函数处理变长序列"""
-    sequences = [item['sequences'] for item in batch]
+    has_cached_backbone = 'cached_ranking_features' in batch[0]
+    sequences = (
+        None
+        if has_cached_backbone
+        else [item['sequences'] for item in batch]
+    )
     targets = [item['targets'] for item in batch]
     relevance = [item['relevance'] for item in batch]
     stock_indices = [item['stock_indices'] for item in batch]
@@ -1403,7 +1435,6 @@ def collate_fn(batch):
     recency_weights = torch.stack([
         item['recency_weight'] for item in batch
     ])
-    has_cached_backbone = 'cached_ranking_features' in batch[0]
     if has_cached_backbone:
         cached_features = [item['cached_ranking_features'] for item in batch]
         cached_regime_sequences = [
@@ -1414,7 +1445,7 @@ def collate_fn(batch):
         ]
     
     # 找到最大股票数量
-    max_stocks = max(seq.size(0) for seq in sequences)
+    max_stocks = max(stock_idx.size(0) for stock_idx in stock_indices)
     
     # Padding到相同长度
     padded_sequences = []
@@ -1440,7 +1471,7 @@ def collate_fn(batch):
         regime,
         industry,
     ) in zip(
-        sequences,
+        sequences if sequences is not None else [None] * len(batch),
         targets,
         relevance,
         stock_indices,
@@ -1450,14 +1481,11 @@ def collate_fn(batch):
         regime_targets,
         industry_indices,
     ):
-        num_stocks = seq.size(0)
-        seq_len = seq.size(1)
-        feature_dim = seq.size(2)
+        num_stocks = stock_idx.size(0)
         
         # 创建padding
         if num_stocks < max_stocks:
             pad_size = max_stocks - num_stocks
-            seq_pad = torch.zeros(pad_size, seq_len, feature_dim)
             tgt_pad = torch.zeros(pad_size)
             rel_pad = torch.zeros(pad_size, dtype=torch.long)
             stock_pad = torch.zeros(pad_size, dtype=torch.long)
@@ -1465,7 +1493,16 @@ def collate_fn(batch):
             tail_target_pad = torch.zeros(pad_size)
             industry_pad = torch.zeros(pad_size, dtype=torch.long)
             
-            seq = torch.cat([seq, seq_pad], dim=0)
+            if seq is not None:
+                seq = torch.cat([
+                    seq,
+                    torch.zeros(
+                        pad_size,
+                        seq.size(1),
+                        seq.size(2),
+                        dtype=seq.dtype,
+                    ),
+                ], dim=0)
             tgt = torch.cat([tgt, tgt_pad], dim=0)
             rel = torch.cat([rel, rel_pad], dim=0)
             stock_idx = torch.cat([stock_idx, stock_pad], dim=0)
@@ -1492,7 +1529,8 @@ def collate_fn(batch):
         mask = torch.ones(max_stocks)
         mask[num_stocks:] = 0
         
-        padded_sequences.append(seq)
+        if seq is not None:
+            padded_sequences.append(seq)
         padded_targets.append(tgt)
         padded_relevance.append(rel)
         padded_stock_indices.append(stock_idx)
@@ -1504,7 +1542,6 @@ def collate_fn(batch):
         masks.append(mask)
     
     result = {
-        'sequences': torch.stack(padded_sequences),      # [batch, max_stocks, seq_len, features]
         'targets': torch.stack(padded_targets),          # [batch, max_stocks]
         'relevance': torch.stack(padded_relevance),      # [batch, max_stocks]
         'stock_indices': torch.stack(padded_stock_indices),  # [batch, max_stocks]
@@ -1517,6 +1554,8 @@ def collate_fn(batch):
         'prediction_dates': prediction_dates,
         'recency_weights': recency_weights,
     }
+    if sequences is not None:
+        result['sequences'] = torch.stack(padded_sequences)
     if has_cached_backbone:
         result.update({
             'cached_ranking_features': torch.stack(padded_cached_features),
@@ -1549,17 +1588,59 @@ def non_overlapping_subset(dataset, stride):
 
 def build_data_loader(dataset, shuffle, device):
     num_workers = int(config.get('num_workers', 0))
-    return DataLoader(
-        dataset,
-        batch_size=config['batch_size'],
-        shuffle=shuffle,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=(
+    if num_workers > 0 and len(dataset):
+        sample = dataset[0]
+        sample_bytes = sum(
+            value.numel() * value.element_size()
+            for value in sample.values()
+            if torch.is_tensor(value)
+        )
+        prefetched_bytes = (
+            sample_bytes
+            * min(config['batch_size'], len(dataset))
+            * num_workers
+            * int(config.get('prefetch_factor', 2))
+        )
+        shared_memory = os.statvfs('/dev/shm')
+        available_bytes = (
+            shared_memory.f_bavail * shared_memory.f_frsize
+        )
+        if prefetched_bytes > available_bytes * 0.8:
+            print(
+                'DataLoader 共享内存检查未通过，明确回退到 '
+                f'num_workers=0: 预计 {prefetched_bytes / 2**30:.2f} GiB, '
+                f'可用 {available_bytes / 2**30:.2f} GiB'
+            )
+            num_workers = 0
+    loader_kwargs = {
+        'batch_size': config['batch_size'],
+        'shuffle': shuffle,
+        'collate_fn': collate_fn,
+        'num_workers': num_workers,
+        'pin_memory': (
             device.type == 'cuda' and config.get('pin_memory', True)
         ),
-        persistent_workers=num_workers > 0,
-    )
+    }
+    if num_workers > 0:
+        loader_kwargs.update({
+            'persistent_workers': True,
+            'prefetch_factor': int(config.get('prefetch_factor', 2)),
+        })
+    try:
+        return DataLoader(dataset, **loader_kwargs)
+    except (OSError, RuntimeError, ValueError) as error:
+        if num_workers == 0:
+            raise
+        print(
+            'DataLoader 多进程初始化失败，明确回退到 num_workers=0: '
+            f'{error}'
+        )
+        loader_kwargs.update({
+            'num_workers': 0,
+            'persistent_workers': False,
+        })
+        loader_kwargs.pop('prefetch_factor', None)
+        return DataLoader(dataset, **loader_kwargs)
 
 # 排序训练函数
 def train_ranking_model(
@@ -2671,6 +2752,7 @@ def fit_training_stage(
     fold_number=None,
 ):
     """训练单一阶段并恢复该阶段最佳完整模型状态。"""
+    started_at = time.perf_counter()
     settings = stage_settings(stage)
     criterion, optimizer = build_training_components(model, stage=stage)
     grad_scaler = create_grad_scaler(device)
@@ -2761,6 +2843,11 @@ def fit_training_stage(
     if best_epoch < 1:
         raise RuntimeError(f'{stage}阶段没有产生有效checkpoint')
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    elapsed = time.perf_counter() - started_at
+    print(
+        f'{stage} 阶段完成: {epochs_ran} epochs, '
+        f'最佳 epoch {best_epoch}, 耗时 {elapsed:.1f}s'
+    )
     return {
         'stage': stage,
         'best_epoch': best_epoch,
@@ -2768,6 +2855,7 @@ def fit_training_stage(
         'checkpoint_metric': settings['checkpoint_metric'],
         'checkpoint_score': float(best_score),
         'steps_per_epoch': len(train_loader),
+        'elapsed_seconds': elapsed,
     }
 
 
@@ -2809,6 +2897,7 @@ def train_one_fold(
     industry2idx,
 ):
     """训练单个 walk-forward 折，并用最佳 checkpoint 统一评估训练/验证集。"""
+    fold_started_at = time.perf_counter()
     fold_number = fold['fold']
     set_seed(base_seed + fold_number)
     fold_dir = os.path.join(output_dir, f'fold_{fold_number}')
@@ -3019,6 +3108,7 @@ def train_one_fold(
             - val_eval_metrics.get('weighted_portfolio_return', 0.0)
         ),
         'rank_ic_gap': train_eval_metrics.get('rank_ic', 0.0) - val_eval_metrics.get('rank_ic', 0.0),
+        'elapsed_seconds': time.perf_counter() - fold_started_at,
     }
     with open(os.path.join(fold_dir, 'metrics.json'), 'w', encoding='utf-8') as file:
         json.dump(result, file, indent=2, ensure_ascii=False)
@@ -3028,6 +3118,10 @@ def train_one_fold(
         compress=3,
     )
     writer.close()
+    print(
+        f'Fold {fold_number} 全流程完成，耗时 '
+        f"{result['elapsed_seconds']:.1f}s"
+    )
     return result, oof_predictions
 
 
@@ -3122,6 +3216,7 @@ def train_final_model(
     base_seed,
 ):
     """按各折最佳更新步数依次完成四阶段全量重训。"""
+    training_started_at = time.perf_counter()
     set_seed(base_seed + 1000)
     final_dir = os.path.join(output_dir, 'full_train')
     os.makedirs(final_dir, exist_ok=True)
@@ -3164,7 +3259,9 @@ def train_final_model(
         f"\n========== Seed {base_seed} full-data retraining: "
         f"{stage_epochs} =========="
     )
+    stage_elapsed_seconds = {}
     for stage in stages[first_stage_index:]:
+        stage_started_at = time.perf_counter()
         if (
             stage != 'ranking'
             and config.get('cache_frozen_backbone', True)
@@ -3231,6 +3328,11 @@ def train_final_model(
                 True,
                 device,
             )
+        stage_elapsed_seconds[stage] = time.perf_counter() - stage_started_at
+        print(
+            f'全量训练 {stage} 阶段耗时: '
+            f"{stage_elapsed_seconds[stage]:.1f}s"
+        )
 
     torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pth'))
     metadata = {
@@ -3245,6 +3347,8 @@ def train_final_model(
         'identity_gate': float(
             model.identity_gate_value().detach().cpu().item()
         ),
+        'stage_elapsed_seconds': stage_elapsed_seconds,
+        'elapsed_seconds': time.perf_counter() - training_started_at,
     }
     with open(os.path.join(output_dir, 'final_training.json'), 'w', encoding='utf-8') as file:
         json.dump(metadata, file, indent=2, ensure_ascii=False)
@@ -3801,6 +3905,8 @@ def main():
             '当前配置是策略重放实验，不允许重新训练；'
             '请使用 POLICY_ONLY=1 ./train.sh'
         )
+    run_started_at = time.perf_counter()
+    preprocessing_started_at = run_started_at
     configured_ensemble_seeds = [int(seed) for seed in config.get(
         'ensemble_seeds',
         [42, 142, 242],
@@ -3840,7 +3946,9 @@ def main():
         f"{config['num_folds']}折; "
         f"seeds={ensemble_seeds}; 设备: {device}; AMP={use_amp(device)}; "
         f"TF32={device.type == 'cuda' and config.get('tf32_enabled', True)}; "
-        f"batch_size={config['batch_size']}"
+        f"batch_size={config['batch_size']}; "
+        f"num_workers={config.get('num_workers', 0)}; "
+        f"prefetch_factor={config.get('prefetch_factor', 2)}"
     )
 
     data_file = os.path.join(config['data_path'], 'train.csv')
@@ -3906,6 +4014,8 @@ def main():
                 'regime_market_feature_indices 与市场压力特征位置不一致: '
                 f'{configured_regime_indices} != {expected_market_indices}'
             )
+    preprocessing_elapsed = time.perf_counter() - preprocessing_started_at
+    print(f'数据读取与预处理完成，耗时 {preprocessing_elapsed:.1f}s')
 
     fold_results = []
     oof_records = {
@@ -3972,6 +4082,7 @@ def main():
                 fold=fold_number,
             ))
 
+    policy_started_at = time.perf_counter()
     policy_calibration_kwargs = build_policy_calibration_kwargs(
         config,
         ensemble_enabled,
@@ -3993,6 +4104,8 @@ def main():
     # forms a circular reference that json.dump cannot serialize.
     policy = detached_deployment_policy(cross_fitted_policy)
     ensemble_metrics = cross_fitted_policy['metrics']
+    policy_elapsed = time.perf_counter() - policy_started_at
+    print(f'OOF 策略校准完成，耗时 {policy_elapsed:.1f}s')
     reference_window_metrics = []
     for start, end in config.get('reference_validation_windows', []):
         rows = [
@@ -4085,6 +4198,7 @@ def main():
         }
     )
 
+    full_training_started_at = time.perf_counter()
     full_train_dataset, full_train_end = prepare_full_training_dataset(
         full_data=full_data,
         features=features,
@@ -4146,6 +4260,16 @@ def main():
         model_paths.append(
             os.path.join(f'seed_{base_seed}', 'best_model.pth')
         )
+    full_training_elapsed = time.perf_counter() - full_training_started_at
+    total_elapsed = time.perf_counter() - run_started_at
+    print(
+        '训练阶段耗时汇总: '
+        f'预处理 {preprocessing_elapsed:.1f}s; '
+        f"三折 {sum(float(result.get('elapsed_seconds', 0.0)) for result in fold_results):.1f}s; "
+        f'策略校准 {policy_elapsed:.1f}s; '
+        f'全量重训 {full_training_elapsed:.1f}s; '
+        f'总计 {total_elapsed:.1f}s'
+    )
 
     policy.update({
         'ensemble_enabled': ensemble_enabled,
@@ -4177,6 +4301,18 @@ def main():
         'num_folds': len(folds),
         'evaluation_stride': int(config.get('evaluation_stride', 5)),
         'ensemble_seeds': ensemble_seeds,
+        'runtime_seconds': {
+            'preprocessing': preprocessing_elapsed,
+            'folds': {
+                str(result['fold']): float(
+                    result.get('elapsed_seconds', 0.0)
+                )
+                for result in fold_results
+            },
+            'policy_calibration': policy_elapsed,
+            'full_training': full_training_elapsed,
+            'total': total_elapsed,
+        },
         'allocation_blend': float(policy['allocation_blend']),
         'selection_risk_gamma': float(policy['selection_risk_gamma']),
         'risk_score_penalty': float(policy.get(

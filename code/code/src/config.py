@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'threefold_rawranking_riskcheckpoint_v11'
+experiment_name = 'threefold_rawranking_riskcheckpoint_v11_iofast'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -205,7 +205,8 @@ config = {
     'fused_optimizer': True,
     'pin_memory': True,
     'non_blocking_transfer': True,
-    'num_workers': 0,
+    'num_workers': 2,
+    'prefetch_factor': 2,
     'deterministic_training': True,
 
     'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import Subset
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,10 +18,13 @@ from config import config  # noqa: E402
 from model import StockTransformer  # noqa: E402
 from predict import validate_result  # noqa: E402
 from train import (  # noqa: E402
+    FrozenBackboneDataset,
+    RankingDataset,
     WeightedRankingLoss,
     _build_label_and_clean,
     build_walk_forward_folds,
     calculate_checkpoint_score,
+    collate_fn,
     configure_model_for_stage,
     detached_deployment_policy,
 )
@@ -34,6 +38,54 @@ from utils import (  # noqa: E402
 
 
 class PolicyRegressionTests(unittest.TestCase):
+    def test_frozen_backbone_batch_omits_raw_sequences(self):
+        sequences = [
+            np.arange(24, dtype=np.float64).reshape(2, 3, 4),
+            np.arange(12, dtype=np.float32).reshape(1, 3, 4),
+        ]
+        targets = [
+            np.asarray([0.1, -0.1], dtype=np.float32),
+            np.asarray([0.2], dtype=np.float32),
+        ]
+        dataset = RankingDataset(
+            sequences,
+            targets,
+            [np.asarray([1, 0]), np.asarray([1])],
+            [np.asarray([2, 3]), np.asarray([4])],
+            [pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")],
+        )
+        first = dataset[0]["sequences"]
+        second = dataset[0]["sequences"]
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        self.assertTrue(dataset.sequences[0].flags.c_contiguous)
+        self.assertTrue(dataset.sequences[0].flags.writeable)
+
+        cached = FrozenBackboneDataset(dataset, [
+            {
+                "cached_ranking_features": torch.zeros(2, 5),
+                "cached_regime_sequence": torch.zeros(3, 2),
+                "cached_market_sequence": torch.zeros(3, 2),
+            },
+            {
+                "cached_ranking_features": torch.zeros(1, 5),
+                "cached_regime_sequence": torch.zeros(3, 2),
+                "cached_market_sequence": torch.zeros(3, 2),
+            },
+        ])
+        self.assertNotIn("sequences", cached[0])
+        batch = collate_fn([cached[0], cached[1]])
+        self.assertNotIn("sequences", batch)
+        self.assertEqual(
+            tuple(batch["cached_ranking_features"].shape),
+            (2, 2, 5),
+        )
+        cached_subset = FrozenBackboneDataset(
+            Subset(dataset, [1]),
+            [cached.cached_samples[1]],
+        )
+        self.assertNotIn("sequences", cached_subset[0])
+        self.assertEqual(cached_subset[0]["targets"].numel(), 1)
+
     def test_holding_path_tail_detects_recovered_drawdown(self):
         rows = []
         paths = {
