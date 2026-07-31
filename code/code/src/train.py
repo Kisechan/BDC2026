@@ -4297,7 +4297,8 @@ def main():
         }
         # 部署策略只保留严格前向 OOF 已通过模块门槛的配置；全 OOF 最优值
         # 仅作为候选报告，不能直接穿透到部署策略。
-        policy = cross_fitted_policy['robust_deployment_policy']
+        # 复制部署策略，避免随后写入 cross_fitted_oof 时形成循环引用。
+        policy = dict(cross_fitted_policy['robust_deployment_policy'])
         ensemble_metrics = cross_fitted_policy['metrics']
     else:
         cross_fitted_policy = {
