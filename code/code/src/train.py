@@ -123,9 +123,9 @@ def dense_stage_loss(
     criterion, model, outputs, relevance, return_outputs, targets,
     allocation_outputs, exposures, auxiliary_outputs, risk_1d_targets,
     risk_3d_targets, tail_5d_targets, regime_targets, industry_indices, stage,
-    return_components=False,
+    return_components=False, item_mask=None, sample_weights=None,
 ):
-    """无 padding 的完整 batch 一次计算辅助阶段损失，避免逐日期 Python 循环。"""
+    """统一计算完整或带 mask 的批量阶段损失。"""
     return criterion(
         outputs,
         relevance,
@@ -144,6 +144,8 @@ def dense_stage_loss(
         tail_5d_targets=tail_5d_targets,
         regime_targets=regime_targets,
         industry_indices=industry_indices,
+        item_mask=item_mask,
+        sample_weights=sample_weights,
         stage=stage,
         return_components=return_components,
     )
@@ -586,16 +588,46 @@ class WeightedRankingLoss(nn.Module):
         if self.risk_5d_target_temperature <= 0:
             raise ValueError('5日风险目标 temperature 必须大于0')
 
-    def listwise_loss(self, y_pred, y_true, weights):
+    @staticmethod
+    def _weighted_day_mean(values, sample_weights):
+        if sample_weights is None:
+            return values.mean()
+        return (
+            (values * sample_weights).sum()
+            / sample_weights.sum().clamp(min=1e-12)
+        )
+
+    def listwise_loss(
+        self,
+        y_pred,
+        y_true,
+        weights,
+        item_mask=None,
+        sample_weights=None,
+    ):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
-        log_pred_probs = F.log_softmax(y_pred, dim=1)
-        rank_min = y_true.min(dim=1, keepdim=True).values
+        if item_mask is None:
+            item_mask = torch.ones_like(y_true, dtype=torch.bool)
+        masked_pred = y_pred.masked_fill(~item_mask, -torch.inf)
+        masked_true = y_true.masked_fill(~item_mask, torch.inf)
+        log_pred_probs = F.log_softmax(masked_pred, dim=1).masked_fill(
+            ~item_mask,
+            0.0,
+        )
+        rank_min = masked_true.min(dim=1, keepdim=True).values
+        rank_max = y_true.masked_fill(
+            ~item_mask,
+            -torch.inf,
+        ).max(dim=1, keepdim=True).values
         rank_range = (
-            y_true.max(dim=1, keepdim=True).values - rank_min
+            rank_max - rank_min
         ).clamp(min=1e-12)
         rank_percentiles = (y_true - rank_min) / rank_range
         target_probs = F.softmax(
-            rank_percentiles / self.listwise_temperature,
+            (rank_percentiles / self.listwise_temperature).masked_fill(
+                ~item_mask,
+                -torch.inf,
+            ),
             dim=1,
         )
 
@@ -605,15 +637,30 @@ class WeightedRankingLoss(nn.Module):
         weighted_target_probs = weighted_target_probs / (
             weighted_target_probs.sum(dim=1, keepdim=True) + 1e-12
         )
-        return -(weighted_target_probs * log_pred_probs).sum(dim=1).mean()
+        day_losses = -(
+            weighted_target_probs * log_pred_probs
+        ).sum(dim=1)
+        return self._weighted_day_mean(day_losses, sample_weights)
 
-    def lambda_rank_loss(self, y_pred, y_true, raw_returns, weights):
+    def lambda_rank_loss(
+        self,
+        y_pred,
+        y_true,
+        raw_returns,
+        weights,
+        item_mask=None,
+        sample_weights=None,
+    ):
         """以排序效用方向、收益差和交换后的 ΔNDCG@5 加权困难股票对。"""
+        if item_mask is None:
+            item_mask = torch.ones_like(y_true, dtype=torch.bool)
         day_losses = []
         for batch_index in range(y_pred.size(0)):
-            scores = y_pred[batch_index]
-            relevance = y_true[batch_index]
-            returns = raw_returns[batch_index]
+            valid = item_mask[batch_index]
+            scores = y_pred[batch_index][valid]
+            relevance = y_true[batch_index][valid]
+            returns = raw_returns[batch_index][valid]
+            day_weights = weights[batch_index][valid]
             num_items = scores.numel()
             candidate_k = min(self.lambdarank_candidate_k, num_items)
             hard_negative_k = min(
@@ -703,10 +750,7 @@ class WeightedRankingLoss(nn.Module):
                 return_difference.abs()
                 / self.lambdarank_return_gap_scale
             ).clamp(min=0.25, max=4.0)
-            local_top_weight = weights[
-                batch_index,
-                candidate_indices,
-            ]
+            local_top_weight = day_weights[candidate_indices]
             pair_weight = (
                 delta_ndcg
                 * return_gap_weight
@@ -722,28 +766,51 @@ class WeightedRankingLoss(nn.Module):
             )
             pair_weight = pair_weight * valid_pairs
             weight_sum = pair_weight.sum()
-            if weight_sum <= 1e-12:
-                day_losses.append(scores.sum() * 0.0)
-                continue
             pair_loss = F.softplus(
                 -score_difference * torch.sign(relevance_difference)
             )
             day_losses.append(
-                (pair_loss * pair_weight).sum() / weight_sum
+                (pair_loss * pair_weight).sum()
+                / weight_sum.clamp(min=1e-12)
             )
-        return torch.stack(day_losses).mean()
+        return self._weighted_day_mean(
+            torch.stack(day_losses),
+            sample_weights,
+        )
 
-    def rank_ic_loss(self, y_pred, y_true):
+    def rank_ic_loss(
+        self,
+        y_pred,
+        y_true,
+        item_mask=None,
+        sample_weights=None,
+    ):
         """用预测分数与真实排名的 Pearson 相关性近似优化 Spearman Rank IC。"""
-        pred_centered = y_pred - y_pred.mean(dim=1, keepdim=True)
-        target_centered = y_true - y_true.mean(dim=1, keepdim=True)
+        if item_mask is None:
+            item_mask = torch.ones_like(y_true, dtype=torch.bool)
+        counts = item_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        pred_means = (
+            y_pred.masked_fill(~item_mask, 0.0).sum(dim=1, keepdim=True)
+            / counts
+        )
+        target_means = (
+            y_true.masked_fill(~item_mask, 0.0).sum(dim=1, keepdim=True)
+            / counts
+        )
+        pred_centered = (y_pred - pred_means).masked_fill(~item_mask, 0.0)
+        target_centered = (
+            y_true - target_means
+        ).masked_fill(~item_mask, 0.0)
         numerator = (pred_centered * target_centered).sum(dim=1)
         denominator = torch.sqrt(
             pred_centered.square().sum(dim=1)
             * target_centered.square().sum(dim=1)
         ).clamp(min=1e-12)
         correlation = numerator / denominator
-        return (1.0 - correlation).mean()
+        return self._weighted_day_mean(
+            1.0 - correlation,
+            sample_weights,
+        )
 
     def industry_residual_ranking_loss(
         self,
@@ -899,6 +966,8 @@ class WeightedRankingLoss(nn.Module):
         tail_5d_targets=None,
         regime_targets=None,
         industry_indices=None,
+        item_mask=None,
+        sample_weights=None,
         stage='joint',
         return_components=False,
     ):
@@ -906,31 +975,59 @@ class WeightedRankingLoss(nn.Module):
         y_pred: [batch, num_items]
         y_true: [batch, num_items] (真实涨跌幅)
         """
-        batch_size, num_items = y_true.size()
-        k = min(self.k, num_items)
-
-        # 1. 识别 top-k 的样本
-        _, top_indices = torch.topk(y_true, k, dim=1)
-        
-        # 2. 创建权重向量
-        weights = torch.full_like(y_true, fill_value=self.base_weight)
-        for i in range(batch_size):
-            weights[i, top_indices[i]] = self.weight_factor
-            
         components = {}
         if stage in {'ranking', 'joint'}:
-            listwise = self.listwise_loss(y_pred, y_true, weights)
+            if item_mask is None:
+                item_mask = torch.ones_like(y_true, dtype=torch.bool)
+            valid_days = item_mask.sum(dim=1).gt(1)
+            day_weights = valid_days.to(y_pred.dtype)
+            if sample_weights is not None:
+                day_weights = (
+                    sample_weights.to(y_pred.dtype) * day_weights
+                )
+            top_indices = torch.topk(
+                y_true.masked_fill(~item_mask, -torch.inf),
+                min(self.k, y_true.size(1)),
+                dim=1,
+            ).indices
+            weights = torch.full_like(
+                y_true,
+                fill_value=self.base_weight,
+            )
+            weights.scatter_(1, top_indices, self.weight_factor)
+            weights = weights * item_mask
+            listwise = self.listwise_loss(
+                y_pred,
+                y_true,
+                weights,
+                item_mask,
+                day_weights,
+            )
             lambdarank = self.lambda_rank_loss(
                 y_pred,
                 y_true,
                 raw_returns,
                 weights,
+                item_mask,
+                day_weights,
             )
-            rank_ic = self.rank_ic_loss(y_pred, y_true)
-            regression = F.smooth_l1_loss(
+            rank_ic = self.rank_ic_loss(
+                y_pred,
+                y_true,
+                item_mask,
+                day_weights,
+            )
+            regression_items = F.smooth_l1_loss(
                 predicted_returns,
                 raw_returns,
                 beta=self.regression_beta,
+                reduction='none',
+            )
+            regression = self._weighted_day_mean(
+                (
+                    regression_items * item_mask
+                ).sum(dim=1) / item_mask.sum(dim=1).clamp(min=1),
+                day_weights,
             )
             components.update({
                 'listwise_loss': self.listwise_weight * listwise,
@@ -1729,7 +1826,18 @@ def train_ranking_model(
         batch_loss_components = {}
         batch_weight_total = None
         batch_size = targets.size(0)
-        if stage != 'ranking' and bool(masks.bool().all()):
+        if stage == 'ranking':
+            batch_loss, batch_loss_components = dense_stage_loss(
+                criterion, model, outputs, masked_relevance,
+                return_outputs, targets, allocation_outputs, exposures,
+                auxiliary_outputs, risk_1d_targets, risk_3d_targets,
+                tail_5d_targets, regime_targets, industry_indices, stage,
+                return_components=True,
+                item_mask=masks.bool(),
+                sample_weights=recency_weights,
+            )
+            batch_weight_total = batch_loss.new_tensor(1.0)
+        elif bool(masks.bool().all()):
             batch_loss, batch_loss_components = dense_stage_loss(
                 criterion, model, outputs, masked_relevance,
                 return_outputs, targets, allocation_outputs, exposures,
@@ -1966,7 +2074,17 @@ def evaluate_ranking_model(
             masked_allocation_outputs = allocation_outputs * masks
             
             # 计算损失
-            batch_loss = None
+            batch_loss = (
+                dense_stage_loss(
+                    criterion, model, outputs, masked_relevance,
+                    return_outputs, targets, allocation_outputs, exposures,
+                    auxiliary_outputs, risk_1d_targets, risk_3d_targets,
+                    tail_5d_targets, regime_targets, industry_indices, stage,
+                    item_mask=masks.bool(),
+                )
+                if stage == 'ranking'
+                else None
+            )
             batch_size = targets.size(0)
             
             for i in range(batch_size):
@@ -1985,7 +2103,7 @@ def evaluate_ranking_model(
                 valid_return_pred = masked_return_outputs[i][valid_indices]
                 valid_allocation_logits = masked_allocation_outputs[i][valid_indices]
                 
-                if len(valid_pred) > 1:
+                if stage != 'ranking' and len(valid_pred) > 1:
                     loss = criterion(
                         valid_pred.unsqueeze(0),
                         valid_relevance.unsqueeze(0),
@@ -2061,8 +2179,9 @@ def evaluate_ranking_model(
                     )
                     batch_loss = batch_loss + loss if batch_loss is not None else loss
             
-            if batch_loss is not None:
+            if batch_loss is not None and stage != 'ranking':
                 batch_loss = batch_loss / batch_size
+            if batch_loss is not None:
                 total_loss += batch_loss.item()
             
             # 计算评估指标

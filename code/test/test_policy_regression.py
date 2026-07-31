@@ -38,6 +38,132 @@ from utils import (  # noqa: E402
 
 
 class PolicyRegressionTests(unittest.TestCase):
+    def test_batched_ranking_loss_matches_per_day_reference(self):
+        torch.manual_seed(7)
+        counts = [8, 6, 5]
+        batch_size, max_items = len(counts), max(counts)
+        masks = torch.zeros(batch_size, max_items, dtype=torch.bool)
+        for index, count in enumerate(counts):
+            masks[index, :count] = True
+        relevance = torch.randn(batch_size, max_items)
+        raw_returns = torch.randn(batch_size, max_items) * 0.03
+        recency = torch.tensor([0.3, 0.7, 1.0])
+        allocation = torch.zeros_like(relevance)
+        exposure = torch.full((batch_size,), 0.6)
+        criterion = WeightedRankingLoss(
+            listwise_weight=0.2,
+            pairwise_weight=1.0,
+            regression_weight=0.05,
+            ic_weight=0.2,
+            id_gate_regularization=0.01,
+            industry_residual_ranking_weight=0.0,
+        )
+
+        batched_scores = torch.randn(
+            batch_size,
+            max_items,
+            requires_grad=True,
+        )
+        batched_returns = torch.randn(
+            batch_size,
+            max_items,
+            requires_grad=True,
+        )
+        batched_gate = torch.tensor(0.2, requires_grad=True)
+        batched_loss, batched_components = criterion(
+            batched_scores,
+            relevance,
+            batched_returns,
+            raw_returns,
+            allocation,
+            exposure,
+            identity_gate=batched_gate,
+            item_mask=masks,
+            sample_weights=recency,
+            stage="ranking",
+            return_components=True,
+        )
+        batched_loss.backward()
+
+        reference_scores = batched_scores.detach().clone().requires_grad_()
+        reference_returns = (
+            batched_returns.detach().clone().requires_grad_()
+        )
+        reference_gate = batched_gate.detach().clone().requires_grad_()
+        reference_loss = 0.0
+        reference_components = {}
+        for index, count in enumerate(counts):
+            day_loss, day_components = criterion(
+                reference_scores[index:index + 1, :count],
+                relevance[index:index + 1, :count],
+                reference_returns[index:index + 1, :count],
+                raw_returns[index:index + 1, :count],
+                allocation[index:index + 1, :count],
+                exposure[index:index + 1],
+                identity_gate=reference_gate,
+                stage="ranking",
+                return_components=True,
+            )
+            reference_loss = reference_loss + recency[index] * day_loss
+            for name, value in day_components.items():
+                reference_components[name] = (
+                    reference_components.get(name, 0.0)
+                    + recency[index] * value
+                )
+        reference_loss = reference_loss / recency.sum()
+        reference_components = {
+            name: value / recency.sum()
+            for name, value in reference_components.items()
+        }
+        reference_loss.backward()
+
+        self.assertLess(
+            abs(batched_loss.item() - reference_loss.item()),
+            1e-6,
+        )
+        self.assertEqual(
+            set(batched_components),
+            set(reference_components),
+        )
+        for name in batched_components:
+            self.assertLess(
+                abs(
+                    batched_components[name].item()
+                    - reference_components[name].item()
+                ),
+                1e-6,
+            )
+        self.assertLess(
+            (
+                batched_scores.grad - reference_scores.grad
+            ).abs().max().item(),
+            1e-5,
+        )
+        self.assertLess(
+            (
+                batched_returns.grad - reference_returns.grad
+            ).abs().max().item(),
+            1e-5,
+        )
+        self.assertLess(
+            abs(batched_gate.grad.item() - reference_gate.grad.item()),
+            1e-5,
+        )
+        for index, count in enumerate(counts):
+            self.assertEqual(
+                torch.argsort(
+                    batched_scores.detach()[index, :count],
+                    descending=True,
+                    stable=True,
+                )[:5].tolist(),
+                torch.argsort(
+                    reference_scores.detach()[index, :count],
+                    descending=True,
+                    stable=True,
+                )[:5].tolist(),
+            )
+        self.assertTrue(torch.isfinite(batched_loss))
+
     def test_frozen_backbone_batch_omits_raw_sequences(self):
         sequences = [
             np.arange(24, dtype=np.float64).reshape(2, 3, 4),
