@@ -200,7 +200,8 @@ def print_cross_validation() -> None:
             selected = row["policy"]
             print(
                 f"  Fold {row['held_out_fold']} <- calibration "
-                f"{row['calibration_folds']}: "
+                f"{row['calibration_folds']} "
+                f"({row.get('num_calibration_folds', len(row['calibration_folds']))}折): "
                 f"Allocation={float(selected['allocation_blend']):.2f}, "
                 f"Exposure={float(selected['exposure_head_blend']):.2f}, "
                 f"Risk={float(selected['risk_score_penalty']):.2f}, "
@@ -210,6 +211,8 @@ def print_cross_validation() -> None:
                 f"{float(selected.get('soft_correlation_penalty', 0.0)):.2f}, "
                 f"CorrExposure="
                 f"{float(selected['correlation_exposure_gamma']):.2f}"
+                + (f"；回退原因: {row['fallback_reason']}"
+                   if row.get("fallback_reason") else "")
             )
         module_reports = summary.get("module_alternative_reports", {})
         if module_reports:

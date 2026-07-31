@@ -3695,6 +3695,9 @@ def run_policy_only():
             'forward_module_max_p10_loss',
             0.005,
         )),
+        forward_min_calibration_folds=int(
+            config.get('forward_min_calibration_folds', 2)
+        ),
         **calibration_kwargs,
     )
     cross_metrics = replay['metrics']
@@ -3721,14 +3724,7 @@ def run_policy_only():
             'module_alternative_reports',
             {},
         ),
-        'module_fallbacks': {
-            'risk_score': 0.0,
-            'reversal': 0.0,
-            'correlation_cluster': False,
-            'allocation': 0.25,
-            'exposure_head': 0.25,
-            'correlation_exposure': 0.0,
-        },
+        'module_fallbacks': dict(candidate_policy['module_fallbacks']),
         'cross_fitted_policy': {
             key: value for key, value in replay.items()
             if key not in (
@@ -3746,6 +3742,8 @@ def run_policy_only():
             'risk_score': 'risk_score_penalty',
             'reversal': 'selection_risk_gamma',
             'correlation_cluster': 'cluster_cap_enabled',
+            'industry_concentration': 'industry_penalty',
+            'soft_correlation': 'soft_correlation_penalty',
             'allocation': 'allocation_blend',
             'exposure_head': 'exposure_head_blend',
             'correlation_exposure': 'correlation_exposure_gamma',
@@ -4180,6 +4178,9 @@ def main():
             'forward_module_max_p10_loss',
             0.005,
         )),
+        forward_min_calibration_folds=int(
+            config.get('forward_min_calibration_folds', 2)
+        ),
         **policy_calibration_kwargs,
     )
     # Detach the deployment policy before attaching the full cross-fitted report.

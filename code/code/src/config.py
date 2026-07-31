@@ -2,8 +2,8 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'threefold_rawranking_riskcheckpoint_v11_memorysafe'
-artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
+experiment_name = 'threefold_rawranking_riskcheckpoint_v11_policywarmup'
+artifact_experiment_name = 'threefold_rawranking_riskcheckpoint_v11_memorysafe'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
@@ -120,7 +120,7 @@ config = {
     'selection_risk_gamma_grid': [0.0],
     'industry_penalty_grid': [0.0, 0.02, 0.05, 0.10],
     'soft_correlation_penalty_grid': [0.0, 0.02, 0.05],
-    'correlation_exposure_gamma_grid': [0.0, 0.5, 1.0, 2.0],
+    'correlation_exposure_gamma_grid': [0.0],
     # Exposure Head 必须保留；OOF 只校准其相对固定基线的占比。
     'exposure_head_blend_grid': [0.25, 0.50, 0.75, 1.0],
     'selection_candidate_k': 10,
@@ -141,6 +141,7 @@ config = {
     'risk_module_max_return_spearman': -0.05,
     'forward_module_max_fold_loss': 0.0025,
     'forward_module_max_p10_loss': 0.005,
+    'forward_min_calibration_folds': 2,
     'minimum_allocation_deployment_blend': 0.25,
     'minimum_exposure_deployment_blend': 0.25,
     'listwise_temperature': 0.2,

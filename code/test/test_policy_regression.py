@@ -346,13 +346,13 @@ class PolicyRegressionTests(unittest.TestCase):
         self.assertEqual(enriched[0]["label_end_date"], "2026-01-12")
         self.assertNotIn("label_end_date", records[0])
 
-    def test_current_forward_replay_fails_promotion(self):
+    def test_current_forward_replay_requires_two_history_folds(self):
         summary_path = (
             PROJECT_ROOT
             / "model"
             / (
                 "60_158+39_reduced25_relmarket12_risk15_"
-                "nested_oof_forward_policy_v7_1"
+                "threefold_rawranking_riskcheckpoint_v11_policywarmup"
             )
             / "cross_validation_summary.json"
         )
@@ -364,20 +364,34 @@ class PolicyRegressionTests(unittest.TestCase):
             "strict_forward_historical_folds_only",
         )
         self.assertFalse(summary["promotion_criteria"]["passed"])
-        self.assertFalse(
-            summary["promotion_criteria"]["mean_weighted_return"]
-        )
-        self.assertFalse(
-            summary["promotion_criteria"]["p10_weighted_return"]
+        self.assertAlmostEqual(
+            summary["mean_weighted_portfolio_return"],
+            0.010866302526486536,
+            places=12,
         )
         self.assertIn("worst_daily_rank_ic", summary)
         self.assertIn("worst_fold_mean_rank_ic", summary)
         self.assertIn("mean_tail_5d_brier_skill", summary)
         folds = summary["cross_fitted_oof"]["fold_policies"]
-        self.assertEqual(folds[0]["calibration_mode"], "warmup_fallback")
+        self.assertEqual(
+            folds[0]["calibration_mode"],
+            "insufficient_history_fallback",
+        )
         self.assertEqual(folds[0]["calibration_folds"], [])
+        self.assertEqual(folds[0]["num_calibration_folds"], 0)
         self.assertEqual(folds[1]["calibration_folds"], [1])
+        self.assertEqual(
+            folds[1]["calibration_mode"],
+            "insufficient_history_fallback",
+        )
+        self.assertEqual(folds[1]["num_calibration_folds"], 1)
         self.assertEqual(folds[2]["calibration_folds"], [1, 2])
+        self.assertEqual(folds[2]["calibration_mode"], "historical_folds_only")
+        self.assertEqual(folds[2]["num_calibration_folds"], 2)
+        self.assertTrue(all(
+            row["policy"]["correlation_exposure_gamma"] == 0.0
+            for row in folds
+        ))
 
     def test_industry_asof_join_never_reads_future_snapshot(self):
         history = pd.DataFrame({

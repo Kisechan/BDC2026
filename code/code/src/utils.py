@@ -4273,6 +4273,7 @@ def forward_fit_module_gated_policy(
     ensemble_days,
     forward_module_max_fold_loss=0.0025,
     forward_module_max_p10_loss=0.005,
+    forward_min_calibration_folds=2,
     **calibration_kwargs,
 ):
     """仅用历史折校准后续折，避免策略层使用未来市场阶段。"""
@@ -4281,6 +4282,8 @@ def forward_fit_module_gated_policy(
         raise ValueError('严格前向模块门控至少需要三折')
     if forward_module_max_fold_loss < 0 or forward_module_max_p10_loss < 0:
         raise ValueError('前向模块容许损失必须非负')
+    if forward_min_calibration_folds < 1:
+        raise ValueError('前向策略最少校准折数必须为正整数')
     for day in ensemble_days:
         if 'label_end_date' not in day:
             raise ValueError('严格前向策略需要 label_end_date')
@@ -4297,7 +4300,7 @@ def forward_fit_module_gated_policy(
     ) + ('disagreement_gamma',)
     fallback_policy = _module_policy_base(calibration_kwargs)
 
-    for fold_position, held_out_fold in enumerate(fold_ids):
+    for held_out_fold in fold_ids:
         evaluation_days = sorted(
             [
                 day for day in ensemble_days
@@ -4315,19 +4318,23 @@ def forward_fit_module_gated_policy(
             if int(day['fold']) < held_out_fold
             and pd.Timestamp(day['label_end_date']) < evaluation_start
         ]
-        if fold_position == 0:
+        calibration_folds = sorted({
+            int(day['fold']) for day in calibration_days
+        })
+        if len(calibration_folds) < forward_min_calibration_folds:
             policy = dict(fallback_policy)
-            calibration_mode = 'warmup_fallback'
+            calibration_mode = 'insufficient_history_fallback'
+            fallback_reason = (
+                f'需要至少{forward_min_calibration_folds}个完整历史折，当前仅'
+                f'{len(calibration_folds)}个'
+            )
         else:
-            if not calibration_days:
-                raise ValueError(
-                    f'Fold {held_out_fold} 前没有已完成标签的校准日期'
-                )
             policy = calibrate_module_gated_policy(
                 calibration_days,
                 **calibration_kwargs,
             )
             calibration_mode = 'historical_folds_only'
+            fallback_reason = None
 
         for day in calibration_days:
             if int(day['fold']) >= held_out_fold:
@@ -4390,9 +4397,9 @@ def forward_fit_module_gated_policy(
         fold_policies.append({
             'held_out_fold': held_out_fold,
             'calibration_mode': calibration_mode,
-            'calibration_folds': sorted({
-                int(day['fold']) for day in calibration_days
-            }),
+            'calibration_folds': calibration_folds,
+            'num_calibration_folds': len(calibration_folds),
+            'fallback_reason': fallback_reason,
             'calibration_dates': [
                 day['prediction_date'] for day in calibration_days
             ],
