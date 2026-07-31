@@ -5027,11 +5027,10 @@ def main():
         candidates, pair_rows = calibrate_v19_pre_registered_candidates(
             ensemble_days, policy_calibration_kwargs,
         )
+        calibration = {'candidates': candidates, 'pair_rows': pair_rows}
         save_joblib_checkpoint(
             {
-                'signature': signature, 'calibration': {
-                    'candidates': candidates, 'pair_rows': pair_rows,
-                },
+                'signature': signature, 'calibration': calibration,
             }, checkpoint_path,
         )
         print('OOF 策略校准 checkpoint 已保存')
