@@ -9,14 +9,13 @@ The active `158+39_reduced25_relmarket12` experiment has 178 inputs after adding
 seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
-market-pressure features. The active policy experiment is
-`threefold_rawranking_riskcheckpoint_v11_policywarmup`, which reuses the
-`threefold_rawranking_riskcheckpoint_v11_memorysafe` model artifacts. It keeps
-the 193 continuous inputs and does not feed
+market-pressure features. The active model experiment is
+`threefold_industryranking_recovery_v12`. It keeps the 193 continuous inputs
+and does not feed
 industry codes or names into the Transformer. Historical industry snapshots
-are joined as-of for two Exposure portfolio summaries and soft Top-10
-concentration selection; the expensive industry-residual ranking objective is
-disabled. Its tail head predicts a causal five-day holding-path loss event.
+are joined as-of for the restored v8 industry-residual ranking objective, two
+Exposure portfolio summaries, and soft Top-10 concentration selection. Its
+tail head predicts a causal five-day holding-path loss event.
 Strategy changes are calibrated in Ranking, Allocation, and Exposure stages
 using at least two strictly earlier folds with fully resolved OOF labels.
 Allocation and Exposure

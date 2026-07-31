@@ -4327,6 +4327,12 @@ def main():
             'min_final_epochs': minimum_epoch,
             'final_epochs': stage_epochs[stage],
         }
+    for stage in ('allocation', 'exposure'):
+        if stage_epochs[stage] < 3:
+            print(
+                f'警告: 全量 {stage} 仅训练 {stage_epochs[stage]} 轮；'
+                '保留折内选择结果，但部署 Head 可能不稳定'
+            )
     full_training = []
     model_paths = []
     for base_seed in ensemble_seeds:

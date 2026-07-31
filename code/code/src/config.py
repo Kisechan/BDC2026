@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'threefold_rawranking_riskcheckpoint_v11_policywarmup'
+experiment_name = 'threefold_industryranking_recovery_v12'
 artifact_experiment_name = 'threefold_rawranking_riskcheckpoint_v11_memorysafe'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -148,8 +148,8 @@ config = {
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
     'pairwise_weight': 0.3, # 降低 LambdaRank@5 对排序主目标的支配
-    # 保持关闭逐行业LambdaRank：保留行业Exposure汇总和组合集中度诊断。
-    'industry_residual_ranking_weight': 0.0,
+    # 恢复 v8 的行业残差排序目标；行业标识仍不进入 Transformer。
+    'industry_residual_ranking_weight': 0.15,
     'lambdarank_candidate_k': 20,
     'lambdarank_hard_negative_k': 20,
     'lambdarank_return_gap_scale': 0.02,
