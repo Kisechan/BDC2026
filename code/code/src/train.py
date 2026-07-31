@@ -249,6 +249,26 @@ def lgbm_relevance_labels(frame):
     ).astype(np.int32)
 
 
+def lgbm_progress_callback(description, total_iterations):
+    """返回树迭代进度条及与 LightGBM 兼容的回调。"""
+    progress = tqdm(
+        total=int(total_iterations), desc=description, unit='树',
+        dynamic_ncols=True, leave=True,
+    )
+
+    def update_progress(environment):
+        completed = int(environment.iteration) + 1
+        progress.update(max(0, completed - progress.n))
+        for result in environment.evaluation_result_list or ():
+            if result[0].startswith('valid') and result[1] == 'ndcg@5':
+                progress.set_postfix_str(f'ndcg@5={result[2]:.4f}')
+                break
+
+    update_progress.order = 20
+    update_progress.before_iteration = False
+    return progress, update_progress
+
+
 def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     """同一训练文件内的表格排序补充模型；只以预测日连续输入训练。"""
     if not config.get('lgbm_enabled', False):
@@ -273,6 +293,7 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
             raise ValueError(f"LightGBM Fold {fold['fold']} 的日期分组不足")
         train_labels = lgbm_relevance_labels(train)
         valid_labels = lgbm_relevance_labels(valid)
+        description = f"LightGBM Fold {fold['fold']}"
         print(f"阶段 LightGBM：Fold {fold['fold']}，训练 {len(train):,} / 验证 {len(valid):,} 行")
         model = LGBMRanker(
             objective='lambdarank', metric='ndcg',
@@ -282,9 +303,22 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
             reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
             n_jobs=config['lgbm_n_jobs'], verbosity=-1,
         )
-        model.fit(train[features], train_labels, group=groups,
-                  eval_X=valid[features], eval_y=valid_labels, eval_group=[valid_groups], eval_at=[5],
-                  callbacks=[early_stopping(config['lgbm_early_stopping_rounds'], verbose=False)])
+        progress, update_progress = lgbm_progress_callback(
+            description, config['lgbm_n_estimators'],
+        )
+        try:
+            model.fit(
+                train[features], train_labels, group=groups,
+                eval_X=valid[features], eval_y=valid_labels,
+                eval_group=[valid_groups], eval_at=[5],
+                callbacks=[
+                    update_progress,
+                    early_stopping(config['lgbm_early_stopping_rounds'], verbose=False),
+                ],
+            )
+        finally:
+            progress.close()
+        print(f"阶段 LightGBM：Fold {fold['fold']} 完成，最佳 {model.best_iteration_} 棵树")
         lgbm_dir = os.path.join(output_dir, 'lgbm')
         os.makedirs(lgbm_dir, exist_ok=True)
         joblib.dump(model, os.path.join(lgbm_dir, f"fold_{fold['fold']}.joblib"))
@@ -321,7 +355,13 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         n_jobs=config['lgbm_n_jobs'], verbosity=-1,
     )
     print(f'阶段 LightGBM：全量开发期重训 {len(data):,} 行，迭代 {iterations}')
-    model.fit(data[features], labels, group=groups)
+    progress, update_progress = lgbm_progress_callback(
+        'LightGBM 全量重训', iterations,
+    )
+    try:
+        model.fit(data[features], labels, group=groups, callbacks=[update_progress])
+    finally:
+        progress.close()
     path = os.path.join(output_dir, 'lgbm_ranker.joblib')
     joblib.dump(model, path)
     return os.path.basename(path)
@@ -4093,7 +4133,8 @@ def main():
 
     ensemble_days = []
     single_seed_days = {seed: [] for seed in ensemble_seeds}
-    full_trading_dates = full_data['日期'].dropna().unique()
+    # full_data 会移除标签不完整的末端日期；OOF 标签结束日仍须在开发期原始日历上推导。
+    full_trading_dates = full_df['日期'].dropna().unique()
     for fold in folds:
         fold_number = int(fold['fold'])
         aligned_days = align_oof_prediction_records(
