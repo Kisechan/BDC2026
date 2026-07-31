@@ -559,6 +559,16 @@ def fuse_lgbm_scores_by_fold(days, lgbm_forward):
 
 def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_folds):
     """完成逐折严格前向 LightGBM 融合与策略校准。"""
+    # LightGBM 权重选择只需要旧版完整策略校准接口支持的字段；其余字段
+    # 留给后续严格模块门控，避免把新模块参数传给兼容接口。
+    lgbm_calibration_kwargs = {
+        key: value for key, value in calibration_kwargs.items()
+        if key not in {
+            'cluster_max_raw_rank', 'cluster_cap_grid',
+            'minimum_allocation_blend', 'minimum_exposure_blend',
+            'policy_simplicity_tolerance', 'module_min_positive_fold_fraction',
+        }
+    }
     lgbm_forward = []
     if lgbm_folds:
         for fold in folds:
@@ -577,7 +587,7 @@ def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_fo
                     (
                         calibrate_ensemble_policy(
                             fuse_lgbm_scores(earlier, float(candidate)),
-                            **calibration_kwargs,
+                            **lgbm_calibration_kwargs,
                         )['oof_metrics']['mean_weighted_portfolio_return'],
                         float(candidate),
                     )
@@ -594,7 +604,9 @@ def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_fo
         ensemble_days = fuse_lgbm_scores_by_fold(ensemble_days, lgbm_forward)
     else:
         deployment_lgbm_weight = 0.0
-    all_oof_policy = calibrate_ensemble_policy(ensemble_days, **calibration_kwargs)
+    all_oof_policy = calibrate_ensemble_policy(
+        ensemble_days, **lgbm_calibration_kwargs,
+    )
     if not config.get('nested_oof_enabled', False):
         return {
             'lgbm_forward': lgbm_forward,
