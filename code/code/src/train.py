@@ -235,6 +235,20 @@ def write_v17_manifest(output_dir, features, folds, lockbox_start, stock_count):
         json.dump(manifest, file, indent=2, ensure_ascii=False)
 
 
+LGBM_RELEVANCE_LEVELS = 31
+
+
+def lgbm_relevance_labels(frame):
+    """将每日行业中性收益排序映射至 LightGBM 支持的 0--30 relevance。"""
+    ranks = frame.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].rank(
+        method='first', ascending=True,
+    ).sub(1)
+    group_sizes = frame.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].transform('size')
+    return np.floor(ranks * LGBM_RELEVANCE_LEVELS / group_sizes).clip(
+        0, LGBM_RELEVANCE_LEVELS - 1,
+    ).astype(np.int32)
+
+
 def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     """同一训练文件内的表格排序补充模型；只以预测日连续输入训练。"""
     if not config.get('lgbm_enabled', False):
@@ -246,7 +260,6 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     if INDUSTRY_NEUTRAL_TARGET not in data:
         raise ValueError('LightGBM 需要行业中性标签')
     results = []
-    rank_labels = lambda frame: frame.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].rank(method='first').sub(1).astype(np.int32)
     for fold in folds:
         train = data.loc[data['日期'] <= fold['train_end']].sort_values(
             ['日期', 'instrument'], kind='mergesort',
@@ -258,17 +271,19 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
         valid_groups = valid.groupby('日期', sort=False).size().to_numpy()
         if train.empty or valid.empty or groups.min() < 2 or valid_groups.min() < 2:
             raise ValueError(f"LightGBM Fold {fold['fold']} 的日期分组不足")
+        train_labels = lgbm_relevance_labels(train)
+        valid_labels = lgbm_relevance_labels(valid)
         print(f"阶段 LightGBM：Fold {fold['fold']}，训练 {len(train):,} / 验证 {len(valid):,} 行")
         model = LGBMRanker(
-            objective='lambdarank', metric='ndcg', eval_at=[5],
+            objective='lambdarank', metric='ndcg',
             learning_rate=config['lgbm_learning_rate'], n_estimators=config['lgbm_n_estimators'],
             num_leaves=config['lgbm_num_leaves'], min_child_samples=config['lgbm_min_child_samples'],
             colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
             reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
             n_jobs=config['lgbm_n_jobs'], verbosity=-1,
         )
-        model.fit(train[features], rank_labels(train), group=groups,
-                  eval_set=[(valid[features], rank_labels(valid))], eval_group=[valid_groups],
+        model.fit(train[features], train_labels, group=groups,
+                  eval_X=valid[features], eval_y=valid_labels, eval_group=[valid_groups], eval_at=[5],
                   callbacks=[early_stopping(config['lgbm_early_stopping_rounds'], verbose=False)])
         lgbm_dir = os.path.join(output_dir, 'lgbm')
         os.makedirs(lgbm_dir, exist_ok=True)
@@ -296,7 +311,7 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
     iterations = int(np.median([row['best_iteration'] for row in fold_results]))
     data = data.sort_values(['日期', 'instrument'], kind='mergesort').copy()
     groups = data.groupby('日期', sort=False).size().to_numpy()
-    labels = data.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].rank(method='first').sub(1).astype(np.int32)
+    labels = lgbm_relevance_labels(data)
     model = LGBMRanker(
         objective='lambdarank', learning_rate=config['lgbm_learning_rate'],
         n_estimators=iterations, num_leaves=config['lgbm_num_leaves'],
