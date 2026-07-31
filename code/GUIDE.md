@@ -82,7 +82,8 @@ LOCKBOX_EVAL=1 ./train.sh
 V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh
 ```
 
-最终重训写入独立 `v1.19_full5y_deployment` 目录。之后运行 `./test.sh` 做工件、推理、股票唯一性和
+最终重训会复用锁箱前冻结的候选策略、LightGBM 中位迭代数和四阶段 epoch，不重新执行 OOF 或策略标定，
+并写入独立 `v1.19_full5y_deployment` 目录。之后运行 `./test.sh` 做工件、推理、股票唯一性和
 资金约束验证；若 `test.csv` 最大日期不晚于预测日，报告会明确拒绝计算本地后验收益。
 
 成功完成训练

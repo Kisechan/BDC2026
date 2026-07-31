@@ -273,7 +273,8 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 先检查 `cross_validation_summary.json` 的 `promotion_criteria.passed`。通过后才可一次性执行
 `LOCKBOX_EVAL=1 ./train.sh`；只有生成的 `lockbox_report.json` 许可最终部署，才可运行
 `V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh`。最终重训始终写入独立
-`v1.19_full5y_deployment` 目录，禁止据此再调参。
+`v1.19_full5y_deployment` 目录，并复用锁箱前冻结的策略、epoch 与 LightGBM 迭代数，不再执行 OOF
+或策略标定；禁止据此再调参。
 
 4) 生成预测结果
 

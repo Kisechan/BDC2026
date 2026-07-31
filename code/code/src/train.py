@@ -449,6 +449,109 @@ def require_accepted_lockbox_for_deployment():
         raise ValueError('锁箱未通过，禁止 v1.19 全五年最终部署重训')
 
 
+def run_frozen_final_deployment(output_dir):
+    """用锁箱前已冻结的策略和轮数在全五年重训，绝不再做 OOF 选型。"""
+    candidate_dir = (
+        f"./model/{config['sequence_length']}_{config['feature_num']}_"
+        f"{config['experiment_name']}_candidate"
+    )
+    source_summary_path = os.path.join(candidate_dir, 'cross_validation_summary.json')
+    source_policy_path = os.path.join(candidate_dir, 'ensemble_policy.json')
+    source_manifest_path = os.path.join(candidate_dir, 'artifact_manifest.json')
+    for path, label in (
+        (source_summary_path, '冻结开发期报告'),
+        (source_policy_path, '冻结部署策略'),
+        (source_manifest_path, '冻结 manifest'),
+    ):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'最终部署缺少{label}: {path}')
+    with open(source_summary_path, encoding='utf-8') as handle:
+        source_summary = json.load(handle)
+    with open(source_policy_path, encoding='utf-8') as handle:
+        policy = json.load(handle)
+    with open(source_manifest_path, encoding='utf-8') as handle:
+        source_manifest = json.load(handle)
+    stage_epochs = source_summary.get('full_training', {}).get('stage_epochs')
+    if set(stage_epochs or ()) != set(TRAINING_STAGES):
+        raise ValueError('冻结开发期报告缺少四阶段最终训练轮数')
+    source_lgbm_folds = []
+    for fold in source_manifest.get('folds', []):
+        fold_id = int(fold['fold'])
+        path = os.path.join(candidate_dir, 'lgbm', f'fold_{fold_id}.joblib')
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'冻结开发期缺少 LightGBM 折模型: {path}')
+        source_lgbm_folds.append({
+            'best_iteration': int(joblib.load(path).booster_.current_iteration()),
+        })
+    if not source_lgbm_folds:
+        raise ValueError('冻结开发期缺少 LightGBM 折迭代数')
+    if os.path.exists(os.path.join(output_dir, 'ensemble_policy.json')) and not resume_training_enabled():
+        raise FileExistsError(f'最终部署目录已存在，拒绝覆盖: {output_dir}')
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+
+    data_file = os.path.join(config['data_path'], 'train.csv')
+    full_df = pd.read_csv(data_file, dtype={'股票代码': str})
+    full_df['股票代码'] = full_df['股票代码'].astype(str).str.zfill(6)
+    stockid2idx = {
+        stock_id: index + 2
+        for index, stock_id in enumerate(sorted(full_df['股票代码'].unique()))
+    }
+    with open(os.path.join(output_dir, 'stockid2idx.json'), 'w', encoding='utf-8') as handle:
+        json.dump(stockid2idx, handle, indent=2, ensure_ascii=False)
+    print('阶段 最终部署：全五年特征、Scaler 与冻结配置重训（不执行 OOF 策略标定）')
+    full_data, features = preprocess_data(full_df, is_train=True, stockid2idx=stockid2idx)
+    full_data['日期'] = pd.to_datetime(full_data['日期'])
+    frozen_folds = [
+        {key: (int(value) if key == 'fold' else pd.Timestamp(value)) for key, value in fold.items()}
+        for fold in source_manifest.get('folds', [])
+    ]
+    write_v17_manifest(output_dir, features, frozen_folds, None, len(stockid2idx))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    configure_accelerator(device)
+    set_seed(int(config['seed']))
+    dataset, train_end = prepare_full_training_dataset(full_data, features, output_dir)
+    final_dir = os.path.join(output_dir, f"seed_{int(config['seed'])}")
+    final_training = train_final_model(
+        dataset, train_end, features, len(stockid2idx), device, final_dir,
+        {stage: int(stage_epochs[stage]) for stage in TRAINING_STAGES},
+        int(config['seed']),
+    )
+    lgbm_model_path = fit_lgbm_final(
+        full_data, features, source_lgbm_folds, output_dir,
+    )
+    policy.update({
+        'policy_role': 'frozen_v1.19_policy_full5y_retrained',
+        'model_paths': [os.path.join(f"seed_{int(config['seed'])}", 'best_model.pth')],
+        'ensemble_enabled': False,
+        'ensemble_seeds': [int(config['seed'])],
+        'lgbm_model_path': lgbm_model_path,
+        'config_path': 'config.json',
+        'scaler_path': 'scaler.pkl',
+        'final_deployment_source_dir': os.path.relpath(candidate_dir, output_dir),
+        'final_deployment_recalibrated': False,
+    })
+    with open(os.path.join(output_dir, 'ensemble_policy.json'), 'w', encoding='utf-8') as handle:
+        json.dump(policy, handle, indent=2, ensure_ascii=False)
+    summary = dict(source_summary)
+    summary.update({
+        'training_mode': 'full5y_deployment_frozen_policy',
+        'full_training': {'models': [final_training], 'stage_epochs': stage_epochs},
+        'final_deployment': {
+            'source_dir': os.path.relpath(candidate_dir, output_dir),
+            'source_policy_sha256': sha256_file(source_policy_path),
+            'source_summary_sha256': sha256_file(source_summary_path),
+            'lockbox_report_sha256': sha256_file(os.path.join(candidate_dir, 'lockbox_report.json')),
+            'recalibrated_on_lockbox': False,
+        },
+    })
+    with open(os.path.join(output_dir, 'cross_validation_summary.json'), 'w', encoding='utf-8') as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+    print(f'最终部署重训完成，工件已隔离写入: {output_dir}')
+    return float(summary['mean_weighted_portfolio_return'])
+
+
 def write_v17_manifest(output_dir, features, folds, lockbox_start, stock_count):
     """记录特征、架构与锁箱边界，供推理拒绝不兼容工件。"""
     manifest = {
@@ -4664,6 +4767,7 @@ def main():
     )
     if final_deployment:
         require_accepted_lockbox_for_deployment()
+        return run_frozen_final_deployment(config['output_dir'])
     if config.get('policy_only_experiment', False) and not final_deployment:
         raise ValueError(
             '当前配置是策略重放实验，不允许重新训练；'
