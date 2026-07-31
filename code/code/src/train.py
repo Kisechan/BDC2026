@@ -344,7 +344,10 @@ def run_lockbox_eval(output_dir):
     )]
     if not anchors:
         raise ValueError('锁箱没有可完成 t+1 至 t+5 持有期的交易日')
-    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # train.py 位于 code/src；推理必须在 code/ 根目录运行，才能解析 data_5y。
+    project_dir = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__),
+    )))
     prediction_root = os.path.join(output_dir, '_lockbox_predictions')
     candidates = {
         'v1.17_baseline': baseline_dir,
