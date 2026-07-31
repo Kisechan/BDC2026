@@ -49,22 +49,41 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v1.18 使用已完成的 v1.17 205维 `158+39_reduced25_relmarket12_risk15_indresid12` candidate
-作严格三折策略重放，不重新训练 Transformer 或 LightGBM。除五年
-行情外，需准备 `data_5y/stock_industry_history.csv`，其中必须包含
-`effective_date,stock_id,industry`；特征只使用预测日期当日或之前的行业快照。运行
-`./train.sh` 后，模型工件根目录必须同时保留 `config.json`、`scaler.pkl`、
-`stockid2idx.json`、checkpoint 和 `artifact_manifest.json`。
+当前 v1.19 训练独立的 205维 `158+39_reduced25_relmarket12_risk15_indresid12` RankGLU
+Transformer 和 `rank_xendcg` LightGBM，不复用或覆盖 v1.17/v1.18 工件。除五年行情外，需准备
+`data_5y/stock_industry_history.csv`，其中必须包含 `effective_date,stock_id,industry`；特征只使用
+预测日期当日或之前的行业快照。运行 `./train.sh` 后，模型工件根目录必须同时保留 `config.json`、
+`scaler.pkl`、`stockid2idx.json`、checkpoint、LightGBM 模型和 `artifact_manifest.json`。
 
 `artifact_manifest.json` 的 `feature_count` 必须为205，且记录 `feature_num`、
-`sequence_length`、`stock_mapping_size` 和模型结构。`./test.sh` 会在特征工程前检查
-manifest、Scaler、checkpoint 输入宽度和股票 embedding；不得把 v1.16 的193维工件接入 v1.17。
+`sequence_length`、`stock_mapping_size`、`score_head_variant=rankglu_v1`、bottleneck 与 gamma 上界。
+`./test.sh` 会在特征工程前检查 manifest、Scaler、checkpoint 输入宽度、RankGLU 头和股票 embedding；
+不得把 v1.16 的193维或旧 MLP score-head 工件接入 v1.19。
 旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
 
-在 `code/` 目录执行 `POLICY_ONLY=1 ./train.sh` 生成独立 v1.18 策略目录。该步骤会加载 v1.17
-checkpoint、scaler、manifest 与最终 LightGBM，并把缺失的折树 OOF 分数缓存于 v1.18 目录；
-不会覆盖 v1.17 工件。完成且开发期晋级后才运行 `./test.sh`。v1.18 固定关闭风险惩罚、反转和
-相关性策略，保留 Allocation Head 和至少25%的 Exposure Head，其余 Exposure 使用近满仓 fallback。
+在 `code/` 目录执行 `./train.sh` 开始 v1.19 单种子三折训练和全开发期重训。它会完整评估两条
+预注册候选：`rankglu_transformer_only` 与 `rankxendcg_lgbm_only`，不搜索中间融合权重。风险惩罚、
+反转、相关性策略和相关簇替换固定关闭；Allocation 保留 Head 25%，Exposure 保留 Head 25%，其余
+Exposure 使用近满仓 fallback。训练完成后先查看 `cross_validation_summary.json` 的
+`pre_registered_candidates` 和 `selected_candidate`：只有被选候选的 `promotion_criteria.passed=true`
+才可进行锁箱评估。
+
+锁箱仅可运行一次，且不会训练模型：
+
+```bash
+LOCKBOX_EVAL=1 ./train.sh
+```
+
+它使用冻结的末两个月数据，以 `t+1` 开盘入场、`t+5` 收盘退出，并每5个交易日取一个非重叠锚点，
+对比 v1.17 baseline 与已晋级 v1.19 候选；结果原子写入 v1.19 目录的 `lockbox_report.json`，存在时
+拒绝覆盖。只有该报告的 `accepted_for_final_deployment=true` 后，才可以运行：
+
+```bash
+V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh
+```
+
+最终重训写入独立 `v1.19_full5y_deployment` 目录。之后运行 `./test.sh` 做工件、推理、股票唯一性和
+资金约束验证；若 `test.csv` 最大日期不晚于预测日，报告会明确拒绝计算本地后验收益。
 
 成功完成训练
 
