@@ -1,10 +1,11 @@
 # 配置参数
 sequence_length = 60
-feature_num = '158+39_reduced25_relmarket12_risk15'
+feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'nested_oof_forward_policy_v7_1'
+experiment_name = 'sixfold_industryresidual_lgbmblend_pathrisk_v17'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
+    'experiment_name': experiment_name,
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
     'sequence_length': sequence_length,
@@ -25,12 +26,15 @@ config = {
     'id_gate_init': 0.20,
     'id_gate_regularization': 0.01,
     'identity_sensitivity_seed': 20260728,
-    # 166个reduced25 + 12个相对市场 + 15个短期风险/市场压力输入。
+    # 166个reduced25 + 12个相对市场 + 15个短期风险/市场压力 +
+    # 12个因果行业残差输入；行业代码和名称不作为模型输入。
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'grad_clip': True,
-    'num_folds': 3,
+    'num_folds': 6,
     'validation_months': 2,
+    'lockbox_months': 2,
+    'lockbox_enabled': True,
     'evaluation_stride': 5,
     'seed': 42,
     'ensemble_enabled': False,
@@ -42,6 +46,9 @@ config = {
 
     'regression_weight': 0.05,
     'regression_beta': 0.02,
+    'industry_residual_head_enabled': True,
+    'industry_residual_weight': 0.05,
+    'industry_residual_beta': 0.02,
     'allocation_weight': 0.1,
     'exposure_weight': 1.0,
     'allocation_candidate_k': 20,
@@ -79,6 +86,10 @@ config = {
     'risk_5d_weight': 0.20,
     'tail_5d_weight': 0.20,
     'tail_5d_threshold': -0.03,
+    'tail_5d_target_mode': 'holding_path_min',
+    'path_loss_5d_head_enabled': True,
+    'path_loss_5d_weight': 0.10,
+    'path_loss_5d_beta': 0.02,
     'regime_gate_enabled': True,
     'regime_market_hidden_size': 16,
     'regime_market_feature_indices': [
@@ -96,6 +107,8 @@ config = {
     'min_exposure': 0.20,
     'max_exposure': 0.999999,
     'allocation_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
+    'allocation_weight_floor': 0.05,
+    'allocation_weight_cap': 0.35,
     'disagreement_gamma_grid': [0.0, 2.0, 4.0, 8.0],
     'selection_risk_gamma_grid': [0.0, 0.05, 0.10, 0.20],
     'correlation_exposure_gamma_grid': [0.0, 0.5, 1.0, 2.0],
@@ -109,10 +122,21 @@ config = {
     'cluster_correlation_threshold': 0.60,
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
+    'lgbm_enabled': True,
+    'lgbm_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
+    'lgbm_learning_rate': 0.03,
+    'lgbm_num_leaves': 31,
+    'lgbm_min_child_samples': 80,
+    'lgbm_feature_fraction': 0.80,
+    'lgbm_bagging_fraction': 0.80,
+    'lgbm_lambda_l2': 5.0,
+    'lgbm_n_estimators': 4000,
+    'lgbm_early_stopping_rounds': 200,
+    'lgbm_n_jobs': -1,
     'nested_oof_enabled': True,
     # 策略层纯收益优先，但保留较轻的下行波动惩罚。
     'ensemble_downside_weight': 0.25,
-    'policy_only_experiment': True,
+    'policy_only_experiment': False,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
     'forward_module_max_fold_loss': 0.0025,
@@ -188,4 +212,5 @@ config = {
     ),
     # 五年历史数据与原三年数据隔离存放，避免覆盖已有实验的切分文件。
     'data_path': './data_5y',
+    'industry_history_path': './data_5y/stock_industry_history.csv',
 }

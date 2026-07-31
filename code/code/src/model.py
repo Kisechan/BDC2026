@@ -143,6 +143,13 @@ class StockTransformer(nn.Module):
         self.tail_5d_head_enabled = bool(
             config.get('tail_5d_head_enabled', False)
         )
+        # V17 的两个辅助目标默认关闭，因而旧 checkpoint/config 保持兼容。
+        self.industry_residual_head_enabled = bool(
+            config.get('industry_residual_head_enabled', False)
+        )
+        self.path_loss_5d_head_enabled = bool(
+            config.get('path_loss_5d_head_enabled', False)
+        )
         self.tail_5d_blend = float(
             config.get('tail_5d_blend', 0.0)
             if self.tail_5d_head_enabled else 0.0
@@ -195,6 +202,15 @@ class StockTransformer(nn.Module):
                     nn.Dropout(config['dropout'] * 0.5),
                     nn.Linear(risk_head_hidden, 1),
                 )
+            if self.path_loss_5d_head_enabled:
+                self.path_loss_5d_head = nn.Sequential(
+                    nn.Linear(risk_head_input, risk_head_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(config['dropout'] * 0.5),
+                    nn.Linear(risk_head_hidden, 1),
+                )
+        elif self.path_loss_5d_head_enabled:
+            raise ValueError('path_loss_5d_head_enabled 需要 risk_heads_enabled=True')
         if self.regime_gate_enabled:
             regime_feature_indices = [
                 int(index)
@@ -238,6 +254,13 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1),
         )
+        if self.industry_residual_head_enabled:
+            self.industry_residual_head = nn.Sequential(
+                nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
+                nn.ReLU(),
+                nn.Dropout(config['dropout'] * 0.5),
+                nn.Linear(config['d_model'] // 4, 1),
+            )
 
         # Top-k 内相对仓位分配头；输出 logits，推理时经 softmax 后乘总仓位。
         self.allocation_head = nn.Sequential(
@@ -457,6 +480,8 @@ class StockTransformer(nn.Module):
         risk_3d_logits = None
         risk_5d_logits = None
         tail_5d_logits = None
+        path_loss_5d_output = None
+        industry_residual_returns = None
         combined_risk = None
         if self.risk_heads_enabled:
             risk_1d_logits = self.risk_1d_head(flat_features).view(
@@ -475,6 +500,10 @@ class StockTransformer(nn.Module):
                 tail_5d_logits = self.tail_5d_head(
                     flat_features
                 ).view(batch_size, num_stocks)
+            if self.path_loss_5d_head_enabled:
+                path_loss_5d_output = self.path_loss_5d_head(
+                    flat_features
+                ).view(batch_size, num_stocks)
             combined_risk = (
                 self.risk_1d_blend * torch.sigmoid(risk_1d_logits)
                 + self.risk_3d_blend * torch.sigmoid(risk_3d_logits)
@@ -489,6 +518,10 @@ class StockTransformer(nn.Module):
                     combined_risk
                     + self.tail_5d_blend * torch.sigmoid(tail_5d_logits)
                 )
+        if self.industry_residual_head_enabled:
+            industry_residual_returns = self.industry_residual_head(
+                flat_features
+            ).view(batch_size, num_stocks)
 
         regime_gate = raw_score_output.new_zeros(batch_size)
         if self.regime_gate_enabled:
@@ -630,6 +663,8 @@ class StockTransformer(nn.Module):
                     'risk_3d_logits': risk_3d_logits,
                     'risk_5d_logits': risk_5d_logits,
                     'tail_5d_logits': tail_5d_logits,
+                    'path_loss_5d_output': path_loss_5d_output,
+                    'industry_residual_returns': industry_residual_returns,
                     'combined_risk': combined_risk,
                     'regime_gate': regime_gate,
                     'exposure_base_probability': base_exposure_probability,

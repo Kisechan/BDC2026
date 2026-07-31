@@ -18,18 +18,24 @@ from utils import (
     RELATIVE_MARKET_FEATURE_SET,
     RISK_MARKET_FEATURES,
     RISK_MARKET_FEATURE_SET,
+    INDUSTRY_RESIDUAL_FEATURE_SET,
+    INDUSTRY_RESIDUAL_FEATURES,
+    INDUSTRY_ASOF_COLUMN,
+    INDUSTRY_NEUTRAL_TARGET,
 )
+from utils import add_industry_residual_features, add_industry_neutral_label
 from utils import create_ranking_dataset_vectorized
 from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
-from utils import cross_fit_ensemble_policy, evaluate_ensemble_policy
-from utils import cross_fit_module_gated_policy
+from utils import evaluate_ensemble_policy
 from utils import attach_label_end_dates, forward_fit_module_gated_policy
+from utils import percentile_ranks
 import joblib
 import os
 import json
 import multiprocessing as mp
 import random
+import hashlib
 
 
 def policy_only_enabled():
@@ -109,7 +115,8 @@ def forward_model_batch(model, batch, sequences, stock_indices, masks, device):
 def dense_stage_loss(
     criterion, model, outputs, relevance, return_outputs, targets,
     allocation_outputs, exposures, auxiliary_outputs, risk_1d_targets,
-    risk_3d_targets, regime_targets, stage, return_components=False,
+    risk_3d_targets, tail_5d_targets, path_loss_5d_targets,
+    industry_neutral_targets, regime_targets, stage, return_components=False,
 ):
     """无 padding 的完整 batch 一次计算辅助阶段损失，避免逐日期 Python 循环。"""
     return criterion(
@@ -124,6 +131,11 @@ def dense_stage_loss(
         risk_3d_logits=auxiliary_outputs['risk_3d_logits'],
         risk_5d_logits=auxiliary_outputs['risk_5d_logits'],
         tail_5d_logits=auxiliary_outputs['tail_5d_logits'],
+        path_loss_5d_outputs=auxiliary_outputs['path_loss_5d_output'],
+        tail_5d_targets=tail_5d_targets,
+        path_loss_5d_targets=path_loss_5d_targets,
+        industry_residual_outputs=auxiliary_outputs['industry_residual_returns'],
+        industry_neutral_targets=industry_neutral_targets,
         regime_gate=auxiliary_outputs['regime_gate'],
         risk_1d_targets=risk_1d_targets,
         risk_3d_targets=risk_3d_targets,
@@ -148,6 +160,176 @@ def resume_training_enabled():
 
 
 TRAINING_STAGES = ('ranking', 'risk', 'allocation', 'exposure')
+
+
+def apply_v17_profile():
+    """在进程启动时选择可复跑的 V17 基线或候选路径。
+
+    配置文件可以保持 candidate 的 205 维默认值；基线由环境变量覆盖，
+    从而保证两者共用同一原始数据、锁箱和 six-fold 边界。
+    """
+    profile = os.environ.get('V17_PROFILE', 'candidate').strip().lower()
+    if profile not in {'baseline', 'candidate'}:
+        raise ValueError('V17_PROFILE 只能为 baseline 或 candidate')
+    if profile == 'baseline':
+        config.update({
+            'feature_num': RISK_MARKET_FEATURE_SET,
+            'industry_residual_head_enabled': False,
+            'industry_residual_weight': 0.0,
+            'path_loss_5d_head_enabled': False,
+            'path_loss_5d_weight': 0.0,
+            'tail_5d_target_mode': 'endpoint_return',
+            'lgbm_enabled': False,
+            # 保守基线：更高的最低仓位及不启用新风险融合模块。
+            'min_exposure': max(float(config.get('min_exposure', .80)), .80),
+        })
+    else:
+        config['feature_num'] = INDUSTRY_RESIDUAL_FEATURE_SET
+    config['v17_profile'] = profile
+    config['output_dir'] = (
+        f"./model/{config['sequence_length']}_{config['feature_num']}_"
+        f"{config.get('experiment_name', 'v17')}_{profile}"
+    )
+    return profile
+
+
+def split_v17_lockbox(df):
+    """冻结最后 N 个自然月；开发期之外的数据不参与训练或选型。"""
+    dated = df.copy()
+    dated['日期'] = pd.to_datetime(dated['日期'])
+    if os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1':
+        if os.environ.get('LOCKBOX_ACCEPTED', '0') != '1':
+            raise ValueError('仅在锁箱验收后设置 LOCKBOX_ACCEPTED=1 才可纳入最终重训')
+        print('锁箱验收已确认：仅用于固定配置的最终部署重训')
+        return dated, None
+    if not config.get('lockbox_enabled', False):
+        return dated, None
+    last_date = dated['日期'].max()
+    months = int(config.get('lockbox_months', 2))
+    if months < 1 or pd.isna(last_date):
+        raise ValueError('lockbox_months 必须大于0，且训练数据必须包含日期')
+    start = (last_date.to_period('M') - (months - 1)).start_time
+    development = dated.loc[dated['日期'] < start].copy()
+    if development.empty or dated.loc[dated['日期'] >= start].empty:
+        raise ValueError('锁箱切分得到空数据集')
+    print(f'锁箱已冻结: {start.date()} 至 {last_date.date()}，不参与开发期训练')
+    return development, pd.Timestamp(start)
+
+
+def write_v17_manifest(output_dir, features, folds, lockbox_start, stock_count):
+    """记录特征、架构与锁箱边界，供推理拒绝不兼容工件。"""
+    manifest = {
+        'schema_version': 1,
+        'feature_num': config['feature_num'], 'feature_count': len(features),
+        'feature_sha256': hashlib.sha256('\n'.join(features).encode()).hexdigest(),
+        'sequence_length': config['sequence_length'], 'd_model': config['d_model'],
+        'nhead': config['nhead'], 'num_layers': config['num_layers'],
+        'dim_feedforward': config['dim_feedforward'],
+        'stock_embedding_dim': config['stock_embedding_dim'],
+        'stock_mapping_size': int(stock_count),
+        'lockbox_start': None if lockbox_start is None else lockbox_start.strftime('%Y-%m-%d'),
+        'folds': [{key: int(value) if key == 'fold' else pd.Timestamp(value).strftime('%Y-%m-%d')
+                   for key, value in fold.items()} for fold in folds],
+    }
+    with open(os.path.join(output_dir, 'artifact_manifest.json'), 'w', encoding='utf-8') as file:
+        json.dump(manifest, file, indent=2, ensure_ascii=False)
+
+
+def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
+    """同一训练文件内的表格排序补充模型；只以预测日连续输入训练。"""
+    if not config.get('lgbm_enabled', False):
+        return []
+    try:
+        from lightgbm import LGBMRanker, early_stopping
+    except ImportError as exc:
+        raise RuntimeError('v1.17 需要 lightgbm；请在 code 目录运行 uv sync') from exc
+    if INDUSTRY_NEUTRAL_TARGET not in data:
+        raise ValueError('LightGBM 需要行业中性标签')
+    results = []
+    rank_labels = lambda frame: frame.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].rank(method='first').sub(1).astype(np.int32)
+    for fold in folds:
+        train = data.loc[data['日期'] <= fold['train_end']].sort_values(
+            ['日期', 'instrument'], kind='mergesort',
+        ).copy()
+        valid = data.loc[
+            (data['日期'] >= fold['val_start']) & (data['日期'] <= fold['val_end'])
+        ].sort_values(['日期', 'instrument'], kind='mergesort').copy()
+        groups = train.groupby('日期', sort=False).size().to_numpy()
+        valid_groups = valid.groupby('日期', sort=False).size().to_numpy()
+        if train.empty or valid.empty or groups.min() < 2 or valid_groups.min() < 2:
+            raise ValueError(f"LightGBM Fold {fold['fold']} 的日期分组不足")
+        print(f"阶段 LightGBM：Fold {fold['fold']}，训练 {len(train):,} / 验证 {len(valid):,} 行")
+        model = LGBMRanker(
+            objective='lambdarank', metric='ndcg', eval_at=[5],
+            learning_rate=config['lgbm_learning_rate'], n_estimators=config['lgbm_n_estimators'],
+            num_leaves=config['lgbm_num_leaves'], min_child_samples=config['lgbm_min_child_samples'],
+            colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
+            reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
+            n_jobs=config['lgbm_n_jobs'], verbosity=-1,
+        )
+        model.fit(train[features], rank_labels(train), group=groups,
+                  eval_set=[(valid[features], rank_labels(valid))], eval_group=[valid_groups],
+                  callbacks=[early_stopping(config['lgbm_early_stopping_rounds'], verbose=False)])
+        lgbm_dir = os.path.join(output_dir, 'lgbm')
+        os.makedirs(lgbm_dir, exist_ok=True)
+        joblib.dump(model, os.path.join(lgbm_dir, f"fold_{fold['fold']}.joblib"))
+        by_date = {pd.Timestamp(date).strftime('%Y-%m-%d'): rows.set_index('instrument')
+                   for date, rows in valid.groupby('日期', sort=False)}
+        for records in oof_records[int(fold['fold'])].values():
+            for record in records:
+                rows = by_date.get(record['prediction_date'])
+                if rows is None:
+                    continue
+                ordered = rows.reindex(np.asarray(record['stock_indices'], dtype=np.int64))
+                if ordered[features].isna().any().any():
+                    raise ValueError('LightGBM OOF 与 Transformer 股票集合不一致')
+                record['lgbm_scores'] = model.predict(ordered[features], num_iteration=model.best_iteration_)
+        results.append({'fold': int(fold['fold']), 'best_iteration': int(model.best_iteration_ or config['lgbm_n_estimators'])})
+    return results
+
+
+def fit_lgbm_final(data, features, fold_results, output_dir):
+    """以折中位最佳轮数重训部署树模型；锁箱仍不进入数据。"""
+    if not fold_results:
+        return None
+    from lightgbm import LGBMRanker
+    iterations = int(np.median([row['best_iteration'] for row in fold_results]))
+    data = data.sort_values(['日期', 'instrument'], kind='mergesort').copy()
+    groups = data.groupby('日期', sort=False).size().to_numpy()
+    labels = data.groupby('日期', sort=False)[INDUSTRY_NEUTRAL_TARGET].rank(method='first').sub(1).astype(np.int32)
+    model = LGBMRanker(
+        objective='lambdarank', learning_rate=config['lgbm_learning_rate'],
+        n_estimators=iterations, num_leaves=config['lgbm_num_leaves'],
+        min_child_samples=config['lgbm_min_child_samples'],
+        colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
+        reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
+        n_jobs=config['lgbm_n_jobs'], verbosity=-1,
+    )
+    print(f'阶段 LightGBM：全量开发期重训 {len(data):,} 行，迭代 {iterations}')
+    model.fit(data[features], labels, group=groups)
+    path = os.path.join(output_dir, 'lgbm_ranker.joblib')
+    joblib.dump(model, path)
+    return os.path.basename(path)
+
+
+def fuse_lgbm_scores(days, weight):
+    """按日百分位融合；Allocation、Exposure、风险头保持 Transformer 来源。"""
+    fused = []
+    for day in days:
+        copied = dict(day)
+        if weight == 0 or 'lgbm_scores' not in day:
+            fused.append(copied)
+            continue
+        score = ((1.0 - weight) * percentile_ranks(np.mean(day['scores'], axis=0))
+                 + weight * percentile_ranks(day['lgbm_scores']))
+        copied['scores'] = score.reshape(1, -1)
+        for key in ('allocation_logits', 'risk_1d_probabilities', 'risk_3d_probabilities',
+                    'risk_5d_probabilities', 'tail_5d_probabilities'):
+            copied[key] = np.mean(day[key], axis=0, keepdims=True)
+        copied['exposures'] = np.asarray([np.median(day['exposures'])])
+        copied['regime_gates'] = np.asarray([np.median(day['regime_gates'])])
+        fused.append(copied)
+    return fused
 
 
 def recover_completed_stage_results(fold_dir, steps_per_epoch):
@@ -289,10 +471,18 @@ feature_cloums_map[RISK_MARKET_FEATURE_SET] = [
     *RISK_MARKET_FEATURES,
 ]
 feature_engineer_func_map[RISK_MARKET_FEATURE_SET] = engineer_features_158plus39
+feature_cloums_map[INDUSTRY_RESIDUAL_FEATURE_SET] = [
+    *feature_cloums_map[RISK_MARKET_FEATURE_SET],
+    *INDUSTRY_RESIDUAL_FEATURES,
+]
+feature_engineer_func_map[INDUSTRY_RESIDUAL_FEATURE_SET] = (
+    engineer_features_158plus39
+)
 assert len(feature_cloums_map['158+39_reduced20']) == 171
 assert len(feature_cloums_map['158+39_reduced25']) == 166
 assert len(feature_cloums_map[RELATIVE_MARKET_FEATURE_SET]) == 178
 assert len(feature_cloums_map[RISK_MARKET_FEATURE_SET]) == 193
+assert len(feature_cloums_map[INDUSTRY_RESIDUAL_FEATURE_SET]) == 205
 
 
 def _build_label_and_clean(processed, drop_small_open=True):
@@ -301,10 +491,18 @@ def _build_label_and_clean(processed, drop_small_open=True):
     processed['open_t2'] = processed.groupby('股票代码')['开盘'].shift(-2)
     processed['open_t4'] = processed.groupby('股票代码')['开盘'].shift(-4)
     processed['open_t5'] = processed.groupby('股票代码')['开盘'].shift(-5)
+    path_loss_enabled = bool(config.get('path_loss_5d_head_enabled', False))
+    tail_target_mode = config.get('tail_5d_target_mode', 'endpoint_return')
+    if tail_target_mode not in {'endpoint_return', 'holding_path_min'}:
+        raise ValueError('tail_5d_target_mode 只能为 endpoint_return 或 holding_path_min')
+    if path_loss_enabled or tail_target_mode == 'holding_path_min':
+        lows = processed.groupby('股票代码')['最低']
+        for offset in range(1, 6):
+            processed[f'low_t{offset}'] = lows.shift(-offset)
 
     # 过滤无效开盘价，避免收益率极端爆炸
     if drop_small_open:
-        processed = processed[processed['open_t1'] > 1e-4]
+        processed = processed.loc[processed['open_t1'] > 1e-4].copy()
 
     processed['label'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
     processed['return_1d_target'] = (
@@ -315,6 +513,14 @@ def _build_label_and_clean(processed, drop_small_open=True):
         (processed['open_t4'] - processed['open_t1'])
         / (processed['open_t1'] + 1e-12)
     )
+    if path_loss_enabled or tail_target_mode == 'holding_path_min':
+        future_low = processed[[f'low_t{offset}' for offset in range(1, 6)]].min(axis=1)
+        processed['path_loss_5d_target'] = (
+            future_low - processed['open_t1']
+        ) / (processed['open_t1'] + 1e-12)
+    else:
+        # 使旧数据集构造接口也始终有此列；该值不会进入损失。
+        processed['path_loss_5d_target'] = processed['label']
     risk_1d_temperature = float(config.get('risk_1d_target_temperature', 0.01))
     risk_3d_temperature = float(config.get('risk_3d_target_temperature', 0.02))
     processed['risk_1d_target'] = 1.0 / (
@@ -331,18 +537,24 @@ def _build_label_and_clean(processed, drop_small_open=True):
             30.0,
         ))
     )
-    processed = processed.dropna(subset=[
+    required_labels = [
         'label',
         'risk_1d_target',
         'risk_3d_target',
-    ])
+    ]
+    if path_loss_enabled:
+        required_labels.append('path_loss_5d_target')
+    processed = processed.dropna(subset=required_labels)
 
     dates = processed['日期']
     tail_threshold = float(config.get('tail_5d_threshold', -0.03))
     market_future_return = processed['label'].groupby(dates).transform('mean')
-    market_tail_share = (
-        processed['label'].le(tail_threshold).groupby(dates).transform('mean')
+    tail_return = (
+        processed['path_loss_5d_target']
+        if tail_target_mode == 'holding_path_min' else processed['label']
     )
+    processed['tail_5d_target'] = tail_return.le(tail_threshold).astype(np.float32)
+    market_tail_share = processed['tail_5d_target'].groupby(dates).transform('mean')
     market_return_temperature = float(
         config.get('regime_market_return_temperature', 0.01)
     )
@@ -365,8 +577,13 @@ def _build_label_and_clean(processed, drop_small_open=True):
         1.0 + np.exp(np.clip(-regime_logit, -30.0, 30.0))
     )
 
+    temporary_columns = ['open_t1', 'open_t2', 'open_t4', 'open_t5']
+    temporary_columns.extend(
+        f'low_t{offset}' for offset in range(1, 6)
+        if f'low_t{offset}' in processed.columns
+    )
     processed.drop(
-        columns=['open_t1', 'open_t2', 'open_t4', 'open_t5'],
+        columns=temporary_columns,
         inplace=True,
     )
     return processed
@@ -395,8 +612,20 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
     if config['feature_num'] in {
         RELATIVE_MARKET_FEATURE_SET,
         RISK_MARKET_FEATURE_SET,
+        INDUSTRY_RESIDUAL_FEATURE_SET,
     }:
         processed = add_relative_market_features(processed)
+    if config['feature_num'] == INDUSTRY_RESIDUAL_FEATURE_SET:
+        industry_history_path = config.get('industry_history_path')
+        if not industry_history_path:
+            raise ValueError('205维行业残差特征需要 industry_history_path')
+        print('阶段 2/4：按 as-of 行业快照计算 12 个行业残差特征')
+        processed = add_industry_residual_features(
+            processed,
+            industry_history_path,
+            min_industry_size=int(config.get('minimum_industry_size', 3)),
+            industry_column=INDUSTRY_ASOF_COLUMN,
+        )
 
     # 映射股票索引，并剔除映射失败样本
     processed['instrument'] = processed['股票代码'].map(stockid2idx)
@@ -404,6 +633,16 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
     processed['instrument'] = processed['instrument'].astype(np.int64)
 
     processed = _build_label_and_clean(processed, drop_small_open=drop_small_open)
+    if config['feature_num'] == INDUSTRY_RESIDUAL_FEATURE_SET:
+        print('阶段 3/4：构建同期行业中性五日收益标签')
+        processed = add_industry_neutral_label(
+            processed,
+            target_column='label',
+            industry_column=INDUSTRY_ASOF_COLUMN,
+            output_column=INDUSTRY_NEUTRAL_TARGET,
+            min_industry_size=int(config.get('minimum_industry_size', 3)),
+        )
+        processed = processed.dropna(subset=[INDUSTRY_NEUTRAL_TARGET])
     return processed, feature_columns
 
 
@@ -445,7 +684,11 @@ class WeightedRankingLoss(nn.Module):
                  risk_5d_target_temperature=0.03,
                  tail_5d_weight=0.0,
                  tail_5d_threshold=-0.03,
-                 regime_weight=0.0):
+                 regime_weight=0.0,
+                 industry_residual_weight=0.0,
+                 industry_residual_beta=0.02,
+                 path_loss_5d_weight=0.0,
+                 path_loss_5d_beta=0.02):
         super(WeightedRankingLoss, self).__init__()
         if listwise_temperature <= 0:
             raise ValueError('listwise_temperature 必须大于 0')
@@ -489,6 +732,10 @@ class WeightedRankingLoss(nn.Module):
         self.tail_5d_weight = float(tail_5d_weight)
         self.tail_5d_threshold = float(tail_5d_threshold)
         self.regime_weight = float(regime_weight)
+        self.industry_residual_weight = float(industry_residual_weight)
+        self.industry_residual_beta = float(industry_residual_beta)
+        self.path_loss_5d_weight = float(path_loss_5d_weight)
+        self.path_loss_5d_beta = float(path_loss_5d_beta)
         self.min_exposure = min_exposure
         self.max_exposure = max_exposure
         if min(
@@ -522,12 +769,16 @@ class WeightedRankingLoss(nn.Module):
             self.risk_5d_weight,
             self.tail_5d_weight,
             self.regime_weight,
+            self.industry_residual_weight,
+            self.path_loss_5d_weight,
         ) < 0:
             raise ValueError('风险头和状态门控损失权重不能为负')
         if self.risk_5d_target_temperature <= 0:
             raise ValueError('5日风险目标 temperature 必须大于0')
         if self.tail_5d_threshold >= 0:
             raise ValueError('5日尾部风险阈值必须小于0')
+        if self.industry_residual_beta <= 0 or self.path_loss_5d_beta <= 0:
+            raise ValueError('辅助回归的 beta 必须大于0')
 
     def listwise_loss(self, y_pred, y_true, weights):
         """基于排名百分位构造平滑目标，再计算加权 Listwise Cross Entropy。"""
@@ -762,6 +1013,11 @@ class WeightedRankingLoss(nn.Module):
         risk_3d_logits=None,
         risk_5d_logits=None,
         tail_5d_logits=None,
+        path_loss_5d_outputs=None,
+        tail_5d_targets=None,
+        path_loss_5d_targets=None,
+        industry_residual_outputs=None,
+        industry_neutral_targets=None,
         regime_gate=None,
         risk_1d_targets=None,
         risk_3d_targets=None,
@@ -805,6 +1061,18 @@ class WeightedRankingLoss(nn.Module):
                 'ic_loss': self.ic_weight * rank_ic,
                 'regression_loss': self.regression_weight * regression,
             })
+            if (
+                industry_residual_outputs is not None
+                and industry_neutral_targets is not None
+                and self.industry_residual_weight > 0
+            ):
+                components['industry_residual_loss'] = (
+                    self.industry_residual_weight * F.smooth_l1_loss(
+                        industry_residual_outputs,
+                        industry_neutral_targets,
+                        beta=self.industry_residual_beta,
+                    )
+                )
         if stage in {'risk', 'joint'}:
             if (
                 risk_1d_logits is not None
@@ -841,15 +1109,28 @@ class WeightedRankingLoss(nn.Module):
                         risk_5d_targets,
                     )
                 )
-            if tail_5d_logits is not None and self.tail_5d_weight > 0:
-                tail_5d_targets = (
-                    raw_returns <= self.tail_5d_threshold
-                ).to(raw_returns.dtype)
+            if (
+                tail_5d_logits is not None
+                and tail_5d_targets is not None
+                and self.tail_5d_weight > 0
+            ):
                 components['tail_5d_loss'] = (
                     self.tail_5d_weight
                     * F.binary_cross_entropy_with_logits(
                         tail_5d_logits,
                         tail_5d_targets,
+                    )
+                )
+            if (
+                path_loss_5d_outputs is not None
+                and path_loss_5d_targets is not None
+                and self.path_loss_5d_weight > 0
+            ):
+                components['path_loss_5d_loss'] = (
+                    self.path_loss_5d_weight * F.smooth_l1_loss(
+                        path_loss_5d_outputs,
+                        path_loss_5d_targets,
+                        beta=self.path_loss_5d_beta,
                     )
                 )
             if (
@@ -1070,6 +1351,9 @@ class RankingDataset(torch.utils.data.Dataset):
         risk_1d_targets=None,
         risk_3d_targets=None,
         regime_targets=None,
+        tail_5d_targets=None,
+        path_loss_5d_targets=None,
+        industry_neutral_targets=None,
     ):
         self.sequences = sequences
         self.targets = targets
@@ -1091,6 +1375,18 @@ class RankingDataset(torch.utils.data.Dataset):
             if regime_targets is not None
             else [np.full_like(target, 0.5) for target in targets]
         )
+        self.tail_5d_targets = (
+            tail_5d_targets if tail_5d_targets is not None
+            else [np.zeros_like(target) for target in targets]
+        )
+        self.path_loss_5d_targets = (
+            path_loss_5d_targets if path_loss_5d_targets is not None
+            else [np.array(target, dtype=np.float32, copy=True) for target in targets]
+        )
+        self.industry_neutral_targets = (
+            industry_neutral_targets if industry_neutral_targets is not None
+            else [np.zeros_like(target) for target in targets]
+        )
         lengths = {
             len(sequences),
             len(targets),
@@ -1100,6 +1396,9 @@ class RankingDataset(torch.utils.data.Dataset):
             len(self.risk_1d_targets),
             len(self.risk_3d_targets),
             len(self.regime_targets),
+            len(self.tail_5d_targets),
+            len(self.path_loss_5d_targets),
+            len(self.industry_neutral_targets),
         }
         if len(lengths) != 1:
             raise ValueError('排序数据集各字段长度不一致')
@@ -1175,6 +1474,15 @@ class RankingDataset(torch.utils.data.Dataset):
                     copy=True,
                 )
             ),
+            'tail_5d_targets': torch.from_numpy(
+                np.array(self.tail_5d_targets[idx], dtype=np.float32, copy=True)
+            ),
+            'path_loss_5d_targets': torch.from_numpy(
+                np.array(self.path_loss_5d_targets[idx], dtype=np.float32, copy=True)
+            ),
+            'industry_neutral_targets': torch.from_numpy(
+                np.array(self.industry_neutral_targets[idx], dtype=np.float32, copy=True)
+            ),
             'recency_weight': torch.tensor(
                 self.recency_weights[idx],
                 dtype=torch.float32,
@@ -1197,6 +1505,53 @@ class FrozenBackboneDataset(torch.utils.data.Dataset):
         item = dict(self.base_dataset[index])
         item.update(self.cached_samples[index])
         return item
+
+
+def build_ranking_dataset(dataset_parts, source_data):
+    """把 vectorized 样本按预测日/股票 ID 对齐到 V17 的额外监督标签。"""
+    (
+        sequences, targets, relevance_scores, stock_indices, prediction_dates,
+        risk_1d_targets, risk_3d_targets, regime_targets,
+    ) = dataset_parts
+    required = {'日期', 'instrument', 'tail_5d_target', 'path_loss_5d_target'}
+    missing = required.difference(source_data.columns)
+    if missing:
+        raise ValueError(f'构造 V17 排序数据集缺少列: {sorted(missing)}')
+    lookup_columns = [
+        '日期', 'instrument', 'tail_5d_target', 'path_loss_5d_target',
+    ]
+    if INDUSTRY_NEUTRAL_TARGET in source_data:
+        lookup_columns.append(INDUSTRY_NEUTRAL_TARGET)
+    lookup = source_data.loc[:, lookup_columns].copy()
+    lookup['日期'] = pd.to_datetime(lookup['日期'])
+    lookup['instrument'] = lookup['instrument'].astype(np.int64)
+    if lookup.duplicated(['日期', 'instrument']).any():
+        raise ValueError('V17 标签键 日期/instrument 不唯一')
+    lookup = lookup.set_index(['日期', 'instrument'])
+
+    def aligned(column, default=0.0):
+        rows = []
+        for date, instruments in zip(prediction_dates, stock_indices):
+            index = pd.MultiIndex.from_arrays([
+                np.repeat(pd.Timestamp(date), len(instruments)),
+                np.asarray(instruments, dtype=np.int64),
+            ])
+            if column in lookup:
+                values = lookup.reindex(index)[column].to_numpy(dtype=np.float32)
+                if not np.isfinite(values).all():
+                    raise ValueError(f'V17 标签 {column} 与排序样本无法完整对齐')
+            else:
+                values = np.full(len(instruments), default, dtype=np.float32)
+            rows.append(values)
+        return rows
+
+    return RankingDataset(
+        sequences, targets, relevance_scores, stock_indices, prediction_dates,
+        risk_1d_targets, risk_3d_targets, regime_targets,
+        tail_5d_targets=aligned('tail_5d_target'),
+        path_loss_5d_targets=aligned('path_loss_5d_target'),
+        industry_neutral_targets=aligned(INDUSTRY_NEUTRAL_TARGET),
+    )
 
 
 def cache_frozen_backbone_dataset(model, dataset, device):
@@ -1243,6 +1598,9 @@ def collate_fn(batch):
     risk_1d_targets = [item['risk_1d_targets'] for item in batch]
     risk_3d_targets = [item['risk_3d_targets'] for item in batch]
     regime_targets = [item['regime_targets'] for item in batch]
+    tail_5d_targets = [item['tail_5d_targets'] for item in batch]
+    path_loss_5d_targets = [item['path_loss_5d_targets'] for item in batch]
+    industry_neutral_targets = [item['industry_neutral_targets'] for item in batch]
     prediction_dates = [item['prediction_date'] for item in batch]
     recency_weights = torch.stack([
         item['recency_weight'] for item in batch
@@ -1268,6 +1626,9 @@ def collate_fn(batch):
     padded_risk_1d_targets = []
     padded_risk_3d_targets = []
     padded_regime_targets = []
+    padded_tail_5d_targets = []
+    padded_path_loss_5d_targets = []
+    padded_industry_neutral_targets = []
     masks = []
     padded_cached_features = []
     
@@ -1279,6 +1640,9 @@ def collate_fn(batch):
         risk_1d,
         risk_3d,
         regime,
+        tail_5d,
+        path_loss_5d,
+        industry_neutral,
     ) in zip(
         sequences,
         targets,
@@ -1287,6 +1651,9 @@ def collate_fn(batch):
         risk_1d_targets,
         risk_3d_targets,
         regime_targets,
+        tail_5d_targets,
+        path_loss_5d_targets,
+        industry_neutral_targets,
     ):
         num_stocks = seq.size(0)
         seq_len = seq.size(1)
@@ -1308,6 +1675,9 @@ def collate_fn(batch):
             risk_1d = torch.cat([risk_1d, risk_target_pad], dim=0)
             risk_3d = torch.cat([risk_3d, risk_target_pad], dim=0)
             regime = torch.cat([regime, risk_target_pad], dim=0)
+            tail_5d = torch.cat([tail_5d, torch.zeros(pad_size)], dim=0)
+            path_loss_5d = torch.cat([path_loss_5d, torch.zeros(pad_size)], dim=0)
+            industry_neutral = torch.cat([industry_neutral, torch.zeros(pad_size)], dim=0)
 
         if has_cached_backbone:
             cached_feature = cached_features[len(padded_cached_features)]
@@ -1333,6 +1703,9 @@ def collate_fn(batch):
         padded_risk_1d_targets.append(risk_1d)
         padded_risk_3d_targets.append(risk_3d)
         padded_regime_targets.append(regime)
+        padded_tail_5d_targets.append(tail_5d)
+        padded_path_loss_5d_targets.append(path_loss_5d)
+        padded_industry_neutral_targets.append(industry_neutral)
         masks.append(mask)
     
     result = {
@@ -1344,6 +1717,9 @@ def collate_fn(batch):
         'risk_1d_targets': torch.stack(padded_risk_1d_targets),
         'risk_3d_targets': torch.stack(padded_risk_3d_targets),
         'regime_targets': torch.stack(padded_regime_targets),
+        'tail_5d_targets': torch.stack(padded_tail_5d_targets),
+        'path_loss_5d_targets': torch.stack(padded_path_loss_5d_targets),
+        'industry_neutral_targets': torch.stack(padded_industry_neutral_targets),
         'prediction_dates': prediction_dates,
         'recency_weights': recency_weights,
     }
@@ -1429,6 +1805,13 @@ def train_ranking_model(
             batch['regime_targets'],
             device,
         )
+        tail_5d_targets = move_batch_tensor(batch['tail_5d_targets'], device)
+        path_loss_5d_targets = move_batch_tensor(
+            batch['path_loss_5d_targets'], device,
+        )
+        industry_neutral_targets = move_batch_tensor(
+            batch['industry_neutral_targets'], device,
+        )
         recency_weights = move_batch_tensor(
             batch['recency_weights'],
             device,
@@ -1475,7 +1858,9 @@ def train_ranking_model(
                 criterion, model, outputs, masked_relevance,
                 return_outputs, targets, allocation_outputs, exposures,
                 auxiliary_outputs, risk_1d_targets, risk_3d_targets,
-                regime_targets, stage, return_components=True,
+                tail_5d_targets, path_loss_5d_targets,
+                industry_neutral_targets, regime_targets, stage,
+                return_components=True,
             )
             batch_weight_total = batch_loss.new_tensor(1.0)
         else:
@@ -1498,6 +1883,9 @@ def train_ranking_model(
                 valid_risk_1d_targets = risk_1d_targets[i][valid_indices]
                 valid_risk_3d_targets = risk_3d_targets[i][valid_indices]
                 valid_regime_targets = regime_targets[i][valid_indices]
+                valid_tail_5d_targets = tail_5d_targets[i][valid_indices]
+                valid_path_loss_5d_targets = path_loss_5d_targets[i][valid_indices]
+                valid_industry_neutral_targets = industry_neutral_targets[i][valid_indices]
             
                 if len(valid_pred) > 1:
                     # 直接使用预处理好的相关性得分，无需重新计算
@@ -1541,6 +1929,17 @@ def train_ranking_model(
                         if auxiliary_outputs['tail_5d_logits'] is not None
                         else None
                     ),
+                    path_loss_5d_outputs=(
+                        auxiliary_outputs['path_loss_5d_output'][i, valid_indices].unsqueeze(0)
+                        if auxiliary_outputs['path_loss_5d_output'] is not None else None
+                    ),
+                    tail_5d_targets=valid_tail_5d_targets.unsqueeze(0),
+                    path_loss_5d_targets=valid_path_loss_5d_targets.unsqueeze(0),
+                    industry_residual_outputs=(
+                        auxiliary_outputs['industry_residual_returns'][i, valid_indices].unsqueeze(0)
+                        if auxiliary_outputs['industry_residual_returns'] is not None else None
+                    ),
+                    industry_neutral_targets=valid_industry_neutral_targets.unsqueeze(0),
                     regime_gate=auxiliary_outputs['regime_gate'][
                         i
                     ].reshape(1),
@@ -1662,6 +2061,13 @@ def evaluate_ranking_model(
                 batch['regime_targets'],
                 device,
             )
+            tail_5d_targets = move_batch_tensor(batch['tail_5d_targets'], device)
+            path_loss_5d_targets = move_batch_tensor(
+                batch['path_loss_5d_targets'], device,
+            )
+            industry_neutral_targets = move_batch_tensor(
+                batch['industry_neutral_targets'], device,
+            )
             
             with torch.autocast(
                 device_type=device.type,
@@ -1764,6 +2170,17 @@ def evaluate_ranking_model(
                             ] is not None
                             else None
                         ),
+                        path_loss_5d_outputs=(
+                            auxiliary_outputs['path_loss_5d_output'][i, valid_indices].unsqueeze(0)
+                            if auxiliary_outputs['path_loss_5d_output'] is not None else None
+                        ),
+                        tail_5d_targets=tail_5d_targets[i, valid_indices].unsqueeze(0),
+                        path_loss_5d_targets=path_loss_5d_targets[i, valid_indices].unsqueeze(0),
+                        industry_residual_outputs=(
+                            auxiliary_outputs['industry_residual_returns'][i, valid_indices].unsqueeze(0)
+                            if auxiliary_outputs['industry_residual_returns'] is not None else None
+                        ),
+                        industry_neutral_targets=industry_neutral_targets[i, valid_indices].unsqueeze(0),
                         regime_gate=auxiliary_outputs['regime_gate'][
                             i
                         ].reshape(1),
@@ -1894,13 +2311,9 @@ def evaluate_ranking_model(
                                 0.03,
                             ))
                         ).detach().cpu().numpy(),
-                        'tail_5d_targets': (
-                            masked_targets[i][valid_indices]
-                            <= float(config.get(
-                                'tail_5d_threshold',
-                                -0.03,
-                            ))
-                        ).float().detach().cpu().numpy(),
+                        'tail_5d_targets': tail_5d_targets[
+                            i, valid_indices
+                        ].detach().cpu().numpy(),
                         'regime_target': float(
                             regime_targets[
                                 i,
@@ -2223,6 +2636,7 @@ def configure_model_for_stage(model, stage):
         'risk_3d_head.',
         'risk_5d_head.',
         'tail_5d_head.',
+        'path_loss_5d_head.',
         'regime_market_encoder.',
         'regime_gate_head.',
     )
@@ -2260,6 +2674,8 @@ def set_model_stage_mode(model, stage, training):
                 model.risk_5d_head.eval()
             if hasattr(model, 'tail_5d_head'):
                 model.tail_5d_head.eval()
+            if hasattr(model, 'path_loss_5d_head'):
+                model.path_loss_5d_head.eval()
         if hasattr(model, 'regime_market_encoder'):
             model.regime_market_encoder.eval()
             model.regime_gate_head.eval()
@@ -2273,6 +2689,8 @@ def set_model_stage_mode(model, stage, training):
             model.risk_5d_head.train()
         if hasattr(model, 'tail_5d_head'):
             model.tail_5d_head.train()
+        if hasattr(model, 'path_loss_5d_head'):
+            model.path_loss_5d_head.train()
         model.regime_market_encoder.train()
         model.regime_gate_head.train()
     elif stage == 'allocation':
@@ -2335,6 +2753,10 @@ def build_training_components(model, stage='ranking'):
         tail_5d_weight=config.get('tail_5d_weight', 0.0),
         tail_5d_threshold=config.get('tail_5d_threshold', -0.03),
         regime_weight=config.get('regime_weight', 0.0),
+        industry_residual_weight=config.get('industry_residual_weight', 0.0),
+        industry_residual_beta=config.get('industry_residual_beta', 0.02),
+        path_loss_5d_weight=config.get('path_loss_5d_weight', 0.0),
+        path_loss_5d_beta=config.get('path_loss_5d_beta', 0.02),
         min_exposure=config.get('min_exposure', 0.80),
         max_exposure=config.get('max_exposure', 0.999999),
     )
@@ -2622,8 +3044,8 @@ def train_one_fold(
         min_window_end_date=fold['val_start'],
         max_window_end_date=fold['val_end'],
     )
-    train_dataset = RankingDataset(*train_parts)
-    val_dataset = RankingDataset(*val_parts)
+    train_dataset = build_ranking_dataset(train_parts, train_data)
+    val_dataset = build_ranking_dataset(val_parts, validation_context)
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise ValueError(f"第 {fold_number} 折没有可用的训练或验证样本")
 
@@ -2841,7 +3263,7 @@ def prepare_full_training_dataset(full_data, features, output_dir):
         config['sequence_length'],
         max_window_end_date=train_data['日期'].max(),
     )
-    train_dataset = RankingDataset(*train_parts)
+    train_dataset = build_ranking_dataset(train_parts, train_data)
     if len(train_dataset) == 0:
         raise ValueError('全量重训无法构造排序样本')
     return train_dataset, train_data['日期'].max()
@@ -3516,6 +3938,7 @@ def run_policy_only():
 def main():
     if policy_only_enabled():
         return run_policy_only()
+    profile = apply_v17_profile()
     if config.get('policy_only_experiment', False):
         raise ValueError(
             '当前配置是策略重放实验，不允许重新训练；'
@@ -3556,7 +3979,7 @@ def main():
         device = torch.device('cpu')
     configure_accelerator(device)
     print(
-        f"训练模式: {'多种子 ensemble' if ensemble_enabled else '单种子三折'}; "
+        f"训练模式: {profile}/{'多种子 ensemble' if ensemble_enabled else '单种子六折'}; "
         f"seeds={ensemble_seeds}; 设备: {device}; AMP={use_amp(device)}; "
         f"TF32={device.type == 'cuda' and config.get('tf32_enabled', True)}; "
         f"batch_size={config['batch_size']}"
@@ -3565,6 +3988,7 @@ def main():
     data_file = os.path.join(config['data_path'], 'train.csv')
     full_df = pd.read_csv(data_file, dtype={'股票代码': str})
     full_df['股票代码'] = full_df['股票代码'].astype(str).str.zfill(6)
+    full_df, lockbox_start = split_v17_lockbox(full_df)
     folds = build_walk_forward_folds(
         full_df,
         num_folds=config['num_folds'],
@@ -3579,6 +4003,9 @@ def main():
 
     full_data, features = preprocess_data(full_df, is_train=True, stockid2idx=stockid2idx)
     full_data['日期'] = pd.to_datetime(full_data['日期'])
+    write_v17_manifest(
+        output_dir, features, folds, lockbox_start, len(stockid2idx),
+    )
     if config.get('exposure_market_encoder_enabled', False):
         market_feature_names = [
             *RELATIVE_MARKET_FEATURES[-5:],
@@ -3645,12 +4072,16 @@ def main():
             fold_results.append(result)
             oof_records[int(fold['fold'])][base_seed] = predictions
 
+    lgbm_folds = fit_lgbm_oof_scores(
+        full_data, features, folds, oof_records, output_dir,
+    )
+
     ensemble_days = []
     single_seed_days = {seed: [] for seed in ensemble_seeds}
     full_trading_dates = full_data['日期'].dropna().unique()
     for fold in folds:
         fold_number = int(fold['fold'])
-        ensemble_days.extend(align_oof_prediction_records(
+        aligned_days = align_oof_prediction_records(
             [
                 attach_label_end_dates(
                     oof_records[fold_number][seed],
@@ -3660,7 +4091,18 @@ def main():
                 for seed in ensemble_seeds
             ],
             fold=fold_number,
-        ))
+        )
+        if lgbm_folds:
+            lgbm_by_date = {
+                record['prediction_date']: record['lgbm_scores']
+                for record in oof_records[fold_number][ensemble_seeds[0]]
+                if 'lgbm_scores' in record
+            }
+            for day in aligned_days:
+                day['lgbm_scores'] = np.asarray(
+                    lgbm_by_date[day['prediction_date']], dtype=np.float64,
+                )
+        ensemble_days.extend(aligned_days)
         for seed in ensemble_seeds:
             single_seed_days[seed].extend(align_oof_prediction_records(
                 [attach_label_end_dates(
@@ -3737,13 +4179,48 @@ def main():
         downside_weight=config.get('ensemble_downside_weight', 0.5),
         top_k=5,
     )
+    lgbm_forward = []
+    if lgbm_folds:
+        for fold in folds:
+            fold_id = int(fold['fold'])
+            if fold_id <= 2:
+                weight = 0.0
+                source = 'fallback_insufficient_earlier_folds'
+            else:
+                earlier = [day for day in ensemble_days
+                           if int(day['fold']) < fold_id
+                           and pd.Timestamp(day['label_end_date']) < fold['val_start']]
+                if len({int(day['fold']) for day in earlier}) < 2:
+                    raise ValueError(f'Fold {fold_id} 没有两折已实现的更早 OOF 标签')
+                candidates = []
+                for candidate in config['lgbm_blend_grid']:
+                    metrics = calibrate_ensemble_policy(
+                        fuse_lgbm_scores(earlier, float(candidate)),
+                        **policy_calibration_kwargs,
+                    )['oof_metrics']
+                    candidates.append((metrics['mean_weighted_portfolio_return'], float(candidate)))
+                _, weight = max(candidates, key=lambda row: (row[0], -row[1]))
+                source = 'strict_earlier_oof'
+            lgbm_forward.append({'fold': fold_id, 'lgbm_weight': weight, 'source': source})
+        deployment_lgbm_weight = float(np.median([
+            row['lgbm_weight'] for row in lgbm_forward if row['fold'] >= 3
+        ]))
+        ensemble_days = fuse_lgbm_scores(ensemble_days, deployment_lgbm_weight)
+    else:
+        deployment_lgbm_weight = 0.0
     policy = calibrate_ensemble_policy(
         ensemble_days,
         **policy_calibration_kwargs,
     )
     if config.get('nested_oof_enabled', False):
-        cross_fitted_policy = cross_fit_ensemble_policy(
+        cross_fitted_policy = forward_fit_module_gated_policy(
             ensemble_days,
+            forward_module_max_fold_loss=float(config.get(
+                'forward_module_max_fold_loss', 0.0025,
+            )),
+            forward_module_max_p10_loss=float(config.get(
+                'forward_module_max_p10_loss', 0.005,
+            )),
             **policy_calibration_kwargs,
         )
         cross_fitted_policy['deployment_policy_differences'] = {
@@ -3762,6 +4239,9 @@ def main():
                 'exposure_head_blend',
             )
         }
+        # 部署策略只保留严格前向 OOF 已通过模块门槛的配置；全 OOF 最优值
+        # 仅作为候选报告，不能直接穿透到部署策略。
+        policy = cross_fitted_policy['robust_deployment_policy']
         ensemble_metrics = cross_fitted_policy['metrics']
     else:
         cross_fitted_policy = {
@@ -3905,6 +4385,10 @@ def main():
             os.path.join(f'seed_{base_seed}', 'best_model.pth')
         )
 
+    lgbm_model_path = fit_lgbm_final(
+        full_data, features, lgbm_folds, output_dir,
+    )
+
     policy.update({
         'ensemble_enabled': ensemble_enabled,
         'mode': 'rank_ensemble' if ensemble_enabled else 'single_model',
@@ -3916,6 +4400,9 @@ def main():
         ),
         'ensemble_seeds': ensemble_seeds,
         'model_paths': model_paths,
+        'lgbm_model_path': lgbm_model_path,
+        'lgbm_weight': deployment_lgbm_weight,
+        'lgbm_forward_selection': lgbm_forward,
         'scaler_path': 'scaler.pkl',
         'config_path': 'config.json',
         'selection_risk_lookback': int(config.get(
