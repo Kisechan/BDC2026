@@ -1,6 +1,8 @@
+import gc
 import json
 import sys
 import unittest
+import weakref
 from copy import deepcopy
 from pathlib import Path
 
@@ -186,7 +188,7 @@ class PolicyRegressionTests(unittest.TestCase):
         self.assertTrue(dataset.sequences[0].flags.c_contiguous)
         self.assertTrue(dataset.sequences[0].flags.writeable)
 
-        cached = FrozenBackboneDataset(dataset, [
+        cached_samples = [
             {
                 "cached_ranking_features": torch.zeros(2, 5),
                 "cached_regime_sequence": torch.zeros(3, 2),
@@ -197,7 +199,9 @@ class PolicyRegressionTests(unittest.TestCase):
                 "cached_regime_sequence": torch.zeros(3, 2),
                 "cached_market_sequence": torch.zeros(3, 2),
             },
-        ])
+        ]
+        cached = FrozenBackboneDataset(dataset, cached_samples)
+        self.assertFalse(hasattr(cached, "base_dataset"))
         self.assertNotIn("sequences", cached[0])
         batch = collate_fn([cached[0], cached[1]])
         self.assertNotIn("sequences", batch)
@@ -207,10 +211,14 @@ class PolicyRegressionTests(unittest.TestCase):
         )
         cached_subset = FrozenBackboneDataset(
             Subset(dataset, [1]),
-            [cached.cached_samples[1]],
+            [cached_samples[1]],
         )
         self.assertNotIn("sequences", cached_subset[0])
         self.assertEqual(cached_subset[0]["targets"].numel(), 1)
+        dataset_reference = weakref.ref(dataset)
+        del dataset
+        gc.collect()
+        self.assertIsNone(dataset_reference())
 
     def test_holding_path_tail_detects_recovered_drawdown(self):
         rows = []

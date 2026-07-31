@@ -1445,30 +1445,30 @@ class RankingDataset(torch.utils.data.Dataset):
 
 
 class FrozenBackboneDataset(torch.utils.data.Dataset):
-    """将冻结的 Ranking 主干表示与原始样本并列保存的轻量数据集。"""
+    """仅保存辅助阶段所需目标和冻结主干表示。"""
     def __init__(self, base_dataset, cached_samples):
         if len(base_dataset) != len(cached_samples):
             raise ValueError('冻结主干缓存与数据集长度不一致')
-        self.base_dataset = base_dataset
-        self.cached_samples = cached_samples
+        self.samples = []
+        for index, cached in enumerate(cached_samples):
+            if isinstance(base_dataset, Subset):
+                item = base_dataset.dataset.get_item(
+                    base_dataset.indices[index],
+                    include_sequence=False,
+                )
+            else:
+                item = base_dataset.get_item(
+                    index,
+                    include_sequence=False,
+                )
+            item.update(cached)
+            self.samples.append(item)
 
     def __len__(self):
-        return len(self.base_dataset)
+        return len(self.samples)
 
     def __getitem__(self, index):
-        if isinstance(self.base_dataset, Subset):
-            source_index = self.base_dataset.indices[index]
-            item = self.base_dataset.dataset.get_item(
-                source_index,
-                include_sequence=False,
-            )
-        else:
-            item = self.base_dataset.get_item(
-                index,
-                include_sequence=False,
-            )
-        item.update(self.cached_samples[index])
-        return item
+        return self.samples[index]
 
 
 def cache_frozen_backbone_dataset(model, dataset, device):
@@ -1684,60 +1684,18 @@ def non_overlapping_subset(dataset, stride):
 
 
 def build_data_loader(dataset, shuffle, device):
-    num_workers = int(config.get('num_workers', 0))
-    if num_workers > 0 and len(dataset):
-        sample = dataset[0]
-        sample_bytes = sum(
-            value.numel() * value.element_size()
-            for value in sample.values()
-            if torch.is_tensor(value)
-        )
-        prefetched_bytes = (
-            sample_bytes
-            * min(config['batch_size'], len(dataset))
-            * num_workers
-            * int(config.get('prefetch_factor', 2))
-        )
-        shared_memory = os.statvfs('/dev/shm')
-        available_bytes = (
-            shared_memory.f_bavail * shared_memory.f_frsize
-        )
-        if prefetched_bytes > available_bytes * 0.8:
-            print(
-                'DataLoader 共享内存检查未通过，明确回退到 '
-                f'num_workers=0: 预计 {prefetched_bytes / 2**30:.2f} GiB, '
-                f'可用 {available_bytes / 2**30:.2f} GiB'
-            )
-            num_workers = 0
-    loader_kwargs = {
-        'batch_size': config['batch_size'],
-        'shuffle': shuffle,
-        'collate_fn': collate_fn,
-        'num_workers': num_workers,
-        'pin_memory': (
+    return DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        # 单个 RankingDataset 包含数十 GiB 变长序列；worker 进程会放大
+        # Dataset 与预取队列的内存占用，主进程零拷贝取样更安全。
+        num_workers=0,
+        pin_memory=(
             device.type == 'cuda' and config.get('pin_memory', True)
         ),
-    }
-    if num_workers > 0:
-        loader_kwargs.update({
-            'persistent_workers': True,
-            'prefetch_factor': int(config.get('prefetch_factor', 2)),
-        })
-    try:
-        return DataLoader(dataset, **loader_kwargs)
-    except (OSError, RuntimeError, ValueError) as error:
-        if num_workers == 0:
-            raise
-        print(
-            'DataLoader 多进程初始化失败，明确回退到 num_workers=0: '
-            f'{error}'
-        )
-        loader_kwargs.update({
-            'num_workers': 0,
-            'persistent_workers': False,
-        })
-        loader_kwargs.pop('prefetch_factor', None)
-        return DataLoader(dataset, **loader_kwargs)
+    )
 
 # 排序训练函数
 def train_ranking_model(
@@ -3084,6 +3042,7 @@ def train_one_fold(
         )
     train_dataset = RankingDataset(*train_parts)
     val_dataset = RankingDataset(*val_parts)
+    del train_parts, val_parts, train_data, validation_context
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise ValueError(f"第 {fold_number} 折没有可用的训练或验证样本")
 
@@ -3144,16 +3103,20 @@ def train_one_fold(
                 True,
             ):
                 print('Ranking 阶段完成：缓存冻结主干表示供后续辅助阶段复用')
+                cached_train_dataset = cache_frozen_backbone_dataset(
+                    model,
+                    train_dataset,
+                    device,
+                )
                 train_loader = build_data_loader(
-                    cache_frozen_backbone_dataset(
-                        model, train_dataset, device,
-                    ),
+                    cached_train_dataset,
                     True,
                     device,
                 )
                 train_eval_loader = build_data_loader(
-                    cache_frozen_backbone_dataset(
-                        model, train_eval_dataset, device,
+                    Subset(
+                        cached_train_dataset,
+                        train_eval_dataset.indices,
                     ),
                     False,
                     device,
@@ -3165,6 +3128,8 @@ def train_one_fold(
                     False,
                     device,
                 )
+                del train_dataset, train_eval_dataset
+                print('冻结缓存就绪：已释放本折原始训练序列')
 
     criterion, _ = build_training_components(model, stage='exposure')
     best_epoch = stage_results['ranking']['best_epoch']
@@ -4066,8 +4031,7 @@ def main():
         f"seeds={ensemble_seeds}; 设备: {device}; AMP={use_amp(device)}; "
         f"TF32={device.type == 'cuda' and config.get('tf32_enabled', True)}; "
         f"batch_size={config['batch_size']}; "
-        f"num_workers={config.get('num_workers', 0)}; "
-        f"prefetch_factor={config.get('prefetch_factor', 2)}"
+        'DataLoader=主进程内存安全模式'
     )
 
     data_file = os.path.join(config['data_path'], 'train.csv')
