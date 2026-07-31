@@ -933,8 +933,10 @@ def main():
 			lgbm_ranker,
 			len(features),
 		)
+		# 保留列名，既校验205维顺序，也避免 sklearn 对 ndarray 的无名列警告。
+		lgbm_input = pd.DataFrame(lgbm_raw_latest, columns=features)
 		lgbm_scores = np.asarray(
-		lgbm_ranker.predict(lgbm_raw_latest),
+		lgbm_ranker.predict(lgbm_input),
 			dtype=np.float64,
 		).reshape(-1)
 		if lgbm_scores.shape != (len(sequence_stock_ids),):

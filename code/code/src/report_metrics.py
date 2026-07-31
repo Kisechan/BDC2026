@@ -231,7 +231,12 @@ def print_cross_validation() -> None:
         int(row["fold"]): row
         for row in summary.get("ensemble_oof", {}).get("folds", [])
     }
-    for fold in summary.get("folds", []):
+    # 策略重放的 ``folds`` 是 OOF 收益摘要；训练期 val_metrics 则保留在
+    # source_training_folds。优先读取后者，兼容普通训练和 policy-only 工件。
+    training_folds = summary.get("source_training_folds", summary.get("folds", []))
+    for fold in training_folds:
+        if "val_metrics" not in fold:
+            continue
         metrics = fold["val_metrics"]
         # random_return_sum is the expected sum of five randomly selected
         # stocks' returns, so divide it by five to compare with Top-5 mean.
