@@ -10,7 +10,7 @@ seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
 market-pressure features. The active model experiment is
-`threefold_downside_ranking_v10`. It keeps the 193 continuous inputs and does not feed
+`threefold_rawranking_riskcheckpoint_v11`. It keeps the 193 continuous inputs and does not feed
 industry codes or names into the Transformer. Historical industry snapshots
 are joined as-of for two Exposure portfolio summaries and soft Top-10
 concentration selection; the expensive industry-residual ranking objective is

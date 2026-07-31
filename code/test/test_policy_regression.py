@@ -53,7 +53,7 @@ class PolicyRegressionTests(unittest.TestCase):
         self.assertGreater(targets.loc["000001", "label"], 0.0)
         self.assertEqual(targets.loc["000001", "tail_5d_target"], 1.0)
         self.assertEqual(targets.loc["000002", "tail_5d_target"], 0.0)
-        self.assertLess(
+        self.assertEqual(
             targets.loc["000001", "ranking_target"],
             targets.loc["000001", "label"],
         )

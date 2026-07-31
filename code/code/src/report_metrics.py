@@ -290,6 +290,7 @@ def print_cross_validation() -> None:
         int(row["fold"]): row
         for row in summary.get("ensemble_oof", {}).get("folds", [])
     }
+    policy_days = summary.get("ensemble_oof", {}).get("daily", [])
     for fold in summary.get("folds", []):
         metrics = fold["val_metrics"]
         # random_return_sum is the expected sum of five randomly selected
@@ -304,10 +305,19 @@ def print_cross_validation() -> None:
             "mean_rank_ic",
             metrics["rank_ic"],
         ))
+        actual_dates = [
+            row["prediction_date"] for row in policy_days
+            if int(row["fold"]) == int(fold["fold"])
+        ]
+        validation_range = (
+            f"{min(actual_dates)} ~ {max(actual_dates)}"
+            if actual_dates
+            else f"{fold['val_start']} ~ {fold['val_end']}"
+        )
         random_baselines.append(random_top5)
         print(
             f"  Seed {fold.get('base_seed', '-')} Fold {fold['fold']} "
-            f"({fold['val_start']} ~ {fold['val_end']}): "
+            f"({validation_range}): "
             f"Top-5 {_pct(top5_return)}, "
             f"随机/全池等权 {_pct(random_top5)}, "
             f"超额 {_pct(top5_return - random_top5)}, "
@@ -436,6 +446,7 @@ def print_portfolio_return_breakdown(
 
 def print_realized_return() -> None:
     result_path = os.path.join("output", "result.csv")
+    diagnostics_path = os.path.join("output", "prediction_diagnostics.json")
     test_path = os.path.join(config["data_path"], "test.csv")
     if not os.path.exists(test_path):
         print("\n[本地后验评分] 未找到 data/test.csv；未来行情未知，跳过真实收益与基线比较。")
@@ -443,8 +454,13 @@ def print_realized_return() -> None:
     if not os.path.exists(result_path):
         print(f"\n[本地后验评分] 未找到预测文件: {result_path}")
         return
+    if not os.path.exists(diagnostics_path):
+        print("\n[本地后验评分] 缺少预测诊断，无法验证预测与收益的时间顺序。")
+        return
 
     try:
+        with open(diagnostics_path, "r", encoding="utf-8") as handle:
+            prediction_date = pd.Timestamp(json.load(handle)["prediction_date"])
         result = pd.read_csv(result_path)
         id_column = "stock_id" if "stock_id" in result.columns else "股票代码"
         weight_column = "weight" if "weight" in result.columns else "权重"
@@ -475,8 +491,16 @@ def print_realized_return() -> None:
         oracle_top5_return = float(returns.nlargest(5).mean()) * gross_exposure
         start_date = test["日期"].min().date()
         end_date = test["日期"].max().date()
+        realized_label = (
+            f"本地后验评分：{start_date} ~ {end_date}"
+            if pd.Timestamp(start_date) > prediction_date
+            else (
+                "历史区间诊断（早于或覆盖预测日，不用于模型晋级）："
+                f"{start_date} ~ {end_date}"
+            )
+        )
 
-        print(f"\n[本地后验评分：{start_date} ~ {end_date}]")
+        print(f"\n[{realized_label}]")
         print(
             f"模型组合收益: {_pct(portfolio_return)} "
             f"(股票 {gross_exposure:.2%}, 现金 {1.0 - gross_exposure:.2%})"

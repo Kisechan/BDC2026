@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'threefold_downside_ranking_v10'
+experiment_name = 'threefold_rawranking_riskcheckpoint_v11'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -97,9 +97,8 @@ config = {
     'tail_5d_weight': 0.20,
     'tail_5d_threshold': -0.03,
     'tail_5d_target_mode': 'holding_path_min',
-    # 排序效用对持有期内超过 3% 的额外回撤做轻量惩罚；原始收益仍用于
-    # 回归头、收益评估和 Allocation/Exposure 监督。
-    'ranking_downside_penalty': 0.25,
+    # v1.18.2恢复原始5日收益排序；路径尾部风险只由风险头和checkpoint使用。
+    'ranking_downside_penalty': 0.0,
     'regime_gate_enabled': True,
     'regime_market_hidden_size': 16,
     'regime_market_feature_indices': [
