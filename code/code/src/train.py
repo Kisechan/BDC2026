@@ -166,7 +166,7 @@ def apply_v17_profile():
     """在进程启动时选择可复跑的 V17 基线或候选路径。
 
     配置文件可以保持 candidate 的 205 维默认值；基线由环境变量覆盖，
-    从而保证两者共用同一原始数据、锁箱和 six-fold 边界。
+    从而保证两者共用同一原始数据、锁箱和三折边界。
     """
     profile = os.environ.get('V17_PROFILE', 'candidate').strip().lower()
     if profile not in {'baseline', 'candidate'}:
@@ -3979,7 +3979,7 @@ def main():
         device = torch.device('cpu')
     configure_accelerator(device)
     print(
-        f"训练模式: {profile}/{'多种子 ensemble' if ensemble_enabled else '单种子六折'}; "
+        f"训练模式: {profile}/{'多种子 ensemble' if ensemble_enabled else '单种子三折'}; "
         f"seeds={ensemble_seeds}; 设备: {device}; AMP={use_amp(device)}; "
         f"TF32={device.type == 'cuda' and config.get('tf32_enabled', True)}; "
         f"batch_size={config['batch_size']}"

@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'sixfold_industryresidual_lgbmblend_pathrisk_v17'
+experiment_name = 'threefold_industryresidual_lgbmblend_pathrisk_v17'
 artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
 config = {
     'experiment_name': experiment_name,
@@ -31,7 +31,8 @@ config = {
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'grad_clip': True,
-    'num_folds': 6,
+    # 三折仍满足 F3 仅使用 F1/F2 已完全实现 OOF 标签的前向标定约束。
+    'num_folds': 3,
     'validation_months': 2,
     'lockbox_months': 2,
     'lockbox_enabled': True,
