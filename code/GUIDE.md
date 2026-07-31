@@ -49,7 +49,8 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v1.17 从头训练205维 `158+39_reduced25_relmarket12_risk15_indresid12` 工件。除五年
+当前 v1.18 使用已完成的 v1.17 205维 `158+39_reduced25_relmarket12_risk15_indresid12` candidate
+作严格三折策略重放，不重新训练 Transformer 或 LightGBM。除五年
 行情外，需准备 `data_5y/stock_industry_history.csv`，其中必须包含
 `effective_date,stock_id,industry`；特征只使用预测日期当日或之前的行业快照。运行
 `./train.sh` 后，模型工件根目录必须同时保留 `config.json`、`scaler.pkl`、
@@ -59,6 +60,11 @@ end_date = "***"
 `sequence_length`、`stock_mapping_size` 和模型结构。`./test.sh` 会在特征工程前检查
 manifest、Scaler、checkpoint 输入宽度和股票 embedding；不得把 v1.16 的193维工件接入 v1.17。
 旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
+
+在 `code/` 目录执行 `POLICY_ONLY=1 ./train.sh` 生成独立 v1.18 策略目录。该步骤会加载 v1.17
+checkpoint、scaler、manifest 与最终 LightGBM，并把缺失的折树 OOF 分数缓存于 v1.18 目录；
+不会覆盖 v1.17 工件。完成且开发期晋级后才运行 `./test.sh`。v1.18 固定关闭风险惩罚、反转和
+相关性策略，保留 Allocation Head 和至少25%的 Exposure Head，其余 Exposure 使用近满仓 fallback。
 
 成功完成训练
 

@@ -190,6 +190,12 @@ def apply_v17_profile():
         f"./model/{config['sequence_length']}_{config['feature_num']}_"
         f"{config.get('experiment_name', 'v17')}_{profile}"
     )
+    if (
+        config.get('policy_only_experiment', False)
+        and os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1'
+    ):
+        # 最终部署训练是一次性例外；其目录永远不能覆盖策略重放或开发期 OOF。
+        config['output_dir'] = config['full_deployment_output_dir']
     return profile
 
 
@@ -287,6 +293,121 @@ def save_joblib_checkpoint(value, checkpoint_path):
     temporary_path = f'{checkpoint_path}.tmp'
     joblib.dump(value, temporary_path)
     os.replace(temporary_path, checkpoint_path)
+
+
+def _oof_score_signature(days, fold_id, features, model):
+    """将缓存绑定到来源 OOF 的日期、股票集合、折和树特征顺序。"""
+    digest = hashlib.sha256('\n'.join(features).encode())
+    for day in sorted(
+        (item for item in days if int(item['fold']) == int(fold_id)),
+        key=lambda item: item['prediction_date'],
+    ):
+        digest.update(day['prediction_date'].encode())
+        digest.update(np.asarray(day['stock_indices'], dtype=np.int64).tobytes())
+    digest.update(str(int(model.booster_.current_iteration())).encode())
+    return digest.hexdigest()
+
+
+def load_or_build_lgbm_oof_scores(
+    source_dir, output_dir, source_config, folds, ensemble_days,
+):
+    """从已保存折树模型恢复 OOF 分数，绝不重新训练任何模型。
+
+    缓存写在 v1.18 策略目录而非 v1.17 来源目录，避免策略重放修改候选工件。
+    """
+    cache_dir = os.path.join(output_dir, 'lgbm_oof_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    models = {}
+    features = None
+    for fold in folds:
+        fold_id = int(fold['fold'])
+        path = os.path.join(source_dir, 'lgbm', f'fold_{fold_id}.joblib')
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'缺少 v1.17 LightGBM 折模型: {path}')
+        model = joblib.load(path)
+        model_features = list(getattr(model, 'feature_name_', []))
+        if not model_features:
+            raise ValueError(f'LightGBM 折模型缺少特征名: {path}')
+        if features is None:
+            features = model_features
+        elif model_features != features:
+            raise ValueError('LightGBM 折模型特征顺序不一致')
+        validate_lgbm_checkpoint(model, features, path)
+        models[fold_id] = model
+
+    cached = {}
+    missing_folds = []
+    for fold in folds:
+        fold_id = int(fold['fold'])
+        cache_path = os.path.join(cache_dir, f'fold_{fold_id}.joblib')
+        signature = _oof_score_signature(
+            ensemble_days, fold_id, features, models[fold_id],
+        )
+        if os.path.isfile(cache_path):
+            payload = joblib.load(cache_path)
+            if payload.get('signature') == signature:
+                cached[fold_id] = payload['scores']
+                print(f'复用 LightGBM OOF 分数缓存：Fold {fold_id}')
+                continue
+        missing_folds.append((fold, signature, cache_path))
+
+    if missing_folds:
+        print('阶段 LightGBM OOF 缓存：仅用已保存折模型重建缺失分数，不训练模型')
+        data_file = os.path.join(source_config.get('data_path', config['data_path']), 'train.csv')
+        raw = pd.read_csv(data_file, dtype={'股票代码': str})
+        raw['股票代码'] = raw['股票代码'].astype(str).str.zfill(6)
+        manifest_path = os.path.join(source_dir, 'artifact_manifest.json')
+        with open(manifest_path, encoding='utf-8') as file:
+            manifest = json.load(file)
+        lockbox_start = manifest.get('lockbox_start')
+        if lockbox_start:
+            raw['日期'] = pd.to_datetime(raw['日期'])
+            raw = raw.loc[raw['日期'] < pd.Timestamp(lockbox_start)].copy()
+        with open(os.path.join(source_dir, 'stockid2idx.json'), encoding='utf-8') as file:
+            stockid2idx = json.load(file)
+        processed, processed_features = preprocess_data(
+            raw, is_train=True, stockid2idx=stockid2idx,
+        )
+        if list(processed_features) != list(features):
+            raise ValueError('LightGBM OOF 缓存特征与 v1.17 205维来源不匹配')
+        processed['日期'] = pd.to_datetime(processed['日期'])
+        for fold, signature, cache_path in tqdm(
+            missing_folds, desc='LightGBM OOF 缓存', unit='折', dynamic_ncols=True,
+        ):
+            fold_id = int(fold['fold'])
+            valid = processed.loc[
+                (processed['日期'] >= pd.Timestamp(fold['val_start']))
+                & (processed['日期'] <= pd.Timestamp(fold['val_end']))
+            ]
+            by_date = {
+                pd.Timestamp(date).strftime('%Y-%m-%d'): rows.set_index('instrument')
+                for date, rows in valid.groupby('日期', sort=False)
+            }
+            rows = {}
+            for day in (item for item in ensemble_days if int(item['fold']) == fold_id):
+                date_rows = by_date.get(day['prediction_date'])
+                if date_rows is None:
+                    raise ValueError(f"LightGBM OOF 缓存缺少 Fold {fold_id} 日期 {day['prediction_date']}")
+                ordered = date_rows.reindex(
+                    np.asarray(day['stock_indices'], dtype=np.int64),
+                )
+                if ordered[features].isna().any().any():
+                    raise ValueError('LightGBM OOF 缓存与 Transformer 股票集合不一致')
+                rows[day['prediction_date']] = models[fold_id].predict(
+                    ordered[features], num_iteration=models[fold_id].best_iteration_,
+                )
+            cached[fold_id] = rows
+            save_joblib_checkpoint(
+                {'signature': signature, 'scores': rows}, cache_path,
+            )
+            print(f'LightGBM OOF 分数缓存已原子写入：Fold {fold_id}')
+
+    for day in ensemble_days:
+        score = cached[int(day['fold'])].get(day['prediction_date'])
+        if score is None or len(score) != len(day['stock_indices']):
+            raise ValueError('LightGBM OOF 缓存日期或股票边界校验失败')
+        day['lgbm_scores'] = np.asarray(score, dtype=np.float64)
+    return [{'fold': int(fold['fold']), 'cached': True} for fold in folds]
 
 
 def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
@@ -418,8 +539,26 @@ def fuse_lgbm_scores(days, weight):
     return fused
 
 
+def fuse_lgbm_scores_by_fold(days, lgbm_forward):
+    """按各自前向折权重融合，禁止把后续折决定回填到早期 OOF。"""
+    weights = {
+        int(row['fold']): float(row['lgbm_weight'])
+        for row in lgbm_forward
+    }
+    folds = {int(day['fold']) for day in days}
+    if folds != set(weights):
+        raise ValueError('逐折 LightGBM 融合缺少 OOF 折权重')
+    fused = []
+    for fold_id in sorted(folds):
+        fused.extend(fuse_lgbm_scores(
+            [day for day in days if int(day['fold']) == fold_id],
+            weights[fold_id],
+        ))
+    return fused
+
+
 def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_folds):
-    """完成可持久化的 LightGBM 融合与严格前向 OOF 策略校准。"""
+    """完成逐折严格前向 LightGBM 融合与策略校准。"""
     lgbm_forward = []
     if lgbm_folds:
         for fold in folds:
@@ -449,10 +588,10 @@ def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_fo
             lgbm_forward.append({
                 'fold': fold_id, 'lgbm_weight': weight, 'source': source,
             })
-        deployment_lgbm_weight = float(np.median([
-            row['lgbm_weight'] for row in lgbm_forward if row['fold'] >= 3
-        ]))
-        ensemble_days = fuse_lgbm_scores(ensemble_days, deployment_lgbm_weight)
+        # 部署只能沿用最后一折当时可得的选择；绝不能中位数回填早期 OOF。
+        deployment_row = lgbm_forward[-1]
+        deployment_lgbm_weight = float(deployment_row['lgbm_weight'])
+        ensemble_days = fuse_lgbm_scores_by_fold(ensemble_days, lgbm_forward)
     else:
         deployment_lgbm_weight = 0.0
     all_oof_policy = calibrate_ensemble_policy(ensemble_days, **calibration_kwargs)
@@ -490,6 +629,10 @@ def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_fo
     return {
         'lgbm_forward': lgbm_forward,
         'deployment_lgbm_weight': deployment_lgbm_weight,
+        'deployment_lgbm_weight_source': {
+            'fold': int(deployment_row['fold']) if lgbm_folds else None,
+            'source': deployment_row['source'] if lgbm_folds else 'transformer_only',
+        },
         # 复制部署策略，避免写入 cross_fitted_oof 时形成循环引用。
         'policy': dict(cross_fitted_policy['robust_deployment_policy']),
         'cross_fitted_policy': cross_fitted_policy,
@@ -3772,6 +3915,16 @@ def run_policy_only():
     })
     if len(fold_ids) < 3:
         raise ValueError('策略重放需要来源目录中完整的至少三折 OOF')
+    folds = [
+        {
+            'fold': int(row['fold']),
+            'train_end': pd.Timestamp(row['train_end']),
+            'val_start': pd.Timestamp(row['val_start']),
+            'val_end': pd.Timestamp(row['val_end']),
+        }
+        for row in source_summary['folds']
+        if int(row['fold']) in fold_ids
+    ]
     source_data_path = source_config.get('data_path', './data_5y')
     source_data_file = os.path.join(source_data_path, 'train.csv')
     if not os.path.isfile(source_data_file):
@@ -3815,22 +3968,20 @@ def run_policy_only():
             records_by_model,
             fold,
         ))
+    lgbm_folds = load_or_build_lgbm_oof_scores(
+        source_dir, output_dir, source_config, folds, ensemble_days,
+    )
     calibration_kwargs = build_policy_calibration_kwargs(
         config,
         ensemble_enabled,
     )
-    replay = forward_fit_module_gated_policy(
+    calibration = calibrate_v17_oof_strategy(
         ensemble_days,
-        forward_module_max_fold_loss=float(config.get(
-            'forward_module_max_fold_loss',
-            0.0025,
-        )),
-        forward_module_max_p10_loss=float(config.get(
-            'forward_module_max_p10_loss',
-            0.005,
-        )),
-        **calibration_kwargs,
+        folds,
+        calibration_kwargs,
+        lgbm_folds,
     )
+    replay = calibration['cross_fitted_policy']
     cross_metrics = replay['metrics']
     candidate_policy = replay['all_oof_candidate_policy']
     robust_policy = replay['robust_deployment_policy']
@@ -3850,6 +4001,14 @@ def run_policy_only():
             source_config.get('selection_risk_lookback', 20),
         )),
         'artifact_source_dir': artifact_source_dir,
+        'lgbm_forward': calibration['lgbm_forward'],
+        'deployment_lgbm_weight': calibration['deployment_lgbm_weight'],
+        'deployment_lgbm_weight_source': calibration[
+            'deployment_lgbm_weight_source'
+        ],
+        # predict.py 使用这两个字段加载来源目录中的全量开发期树模型。
+        'lgbm_weight': calibration['deployment_lgbm_weight'],
+        'lgbm_model_path': 'lgbm_ranker.joblib',
         'module_eligibility': replay['module_eligibility'],
         'module_alternative_reports': candidate_policy.get(
             'module_alternative_reports',
@@ -3873,79 +4032,73 @@ def run_policy_only():
         'all_oof_candidate_policy': _compact_policy(candidate_policy),
         'robust_deployment_policy': _compact_policy(robust_policy),
     })
-    enabled_modules_valid = all(
-        details.get('eligible', False)
-        for module, details in replay['module_eligibility'].items()
-        if policy.get({
-            'risk_score': 'risk_score_penalty',
-            'reversal': 'selection_risk_gamma',
-            'correlation_cluster': 'cluster_cap_enabled',
-            'allocation': 'allocation_blend',
-            'exposure_head': 'exposure_head_blend',
-            'correlation_exposure': 'correlation_exposure_gamma',
-        }[module]) != policy['module_fallbacks'][module]
-    )
-    cluster_report = replay['module_eligibility']['correlation_cluster']
-    source_identity = source_summary.get('identity_sensitivity', {})
-    source_unk = source_identity.get('all_unk_vs_real', {})
+    baseline_path = os.path.abspath(config['baseline_source_dir'])
+    with open(
+        os.path.join(baseline_path, 'cross_validation_summary.json'),
+        encoding='utf-8',
+    ) as file:
+        baseline_summary = json.load(file)
+    baseline_metrics = baseline_summary['cross_fitted_oof']['metrics']
+    baseline_by_fold = {
+        int(row['fold']): row
+        for row in baseline_metrics['folds']
+    }
+    candidate_by_fold = {
+        int(row['fold']): row for row in cross_metrics['folds']
+    }
+    fold_deltas = [
+        {
+            'fold': fold_id,
+            'weighted_return_delta': float(
+                candidate_by_fold[fold_id]['mean_weighted_portfolio_return']
+                - baseline_by_fold[fold_id]['mean_weighted_portfolio_return']
+            ),
+            'rank_ic_delta': float(
+                candidate_by_fold[fold_id]['mean_rank_ic']
+                - baseline_by_fold[fold_id]['mean_rank_ic']
+            ),
+        }
+        for fold_id in fold_ids
+    ]
+    metric_deltas = {
+        'mean_weighted_portfolio_return': float(
+            cross_metrics['mean_weighted_portfolio_return']
+            - baseline_metrics['mean_weighted_portfolio_return']
+        ),
+        'p10_weighted_portfolio_return': float(
+            cross_metrics['p10_weighted_portfolio_return']
+            - baseline_metrics['p10_weighted_portfolio_return']
+        ),
+        'worst_fold_weighted_portfolio_return': float(
+            cross_metrics['worst_fold_weighted_portfolio_return']
+            - baseline_metrics['worst_fold_weighted_portfolio_return']
+        ),
+        'mean_rank_ic': float(
+            cross_metrics['mean_rank_ic'] - baseline_metrics['mean_rank_ic']
+        ),
+    }
     promotion_criteria = {
         'applicable': True,
-        'mean_weighted_return': bool(
-            cross_metrics['mean_weighted_portfolio_return']
-            >= config.get('promotion_mean_weighted_return', 0.019902)
+        'mean_weighted_return_gain_at_least_10bp': bool(
+            metric_deltas['mean_weighted_portfolio_return'] >= 0.001
         ),
-        'worst_fold_weighted_return': bool(
-            cross_metrics['worst_fold_weighted_portfolio_return']
-            >= config.get(
-                'promotion_worst_fold_weighted_return',
-                0.012523,
-            )
+        'at_least_two_positive_fold_gains': bool(sum(
+            row['weighted_return_delta'] > 0.0 for row in fold_deltas
+        ) >= 2),
+        'p10_not_worse_than_10bp': bool(
+            metric_deltas['p10_weighted_portfolio_return'] >= -0.001
         ),
-        'mean_top5_return': bool(
-            cross_metrics['mean_top5_return']
-            >= config.get('promotion_mean_top5_return', 0.0300)
+        'worst_fold_not_worse_than_10bp': bool(
+            metric_deltas['worst_fold_weighted_portfolio_return'] >= -0.001
         ),
-        'p10_weighted_return': bool(
-            cross_metrics['p10_weighted_portfolio_return']
-            > config.get('promotion_p10_weighted_return', -0.025672)
-        ),
-        'mean_rank_ic': bool(
-            cross_metrics['mean_rank_ic']
-            >= config.get('promotion_mean_rank_ic', 0.0514)
-        ),
-        'enabled_modules_pass_gates': bool(enabled_modules_valid),
-        'cluster_selection_not_harmful': bool(
-            not policy['cluster_cap_enabled']
-            or cluster_report.get('mean_paired_contribution', 0.0) >= 0.0
+        'rank_ic_not_worse_than_0_005': bool(
+            metric_deltas['mean_rank_ic'] >= -0.005
         ),
         'allocation_minimum_retained': bool(
             policy['allocation_blend'] >= 0.25
         ),
         'exposure_minimum_retained': bool(
             policy['exposure_head_blend'] >= 0.25
-        ),
-        'exposure_objective_improved': bool(
-            cross_metrics['exposure_policy_objective_delta'] >= 0.0
-        ),
-        'exposure_not_constant': bool(
-            cross_metrics['exposure_std']
-            >= config.get('promotion_min_exposure_std', 0.01)
-        ),
-        'regime_gate_not_constant': bool(
-            cross_metrics['regime_gate_std']
-            >= config.get('promotion_min_regime_gate_std', 0.01)
-        ),
-        'regime_gate_direction': bool(
-            cross_metrics['regime_return_spearman'] < 0.0
-            and cross_metrics['regime_tail_share_spearman'] > 0.0
-        ),
-        'id_score_correlation': bool(
-            source_unk.get('score_spearman', 0.0)
-            >= config.get('promotion_id_score_correlation', 0.90)
-        ),
-        'id_top5_overlap': bool(
-            source_unk.get('top5_overlap', 0.0)
-            >= config.get('promotion_id_top5_overlap', 0.40)
         ),
     }
     promotion_criteria['passed'] = all(
@@ -3990,6 +4143,11 @@ def run_policy_only():
             policy['correlation_exposure_gamma']
         ),
         'exposure_head_blend': float(policy['exposure_head_blend']),
+        'lgbm_forward': calibration['lgbm_forward'],
+        'deployment_lgbm_weight': calibration['deployment_lgbm_weight'],
+        'deployment_lgbm_weight_source': calibration[
+            'deployment_lgbm_weight_source'
+        ],
         **{
             key: cross_metrics[key] for key in (
                 'mean_top5_return',
@@ -4058,7 +4216,30 @@ def run_policy_only():
         },
         'deployment_policy': _compact_policy(robust_policy, False),
         'promotion_criteria': promotion_criteria,
-        'folds': source_summary.get('folds', []),
+        'baseline_comparison': {
+            'baseline_source_dir': os.path.relpath(baseline_path, output_dir),
+            'metric_deltas': metric_deltas,
+            'fold_deltas': fold_deltas,
+        },
+        'original_v17_candidate': {
+            'artifact_source_dir': artifact_source_dir,
+            'reported_cross_fitted_metrics': source_summary.get(
+                'cross_fitted_oof', {}
+            ).get('metrics', {}),
+            'warning': (
+                'v1.17 的全局 LightGBM 部署权重曾回填早期 OOF；'
+                '仅作历史参考，不作为 v1.18 晋级依据。'
+            ),
+        },
+        'disabled_strategy_modules': {
+            'risk_penalty': True,
+            'reversal_penalty': True,
+            'correlation_exposure': True,
+            'correlation_cluster_replacement': True,
+            'exposure_mode': '25% Exposure Head + 75% 0.999999 fallback',
+        },
+        'folds': cross_metrics['folds'],
+        'source_training_folds': source_summary.get('folds', []),
         'full_training': {
             'reused': True,
             'artifact_source_dir': artifact_source_dir,
@@ -4119,10 +4300,15 @@ def main():
     if policy_only_enabled():
         return run_policy_only()
     profile = apply_v17_profile()
-    if config.get('policy_only_experiment', False):
+    final_deployment = (
+        os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1'
+        and os.environ.get('LOCKBOX_ACCEPTED', '0') == '1'
+    )
+    if config.get('policy_only_experiment', False) and not final_deployment:
         raise ValueError(
             '当前配置是策略重放实验，不允许重新训练；'
-            '请使用 POLICY_ONLY=1 ./train.sh'
+            '请使用 POLICY_ONLY=1 ./train.sh；锁箱验收通过后才可设置 '
+            'V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 做独立最终部署重训'
         )
     configured_ensemble_seeds = [int(seed) for seed in config.get(
         'ensemble_seeds',

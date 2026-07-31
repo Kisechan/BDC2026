@@ -2,8 +2,12 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'threefold_industryresidual_lgbmblend_pathrisk_v17'
-artifact_experiment_name = 'nested_oof_diverse_tailregime_v6_decay5y'
+experiment_name = 'returnfirst_strict_oof_v18'
+# v1.18 是策略重放版本：模型、scaler 和特征 manifest 均来自这一固定 v1.17
+# candidate，绝不把 205 维工件与旧 v6/v1.16 混用。
+artifact_experiment_name = (
+    'threefold_industryresidual_lgbmblend_pathrisk_v17_candidate'
+)
 config = {
     'experiment_name': experiment_name,
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
@@ -78,7 +82,8 @@ config = {
     # 排序主干输出原始分数；风险惩罚强度只用 OOF 网格校准。
     'risk_penalty_scale': 0.0,
     'oof_risk_penalty_enabled': True,
-    'risk_score_penalty_grid': [0.0, 0.05, 0.10, 0.15, 0.25],
+    # v1.18 收益优先重放：这些可选风险/相关模块固定关闭，不再搜索。
+    'risk_score_penalty_grid': [0.0],
     'risk_1d_target_temperature': 0.01,
     'risk_3d_target_temperature': 0.02,
     'risk_5d_target_temperature': 0.03,
@@ -107,19 +112,19 @@ config = {
     'exposure_risk_penalty_init': 0.25,
     'min_exposure': 0.20,
     'max_exposure': 0.999999,
-    'allocation_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
+    'allocation_blend_grid': [0.25],
     'allocation_weight_floor': 0.05,
     'allocation_weight_cap': 0.35,
     'disagreement_gamma_grid': [0.0, 2.0, 4.0, 8.0],
-    'selection_risk_gamma_grid': [0.0, 0.05, 0.10, 0.20],
-    'correlation_exposure_gamma_grid': [0.0, 0.5, 1.0, 2.0],
+    'selection_risk_gamma_grid': [0.0],
+    'correlation_exposure_gamma_grid': [0.0],
     # Exposure Head 必须保留；OOF 只校准其相对固定基线的占比。
-    'exposure_head_blend_grid': [0.25, 0.50, 0.75, 1.0],
+    'exposure_head_blend_grid': [0.25],
     'selection_candidate_k': 30,
     'selection_risk_lookback': 60,
     'selection_correlation_lookbacks': [20, 60],
     'cluster_cap_enabled': False,
-    'cluster_cap_grid': [False, True],
+    'cluster_cap_grid': [False],
     'cluster_correlation_threshold': 0.60,
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
@@ -137,7 +142,7 @@ config = {
     'nested_oof_enabled': True,
     # 策略层纯收益优先，但保留较轻的下行波动惩罚。
     'ensemble_downside_weight': 0.25,
-    'policy_only_experiment': False,
+    'policy_only_experiment': True,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
     'forward_module_max_fold_loss': 0.0025,
@@ -193,7 +198,8 @@ config = {
     'promotion_id_top5_overlap': 0.40,
     'promotion_min_exposure_std': 0.01,
     'promotion_min_regime_gate_std': 0.01,
-    'fixed_exposure_baseline': 0.6231689453125,
+    # Exposure Head 始终占 25%，其余为近满仓收益优先 fallback。
+    'fixed_exposure_baseline': 0.999999,
 
     # 保持损失为 FP32，仅对 Transformer 前向启用 AMP。
     'amp_enabled': True,
@@ -206,10 +212,17 @@ config = {
 
     'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
     'policy_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_{experiment_name}'
+        f'./model/{sequence_length}_{feature_num}_{experiment_name}_policy'
     ),
     'policy_only_source_dir': (
         f'./model/{sequence_length}_{feature_num}_{artifact_experiment_name}'
+    ),
+    'baseline_source_dir': (
+        './model/60_158+39_reduced25_relmarket12_risk15_'
+        'threefold_industryresidual_lgbmblend_pathrisk_v17_baseline'
+    ),
+    'full_deployment_output_dir': (
+        f'./model/{sequence_length}_{feature_num}_v1.18_full5y_deployment'
     ),
     # 五年历史数据与原三年数据隔离存放，避免覆盖已有实验的切分文件。
     'data_path': './data_5y',

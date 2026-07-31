@@ -15,7 +15,7 @@
 1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）与行业历史快照；
 2. 做单股量价特征工程，并增加短期反转、下行波动、市场压力和行业 as-of 残差特征；
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
-4. v1.17 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月 lockbox，每折训练/验证之间 purge 5 日；
+4. v1.17 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月 lockbox，每折训练/验证之间 purge 5 日；v1.18 只严格重放这些候选工件的策略层；
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
    回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
@@ -26,6 +26,21 @@
 
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
+
+### v1.18 严格 OOF 收益优先重放
+
+v1.18 固定复用 v1.17 candidate 的 205 维 Transformer、scaler、三折 OOF 和已保存的
+LightGBM 折模型，输出到独立的
+`model/60_158+39_reduced25_relmarket12_risk15_indresid12_returnfirst_strict_oof_v18_policy/`。
+运行 `POLICY_ONLY=1 ./train.sh` 不会出现训练 epoch：缺少时仅用已保存的 LightGBM 折模型
+重建并原子缓存 OOF 分数。F1/F2 强制只用 Transformer；F3 只能用 F1/F2 完整标签选择融合
+权重；部署权重取最后一个合法前向折。风险惩罚、反转、相关性降仓和相关簇替换均关闭；
+Allocation Head 保留 25%，Exposure 为 25% Head 加 75% 近满仓 fallback。
+
+`cross_validation_summary.json` 同时记录 v1.17 baseline、历史 v1.17 candidate 和校正后
+v1.18 的逐折对比。晋级仅比较三折动态组合收益：均值至少 +10bp、至少两折正增益、P10 与
+最差折不差于 -10bp、Rank IC 不低于 -0.005。通过后才可进行一次 lockbox 验收；`test.csv`
+不参与该选择过程。
 
 ---
 
