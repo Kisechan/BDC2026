@@ -269,6 +269,26 @@ def lgbm_progress_callback(description, total_iterations):
     return progress, update_progress
 
 
+def validate_lgbm_checkpoint(model, features, checkpoint_path, expected_iterations=None):
+    """拒绝复用特征或训练轮数不一致的 LightGBM 工件。"""
+    if (
+        int(getattr(model, 'n_features_in_', -1)) != len(features)
+        or list(getattr(model, 'feature_name_', [])) != list(features)
+    ):
+        raise ValueError(f'LightGBM checkpoint 特征不匹配: {checkpoint_path}')
+    if expected_iterations is not None:
+        actual_iterations = int(model.booster_.current_iteration())
+        if actual_iterations != int(expected_iterations):
+            raise ValueError(f'LightGBM checkpoint 迭代数不匹配: {checkpoint_path}')
+
+
+def save_joblib_checkpoint(value, checkpoint_path):
+    """原子写入 checkpoint，进程中断时保留上一个完整版本。"""
+    temporary_path = f'{checkpoint_path}.tmp'
+    joblib.dump(value, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+
+
 def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     """同一训练文件内的表格排序补充模型；只以预测日连续输入训练。"""
     if not config.get('lgbm_enabled', False):
@@ -280,6 +300,8 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     if INDUSTRY_NEUTRAL_TARGET not in data:
         raise ValueError('LightGBM 需要行业中性标签')
     results = []
+    lgbm_dir = os.path.join(output_dir, 'lgbm')
+    os.makedirs(lgbm_dir, exist_ok=True)
     for fold in folds:
         train = data.loc[data['日期'] <= fold['train_end']].sort_values(
             ['日期', 'instrument'], kind='mergesort',
@@ -291,37 +313,41 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
         valid_groups = valid.groupby('日期', sort=False).size().to_numpy()
         if train.empty or valid.empty or groups.min() < 2 or valid_groups.min() < 2:
             raise ValueError(f"LightGBM Fold {fold['fold']} 的日期分组不足")
-        train_labels = lgbm_relevance_labels(train)
-        valid_labels = lgbm_relevance_labels(valid)
         description = f"LightGBM Fold {fold['fold']}"
-        print(f"阶段 LightGBM：Fold {fold['fold']}，训练 {len(train):,} / 验证 {len(valid):,} 行")
-        model = LGBMRanker(
-            objective='lambdarank', metric='ndcg',
-            learning_rate=config['lgbm_learning_rate'], n_estimators=config['lgbm_n_estimators'],
-            num_leaves=config['lgbm_num_leaves'], min_child_samples=config['lgbm_min_child_samples'],
-            colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
-            reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
-            n_jobs=config['lgbm_n_jobs'], verbosity=-1,
-        )
-        progress, update_progress = lgbm_progress_callback(
-            description, config['lgbm_n_estimators'],
-        )
-        try:
-            model.fit(
-                train[features], train_labels, group=groups,
-                eval_X=valid[features], eval_y=valid_labels,
-                eval_group=[valid_groups], eval_at=[5],
-                callbacks=[
-                    update_progress,
-                    early_stopping(config['lgbm_early_stopping_rounds'], verbose=False),
-                ],
+        checkpoint_path = os.path.join(lgbm_dir, f"fold_{fold['fold']}.joblib")
+        if resume_training_enabled() and os.path.isfile(checkpoint_path):
+            model = joblib.load(checkpoint_path)
+            validate_lgbm_checkpoint(model, features, checkpoint_path)
+            print(f"恢复 LightGBM Fold {fold['fold']} checkpoint")
+        else:
+            train_labels = lgbm_relevance_labels(train)
+            valid_labels = lgbm_relevance_labels(valid)
+            print(f"阶段 LightGBM：Fold {fold['fold']}，训练 {len(train):,} / 验证 {len(valid):,} 行")
+            model = LGBMRanker(
+                objective='lambdarank', metric='ndcg',
+                learning_rate=config['lgbm_learning_rate'], n_estimators=config['lgbm_n_estimators'],
+                num_leaves=config['lgbm_num_leaves'], min_child_samples=config['lgbm_min_child_samples'],
+                colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
+                reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
+                n_jobs=config['lgbm_n_jobs'], verbosity=-1,
             )
-        finally:
-            progress.close()
-        print(f"阶段 LightGBM：Fold {fold['fold']} 完成，最佳 {model.best_iteration_} 棵树")
-        lgbm_dir = os.path.join(output_dir, 'lgbm')
-        os.makedirs(lgbm_dir, exist_ok=True)
-        joblib.dump(model, os.path.join(lgbm_dir, f"fold_{fold['fold']}.joblib"))
+            progress, update_progress = lgbm_progress_callback(
+                description, config['lgbm_n_estimators'],
+            )
+            try:
+                model.fit(
+                    train[features], train_labels, group=groups,
+                    eval_X=valid[features], eval_y=valid_labels,
+                    eval_group=[valid_groups], eval_at=[5],
+                    callbacks=[
+                        update_progress,
+                        early_stopping(config['lgbm_early_stopping_rounds'], verbose=False),
+                    ],
+                )
+            finally:
+                progress.close()
+            print(f"阶段 LightGBM：Fold {fold['fold']} 完成，最佳 {model.best_iteration_} 棵树")
+            save_joblib_checkpoint(model, checkpoint_path)
         by_date = {pd.Timestamp(date).strftime('%Y-%m-%d'): rows.set_index('instrument')
                    for date, rows in valid.groupby('日期', sort=False)}
         for records in oof_records[int(fold['fold'])].values():
@@ -343,6 +369,12 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         return None
     from lightgbm import LGBMRanker
     iterations = int(np.median([row['best_iteration'] for row in fold_results]))
+    path = os.path.join(output_dir, 'lgbm_ranker.joblib')
+    if resume_training_enabled() and os.path.isfile(path):
+        model = joblib.load(path)
+        validate_lgbm_checkpoint(model, features, path, expected_iterations=iterations)
+        print('恢复 LightGBM 全量重训 checkpoint')
+        return os.path.basename(path)
     data = data.sort_values(['日期', 'instrument'], kind='mergesort').copy()
     groups = data.groupby('日期', sort=False).size().to_numpy()
     labels = lgbm_relevance_labels(data)
@@ -362,8 +394,7 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         model.fit(data[features], labels, group=groups, callbacks=[update_progress])
     finally:
         progress.close()
-    path = os.path.join(output_dir, 'lgbm_ranker.joblib')
-    joblib.dump(model, path)
+    save_joblib_checkpoint(model, path)
     return os.path.basename(path)
 
 
@@ -385,6 +416,100 @@ def fuse_lgbm_scores(days, weight):
         copied['regime_gates'] = np.asarray([np.median(day['regime_gates'])])
         fused.append(copied)
     return fused
+
+
+def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_folds):
+    """完成可持久化的 LightGBM 融合与严格前向 OOF 策略校准。"""
+    lgbm_forward = []
+    if lgbm_folds:
+        for fold in folds:
+            fold_id = int(fold['fold'])
+            if fold_id <= 2:
+                weight, source = 0.0, 'fallback_insufficient_earlier_folds'
+            else:
+                earlier = [
+                    day for day in ensemble_days
+                    if int(day['fold']) < fold_id
+                    and pd.Timestamp(day['label_end_date']) < fold['val_start']
+                ]
+                if len({int(day['fold']) for day in earlier}) < 2:
+                    raise ValueError(f'Fold {fold_id} 没有两折已实现的更早 OOF 标签')
+                candidates = [
+                    (
+                        calibrate_ensemble_policy(
+                            fuse_lgbm_scores(earlier, float(candidate)),
+                            **calibration_kwargs,
+                        )['oof_metrics']['mean_weighted_portfolio_return'],
+                        float(candidate),
+                    )
+                    for candidate in config['lgbm_blend_grid']
+                ]
+                _, weight = max(candidates, key=lambda row: (row[0], -row[1]))
+                source = 'strict_earlier_oof'
+            lgbm_forward.append({
+                'fold': fold_id, 'lgbm_weight': weight, 'source': source,
+            })
+        deployment_lgbm_weight = float(np.median([
+            row['lgbm_weight'] for row in lgbm_forward if row['fold'] >= 3
+        ]))
+        ensemble_days = fuse_lgbm_scores(ensemble_days, deployment_lgbm_weight)
+    else:
+        deployment_lgbm_weight = 0.0
+    all_oof_policy = calibrate_ensemble_policy(ensemble_days, **calibration_kwargs)
+    if not config.get('nested_oof_enabled', False):
+        return {
+            'lgbm_forward': lgbm_forward,
+            'deployment_lgbm_weight': deployment_lgbm_weight,
+            'policy': all_oof_policy,
+            'cross_fitted_policy': {
+                'method': 'disabled', 'metrics': all_oof_policy['oof_metrics'],
+                'fold_policies': [], 'policy_stability': {},
+            },
+            'ensemble_metrics': all_oof_policy['oof_metrics'],
+        }
+    cross_fitted_policy = forward_fit_module_gated_policy(
+        ensemble_days,
+        forward_module_max_fold_loss=float(config.get(
+            'forward_module_max_fold_loss', 0.0025,
+        )),
+        forward_module_max_p10_loss=float(config.get(
+            'forward_module_max_p10_loss', 0.005,
+        )),
+        **calibration_kwargs,
+    )
+    cross_fitted_policy['deployment_policy_differences'] = {
+        field: [
+            float(all_oof_policy[field]) - float(row['policy'][field])
+            for row in cross_fitted_policy['fold_policies']
+        ]
+        for field in (
+            'allocation_blend', 'disagreement_gamma', 'selection_risk_gamma',
+            'risk_score_penalty', 'correlation_exposure_gamma', 'exposure_head_blend',
+        )
+    }
+    return {
+        'lgbm_forward': lgbm_forward,
+        'deployment_lgbm_weight': deployment_lgbm_weight,
+        # 复制部署策略，避免写入 cross_fitted_oof 时形成循环引用。
+        'policy': dict(cross_fitted_policy['robust_deployment_policy']),
+        'cross_fitted_policy': cross_fitted_policy,
+        'ensemble_metrics': cross_fitted_policy['metrics'],
+    }
+
+
+def oof_strategy_checkpoint_signature(features, folds, lgbm_folds, ensemble_seeds):
+    """为恢复检查绑定特征、折边界、树模型迭代数和完整训练配置。"""
+    payload = {
+        'feature_sha256': hashlib.sha256('\n'.join(features).encode()).hexdigest(),
+        'folds': [{
+            key: int(value) if key == 'fold' else pd.Timestamp(value).strftime('%Y-%m-%d')
+            for key, value in fold.items()
+        } for fold in folds],
+        'lgbm_folds': lgbm_folds,
+        'ensemble_seeds': list(ensemble_seeds),
+        'config': config,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def recover_completed_stage_results(fold_dir, steps_per_epoch):
@@ -4235,79 +4360,32 @@ def main():
         downside_weight=config.get('ensemble_downside_weight', 0.5),
         top_k=5,
     )
-    lgbm_forward = []
-    if lgbm_folds:
-        for fold in folds:
-            fold_id = int(fold['fold'])
-            if fold_id <= 2:
-                weight = 0.0
-                source = 'fallback_insufficient_earlier_folds'
-            else:
-                earlier = [day for day in ensemble_days
-                           if int(day['fold']) < fold_id
-                           and pd.Timestamp(day['label_end_date']) < fold['val_start']]
-                if len({int(day['fold']) for day in earlier}) < 2:
-                    raise ValueError(f'Fold {fold_id} 没有两折已实现的更早 OOF 标签')
-                candidates = []
-                for candidate in config['lgbm_blend_grid']:
-                    metrics = calibrate_ensemble_policy(
-                        fuse_lgbm_scores(earlier, float(candidate)),
-                        **policy_calibration_kwargs,
-                    )['oof_metrics']
-                    candidates.append((metrics['mean_weighted_portfolio_return'], float(candidate)))
-                _, weight = max(candidates, key=lambda row: (row[0], -row[1]))
-                source = 'strict_earlier_oof'
-            lgbm_forward.append({'fold': fold_id, 'lgbm_weight': weight, 'source': source})
-        deployment_lgbm_weight = float(np.median([
-            row['lgbm_weight'] for row in lgbm_forward if row['fold'] >= 3
-        ]))
-        ensemble_days = fuse_lgbm_scores(ensemble_days, deployment_lgbm_weight)
-    else:
-        deployment_lgbm_weight = 0.0
-    policy = calibrate_ensemble_policy(
-        ensemble_days,
-        **policy_calibration_kwargs,
+    checkpoint_path = os.path.join(output_dir, 'oof_strategy_calibration.joblib')
+    signature = oof_strategy_checkpoint_signature(
+        features, folds, lgbm_folds, ensemble_seeds,
     )
-    if config.get('nested_oof_enabled', False):
-        cross_fitted_policy = forward_fit_module_gated_policy(
-            ensemble_days,
-            forward_module_max_fold_loss=float(config.get(
-                'forward_module_max_fold_loss', 0.0025,
-            )),
-            forward_module_max_p10_loss=float(config.get(
-                'forward_module_max_p10_loss', 0.005,
-            )),
-            **policy_calibration_kwargs,
+    calibration = None
+    if resume_training_enabled() and os.path.isfile(checkpoint_path):
+        cached = joblib.load(checkpoint_path)
+        if cached.get('signature') == signature:
+            calibration = cached['calibration']
+            print('恢复严格 OOF 策略校准 checkpoint')
+        else:
+            print('OOF 策略校准 checkpoint 与当前工件不匹配，将重新校准')
+    if calibration is None:
+        print('阶段 OOF 策略校准：LightGBM 融合与严格前向模块门控')
+        calibration = calibrate_v17_oof_strategy(
+            ensemble_days, folds, policy_calibration_kwargs, lgbm_folds,
         )
-        cross_fitted_policy['deployment_policy_differences'] = {
-            field: [
-                float(policy[field]) - float(
-                    row['policy'][field]
-                )
-                for row in cross_fitted_policy['fold_policies']
-            ]
-            for field in (
-                'allocation_blend',
-                'disagreement_gamma',
-                'selection_risk_gamma',
-                'risk_score_penalty',
-                'correlation_exposure_gamma',
-                'exposure_head_blend',
-            )
-        }
-        # 部署策略只保留严格前向 OOF 已通过模块门槛的配置；全 OOF 最优值
-        # 仅作为候选报告，不能直接穿透到部署策略。
-        # 复制部署策略，避免随后写入 cross_fitted_oof 时形成循环引用。
-        policy = dict(cross_fitted_policy['robust_deployment_policy'])
-        ensemble_metrics = cross_fitted_policy['metrics']
-    else:
-        cross_fitted_policy = {
-            'method': 'disabled',
-            'metrics': policy['oof_metrics'],
-            'fold_policies': [],
-            'policy_stability': {},
-        }
-        ensemble_metrics = policy['oof_metrics']
+        save_joblib_checkpoint(
+            {'signature': signature, 'calibration': calibration}, checkpoint_path,
+        )
+        print('OOF 策略校准 checkpoint 已保存')
+    lgbm_forward = calibration['lgbm_forward']
+    deployment_lgbm_weight = calibration['deployment_lgbm_weight']
+    policy = calibration['policy']
+    cross_fitted_policy = calibration['cross_fitted_policy']
+    ensemble_metrics = calibration['ensemble_metrics']
     single_seed_summaries = {}
     for seed in ensemble_seeds:
         single_seed_summaries[str(seed)] = evaluate_ensemble_policy(
