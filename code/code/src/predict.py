@@ -17,6 +17,7 @@ from utils import build_ensemble_portfolio
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import extract_selection_risk_context
 from utils import (
+	INDUSTRY_ASOF_COLUMN,
 	MARKET_PRESSURE_FEATURES,
 	RELATIVE_MARKET_FEATURES,
 	RELATIVE_MARKET_FEATURE_SET,
@@ -482,6 +483,12 @@ def build_prediction_day_diagnostics(
 			'cluster_constraint_applied': bool(
 				portfolio['cluster_constraint_applied']
 			),
+			'industry_constraint_applied': bool(
+				portfolio['industry_constraint_applied']
+			),
+			'industry_constraint_fallback': bool(
+				portfolio['industry_constraint_fallback']
+			),
 			'head_base_exposure': float(portfolio['head_base_exposure']),
 			'base_exposure': float(portfolio['base_exposure']),
 		},
@@ -713,6 +720,13 @@ def main():
 	lgbm_raw_latest = lgbm_raw_latest_by_stock.reindex(
 		sequence_stock_ids,
 	)[features].to_numpy(dtype=np.float32)
+	industry_labels = None
+	if INDUSTRY_ASOF_COLUMN in processed:
+		industry_labels = processed.sort_values(
+			['股票代码', '日期'],
+		).groupby('股票代码', sort=False).tail(1).set_index('股票代码')[
+			INDUSTRY_ASOF_COLUMN
+		].reindex(sequence_stock_ids).to_numpy(dtype=object)
 	if not np.isfinite(lgbm_raw_latest).all():
 		raise ValueError('LightGBM 预测日特征与可用序列股票集合不一致')
 	selection_risk_context = None
@@ -1059,6 +1073,12 @@ def main():
 			'fixed_exposure_baseline',
 			0.6231689453125,
 		)),
+		industry_labels=industry_labels,
+		max_stocks_per_industry=(
+			policy.get('max_stocks_per_industry')
+			if industry_labels is not None else None
+		),
+		industry_candidate_k=int(policy.get('industry_candidate_k', 10)),
 		top_k=int(policy.get('top_k', 5)),
 	)
 	top_indices = portfolio['top_indices']

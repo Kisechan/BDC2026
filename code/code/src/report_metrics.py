@@ -59,6 +59,12 @@ def print_cross_validation() -> None:
             "最差折动态权重组合收益: "
             f"{_pct(float(summary['worst_fold_weighted_portfolio_return']))}"
         )
+        if 'max_drawdown' in summary:
+            print(
+                f"最差单日/最大回撤: "
+                f"{_pct(float(summary['worst_weighted_portfolio_return']))} / "
+                f"{_pct(float(summary['max_drawdown']))}"
+            )
         print(
             f"平均股票仓位/现金: {float(summary['mean_gross_exposure']):.2%} / "
             f"{float(summary['mean_cash_weight']):.2%}"
@@ -271,7 +277,7 @@ def print_cross_validation() -> None:
         )
     candidates = summary.get('pre_registered_candidates', {})
     if candidates:
-        print('v1.19 预注册纯模型候选（无中间融合）:')
+        print('预注册策略候选（不做事后融合）:')
         for name, candidate in candidates.items():
             metrics = candidate.get('metrics', {})
             gate = candidate.get('promotion_criteria', {})
@@ -282,23 +288,34 @@ def print_cross_validation() -> None:
                 f"Rank IC={float(metrics.get('mean_rank_ic', 0.0)):+.4f}, "
                 f"晋级={'PASS' if gate.get('passed') else 'FAIL'}"
             )
-        pair_rows = summary.get('lgbm_pair_report', [])
-        if pair_rows:
-            paired_return = np.mean([
-                row['weighted_return_delta_lgbm_minus_transformer']
-                for row in pair_rows
-            ])
-            paired_ic = np.mean([
-                row['rank_ic_delta_lgbm_minus_transformer']
-                for row in pair_rows
-            ])
-            overlap = np.mean([row['top5_overlap'] for row in pair_rows])
-            print(
-                '  LGBM−Transformer 配对：'
-                f'收益 {_pct(float(paired_return))}，'
-                f'Rank IC {float(paired_ic):+.4f}，'
-                f'Top-5 重合率 {float(overlap):.2%}'
-            )
+    if 'industry_constraint_application_rate' in summary:
+        print(
+            '行业约束—应用/回退率、行业数/HHI/最大行业权重: '
+            f"{float(summary['industry_constraint_application_rate']):.2%} / "
+            f"{float(summary['industry_constraint_fallback_rate']):.2%}, "
+            f"{float(summary['mean_industry_count']):.2f} / "
+            f"{float(summary['mean_industry_hhi']):.4f} / "
+            f"{_pct(float(summary['mean_max_industry_weight']))}"
+        )
+    if summary.get('market_state_diagnostics'):
+        print('市场状态诊断已写入 cross_validation_summary.json（不参与选型）。')
+    pair_rows = summary.get('lgbm_pair_report', [])
+    if pair_rows:
+        paired_return = np.mean([
+            row['weighted_return_delta_lgbm_minus_transformer']
+            for row in pair_rows
+        ])
+        paired_ic = np.mean([
+            row['rank_ic_delta_lgbm_minus_transformer']
+            for row in pair_rows
+        ])
+        overlap = np.mean([row['top5_overlap'] for row in pair_rows])
+        print(
+            '  LGBM−Transformer 配对：'
+            f'收益 {_pct(float(paired_return))}，'
+            f'Rank IC {float(paired_ic):+.4f}，'
+            f'Top-5 重合率 {float(overlap):.2%}'
+        )
 
 
 def _number(value, digits: int = 4) -> str:

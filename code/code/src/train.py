@@ -29,7 +29,7 @@ from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
 from utils import evaluate_ensemble_policy
 from utils import attach_label_end_dates, forward_fit_module_gated_policy
-from utils import percentile_ranks
+from utils import maximum_drawdown, percentile_ranks
 import joblib
 import os
 import json
@@ -52,6 +52,12 @@ def policy_only_enabled():
 
 def lockbox_eval_enabled():
     return os.environ.get('LOCKBOX_EVAL', '0').strip().lower() in {
+        '1', 'true', 'yes', 'on',
+    }
+
+
+def stress_eval_enabled():
+    return os.environ.get('STRESS_EVAL', '0').strip().lower() in {
         '1', 'true', 'yes', 'on',
     }
 
@@ -305,29 +311,43 @@ def atomic_write_lockbox_report(path, report):
             os.unlink(temporary_path)
 
 
-def run_lockbox_eval(output_dir):
-    """一次性比较冻结 v1.17 基线与已晋级 v1.19 候选，不训练任何模型。"""
+def run_lockbox_eval(output_dir, stress=False):
+    """一次性回放新锁箱，或只诊断已知压力期；两者均不训练模型。"""
     if os.environ.get('V17_INCLUDE_LOCKBOX', '0') == '1':
-        raise ValueError('LOCKBOX_EVAL 与最终部署重训互斥')
-    report_path = os.path.join(output_dir, 'lockbox_report.json')
+        raise ValueError('评估回放与最终部署重训互斥')
+    report_path = os.path.join(
+        output_dir,
+        'observed_stress_report.json' if stress else 'lockbox_report.json',
+    )
     if os.path.exists(report_path):
         raise FileExistsError(f'锁箱报告已存在，拒绝第二次运行: {report_path}')
     policy_path = os.path.join(output_dir, 'ensemble_policy.json')
     manifest_path = os.path.join(output_dir, 'artifact_manifest.json')
-    for path, label in ((policy_path, 'v1.19 策略'), (manifest_path, 'v1.19 manifest')):
+    for path, label in ((policy_path, 'v1.20 策略'), (manifest_path, 'v1.20 manifest')):
         if not os.path.isfile(path):
             raise FileNotFoundError(f'LOCKBOX_EVAL 需要{label}: {path}')
     with open(policy_path, encoding='utf-8') as handle:
         policy = json.load(handle)
     promotion = policy.get('promotion_criteria', {})
     if not promotion.get('passed', False):
-        raise ValueError('v1.19 开发期未晋级，LOCKBOX_EVAL 被拒绝')
+        raise ValueError('v1.20 开发期未晋级，评估回放被拒绝')
     with open(manifest_path, encoding='utf-8') as handle:
         manifest = json.load(handle)
     lockbox_start_raw = manifest.get('lockbox_start')
     if not lockbox_start_raw:
-        raise ValueError('v1.19 manifest 未冻结 lockbox_start')
-    lockbox_start = pd.Timestamp(lockbox_start_raw)
+        raise ValueError('v1.20 manifest 未冻结 lockbox_start')
+    known_stress_end = pd.Timestamp(config['known_stress_end'])
+    if stress:
+        lockbox_start = pd.Timestamp(config['known_stress_start'])
+        evaluation_end = known_stress_end
+    else:
+        lockbox_start = pd.Timestamp(lockbox_start_raw)
+        if lockbox_start <= known_stress_end:
+            raise ValueError(
+                'LOCKBOX_EVAL 只允许 2026-07-29 之后新增数据形成的新锁箱；'
+                '当前末两月已被 v1.19 消费，请使用 STRESS_EVAL=1 做已知压力诊断'
+            )
+        evaluation_end = None
     baseline_dir = os.path.abspath(config['baseline_source_dir'])
     baseline_policy = os.path.join(baseline_dir, 'ensemble_policy.json')
     if not os.path.isfile(baseline_policy):
@@ -339,8 +359,16 @@ def run_lockbox_eval(output_dir):
     raw['日期'] = pd.to_datetime(raw['日期'])
     dates = np.array(sorted(raw['日期'].unique()), dtype='datetime64[ns]')
     first = int(np.searchsorted(dates, lockbox_start.to_datetime64(), side='left'))
+    last_anchor_exclusive = len(dates) - 5
+    if evaluation_end is not None:
+        last_anchor_exclusive = min(
+            last_anchor_exclusive,
+            int(np.searchsorted(
+                dates, evaluation_end.to_datetime64(), side='right',
+            )) - 5,
+        )
     anchors = [pd.Timestamp(dates[index]) for index in range(
-        first, max(first, len(dates) - 5), int(config['evaluation_stride']),
+        first, max(first, last_anchor_exclusive), int(config['evaluation_stride']),
     )]
     if not anchors:
         raise ValueError('锁箱没有可完成 t+1 至 t+5 持有期的交易日')
@@ -348,15 +376,18 @@ def run_lockbox_eval(output_dir):
     source_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.dirname(os.path.dirname(source_dir))
     predict_script = os.path.join(source_dir, 'predict.py')
-    prediction_root = os.path.join(output_dir, '_lockbox_predictions')
+    prediction_root = os.path.join(
+        output_dir, '_stress_predictions' if stress else '_lockbox_predictions',
+    )
     candidates = {
         'v1.17_baseline': baseline_dir,
-        'v1.19_candidate': os.path.abspath(output_dir),
+        'v1.20_candidate': os.path.abspath(output_dir),
     }
     records = {name: [] for name in candidates}
     total_steps = len(anchors) * len(candidates)
     print(
-        f'阶段 Lockbox：{lockbox_start.date()} 起 {len(anchors)} 个非重叠锚点，'
+        f"阶段 {'Stress' if stress else 'Lockbox'}：{lockbox_start.date()} 起 "
+        f'{len(anchors)} 个非重叠锚点，'
         '仅加载冻结工件推理'
     )
     with tqdm(total=total_steps, desc='Lockbox 回放', unit='模型日', dynamic_ncols=True) as progress:
@@ -403,21 +434,32 @@ def run_lockbox_eval(output_dir):
         for name, rows in records.items()
     }
     baseline_stats = results['v1.17_baseline']
-    candidate_stats = results['v1.19_candidate']
+    candidate_stats = results['v1.20_candidate']
+    mean_passed = (
+        candidate_stats['mean_return'] >= baseline_stats['mean_return']
+        if stress else candidate_stats['mean_return'] > baseline_stats['mean_return']
+    )
     accepted = bool(
-        candidate_stats['mean_return'] > baseline_stats['mean_return']
+        mean_passed
         and candidate_stats['p10_return'] >= baseline_stats['p10_return']
         and candidate_stats['max_drawdown'] >= baseline_stats['max_drawdown']
     )
     report = {
-        'protocol': 'v1.19_lockbox_t_plus_1_open_to_t_plus_5_close_stride_5',
+        'protocol': (
+            'v1.20_observed_stress_t_plus_1_open_to_t_plus_5_close_stride_5'
+            if stress else 'v1.20_fresh_lockbox_t_plus_1_open_to_t_plus_5_close_stride_5'
+        ),
         'lockbox_start': lockbox_start.strftime('%Y-%m-%d'),
+        'lockbox_end': (
+            None if evaluation_end is None else evaluation_end.strftime('%Y-%m-%d')
+        ),
+        'fresh_lockbox': not stress,
         'model_dirs': candidates,
         'selected_candidate': policy.get('candidate_name'),
         'hashes': {
             'train_csv': sha256_file(data_file),
-            'v1.19_policy': sha256_file(policy_path),
-            'v1.19_manifest': sha256_file(manifest_path),
+            'v1.20_policy': sha256_file(policy_path),
+            'v1.20_manifest': sha256_file(manifest_path),
             'v1.17_policy': sha256_file(baseline_policy),
         },
         'results': results,
@@ -425,12 +467,13 @@ def run_lockbox_eval(output_dir):
             key: float(candidate_stats[key] - baseline_stats[key])
             for key in ('mean_return', 'p10_return', 'max_drawdown')
         },
-        'accepted_for_final_deployment': accepted,
+        'accepted_for_final_deployment': bool(accepted and not stress),
+        'stress_gate_passed': bool(accepted) if stress else None,
     }
     atomic_write_lockbox_report(report_path, report)
     print(
-        f'Lockbox 报告已写入: {report_path}; '
-        f'最终部署许可: {"通过" if accepted else "未通过"}'
+        f"{'Stress' if stress else 'Lockbox'} 报告已写入: {report_path}; "
+        f"最终部署许可: {'通过' if accepted and not stress else '未通过'}"
     )
     return candidate_stats['mean_return']
 
@@ -449,11 +492,15 @@ def require_accepted_lockbox_for_deployment():
     with open(report_path, encoding='utf-8') as handle:
         report = json.load(handle)
     if not report.get('accepted_for_final_deployment', False):
-        raise ValueError('锁箱未通过，禁止 v1.19 全五年最终部署重训')
+        raise ValueError('锁箱未通过，禁止 v1.20 最终全历史部署重训')
+    if not report.get('fresh_lockbox', False) or pd.Timestamp(
+        report.get('lockbox_start', '1900-01-01')
+    ) <= pd.Timestamp(config['known_stress_end']):
+        raise ValueError('最终部署只接受 2026-07-29 之后的新锁箱报告')
 
 
 def run_frozen_final_deployment(output_dir):
-    """用锁箱前已冻结的策略和轮数在全五年重训，绝不再做 OOF 选型。"""
+    """用新锁箱前已冻结的策略和轮数作全历史重训，绝不再做 OOF 选型。"""
     candidate_dir = (
         f"./model/{config['sequence_length']}_{config['feature_num']}_"
         f"{config['experiment_name']}_candidate"
@@ -525,7 +572,7 @@ def run_frozen_final_deployment(output_dir):
         full_data, features, source_lgbm_folds, output_dir,
     )
     policy.update({
-        'policy_role': 'frozen_v1.19_policy_full5y_retrained',
+        'policy_role': 'frozen_v1.20_policy_full_history_retrained',
         'model_paths': [os.path.join(f"seed_{int(config['seed'])}", 'best_model.pth')],
         'ensemble_enabled': False,
         'ensemble_seeds': [int(config['seed'])],
@@ -539,7 +586,7 @@ def run_frozen_final_deployment(output_dir):
         json.dump(policy, handle, indent=2, ensure_ascii=False)
     summary = dict(source_summary)
     summary.update({
-        'training_mode': 'full5y_deployment_frozen_policy',
+        'training_mode': 'full_history_deployment_frozen_policy',
         'full_training': {'models': [final_training], 'stage_epochs': stage_epochs},
         'final_deployment': {
             'source_dir': os.path.relpath(candidate_dir, output_dir),
@@ -746,6 +793,22 @@ def load_or_build_lgbm_oof_scores(
     return [{'fold': int(fold['fold']), 'cached': True} for fold in folds]
 
 
+def recent_lgbm_training_frame(data, train_end, window_days):
+    """按实际交易日截取树模型最近训练窗口，保留同日全部股票。"""
+    if int(window_days) < 1:
+        raise ValueError('lgbm_train_window_days 必须为正整数')
+    dates = np.sort(data.loc[data['日期'] <= train_end, '日期'].unique())
+    if len(dates) < int(window_days):
+        raise ValueError(
+            f'LightGBM 仅有 {len(dates)} 个训练日，不足近期窗口 {window_days}'
+        )
+    selected_dates = dates[-int(window_days):]
+    frame = data.loc[data['日期'].isin(selected_dates)].sort_values(
+        ['日期', 'instrument'], kind='mergesort',
+    ).copy()
+    return frame, selected_dates
+
+
 def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     """同一训练文件内的表格排序补充模型；只以预测日连续输入训练。"""
     if not config.get('lgbm_enabled', False):
@@ -753,16 +816,22 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     try:
         from lightgbm import LGBMRanker, early_stopping
     except ImportError as exc:
-        raise RuntimeError('v1.19 需要 lightgbm；请在 code 目录运行 uv sync') from exc
+        raise RuntimeError('v1.20 需要 lightgbm；请在 code 目录运行 uv sync') from exc
     if INDUSTRY_NEUTRAL_TARGET not in data:
         raise ValueError('LightGBM 需要行业中性标签')
     results = []
     lgbm_dir = os.path.join(output_dir, 'lgbm')
     os.makedirs(lgbm_dir, exist_ok=True)
+    window_days = int(config.get('lgbm_train_window_days', 0))
+    if window_days < 1:
+        raise ValueError('lgbm_train_window_days 必须为正整数')
     for fold in folds:
-        train = data.loc[data['日期'] <= fold['train_end']].sort_values(
-            ['日期', 'instrument'], kind='mergesort',
-        ).copy()
+        try:
+            train, train_dates = recent_lgbm_training_frame(
+                data, fold['train_end'], window_days,
+            )
+        except ValueError as exc:
+            raise ValueError(f"LightGBM Fold {fold['fold']}：{exc}") from exc
         valid = data.loc[
             (data['日期'] >= fold['val_start']) & (data['日期'] <= fold['val_end'])
         ].sort_values(['日期', 'instrument'], kind='mergesort').copy()
@@ -779,7 +848,11 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
         else:
             train_labels = lgbm_relevance_labels(train)
             valid_labels = lgbm_relevance_labels(valid)
-            print(f"阶段 LightGBM：Fold {fold['fold']}，训练 {len(train):,} / 验证 {len(valid):,} 行")
+            print(
+                f"阶段 LightGBM：Fold {fold['fold']}，近期 {window_days} 日 "
+                f"({pd.Timestamp(train_dates[0]).date()} ~ {pd.Timestamp(train_dates[-1]).date()})，"
+                f"训练 {len(train):,} / 验证 {len(valid):,} 行"
+            )
             model = LGBMRanker(
                 objective=config.get('lgbm_objective', 'lambdarank'), metric='ndcg',
                 learning_rate=config['lgbm_learning_rate'], n_estimators=config['lgbm_n_estimators'],
@@ -816,7 +889,13 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
                 if ordered[features].isna().any().any():
                     raise ValueError('LightGBM OOF 与 Transformer 股票集合不一致')
                 record['lgbm_scores'] = model.predict(ordered[features], num_iteration=model.best_iteration_)
-        results.append({'fold': int(fold['fold']), 'best_iteration': int(model.best_iteration_ or config['lgbm_n_estimators'])})
+        results.append({
+            'fold': int(fold['fold']),
+            'best_iteration': int(model.best_iteration_ or config['lgbm_n_estimators']),
+            'train_window_days': window_days,
+            'train_start': pd.Timestamp(train_dates[0]).strftime('%Y-%m-%d'),
+            'train_end': pd.Timestamp(train_dates[-1]).strftime('%Y-%m-%d'),
+        })
     return results
 
 
@@ -832,7 +911,10 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         validate_lgbm_checkpoint(model, features, path, expected_iterations=iterations)
         print('恢复 LightGBM 全量重训 checkpoint')
         return os.path.basename(path)
-    data = data.sort_values(['日期', 'instrument'], kind='mergesort').copy()
+    window_days = int(config.get('lgbm_train_window_days', 0))
+    data, window_dates = recent_lgbm_training_frame(
+        data, data['日期'].max(), window_days,
+    )
     groups = data.groupby('日期', sort=False).size().to_numpy()
     labels = lgbm_relevance_labels(data)
     model = LGBMRanker(
@@ -843,7 +925,11 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
         n_jobs=config['lgbm_n_jobs'], verbosity=-1,
     )
-    print(f'阶段 LightGBM：全量开发期重训 {len(data):,} 行，迭代 {iterations}')
+    print(
+        f'阶段 LightGBM：全量开发期近期 {window_days} 日重训 '
+        f'({pd.Timestamp(window_dates[0]).date()} ~ {pd.Timestamp(window_dates[-1]).date()})，'
+        f'{len(data):,} 行，迭代 {iterations}'
+    )
     progress, update_progress = lgbm_progress_callback(
         'LightGBM 全量重训', iterations,
     )
@@ -853,6 +939,62 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
         progress.close()
     save_joblib_checkpoint(model, path)
     return os.path.basename(path)
+
+
+def attach_oof_strategy_metadata(ensemble_days, data):
+    """把预测日已知的行业快照和市场状态接到 OOF，绝不写入模型输入。"""
+    required = [INDUSTRY_ASOF_COLUMN, 'market_return_20', 'market_downside_vol_20']
+    missing = [name for name in required if name not in data]
+    if missing:
+        raise ValueError(f'OOF 策略元数据缺少列: {missing}')
+    lookup = data.set_index(['日期', 'instrument'])[required]
+    for day in ensemble_days:
+        index = pd.MultiIndex.from_arrays([
+            np.repeat(pd.Timestamp(day['prediction_date']), len(day['stock_indices'])),
+            np.asarray(day['stock_indices'], dtype=np.int64),
+        ], names=['日期', 'instrument'])
+        rows = lookup.reindex(index)
+        if rows[['market_return_20', 'market_downside_vol_20']].isna().any().any():
+            raise ValueError(f"OOF {day['prediction_date']} 缺少市场状态")
+        day['industry_labels'] = rows[INDUSTRY_ASOF_COLUMN].to_numpy(dtype=object)
+        day['market_return_20'] = float(rows['market_return_20'].median())
+        day['market_downside_vol_20'] = float(rows['market_downside_vol_20'].median())
+    return ensemble_days
+
+
+def market_state_diagnostics(metrics, data, folds):
+    """按各折训练期中位数给 OOF 打四个因果市场状态标签，仅报告不选型。"""
+    daily = metrics.get('daily', [])
+    medians = {}
+    for fold in folds:
+        train = data.loc[data['日期'] <= fold['train_end']]
+        medians[int(fold['fold'])] = {
+            name: float(train[name].median())
+            for name in ('market_return_20', 'market_downside_vol_20')
+        }
+    states = {}
+    for row in daily:
+        fold = int(row['fold'])
+        median = medians[fold]
+        high_return = float(row.get('market_return_20', 0.0)) >= median['market_return_20']
+        high_downside = float(row.get('market_downside_vol_20', 0.0)) >= median['market_downside_vol_20']
+        name = (
+            f"market_return_20_{'high' if high_return else 'low'}__"
+            f"market_downside_vol_20_{'high' if high_downside else 'low'}"
+        )
+        states.setdefault(name, []).append(row['weighted_portfolio_return'])
+    return {
+        'training_medians_by_fold': medians,
+        'states': {
+            name: {
+                'count': len(values),
+                'mean_weighted_portfolio_return': float(np.mean(values)),
+                'p10_weighted_portfolio_return': float(np.quantile(values, 0.10)),
+            }
+            for name, values in sorted(states.items())
+        },
+        'selection_use': 'diagnostic_only',
+    }
 
 
 def fuse_lgbm_scores(days, weight):
@@ -989,8 +1131,18 @@ def calibrate_v17_oof_strategy(ensemble_days, folds, calibration_kwargs, lgbm_fo
 
 
 def promotion_against_baseline(metrics, baseline_metrics):
-    """v1.19 的唯一晋级门槛：收益优先，同时保留10bp尾部护栏。"""
+    """v1.20 的唯一晋级门槛：收益增益和逐日/回撤 10bp 护栏。"""
     tolerance = 1e-12
+    def max_drawdown(source):
+        if 'max_drawdown' in source:
+            return float(source['max_drawdown'])
+        daily = sorted(source.get('daily', []), key=lambda row: row['prediction_date'])
+        if not daily:
+            raise ValueError('晋级判断缺少计算最大回撤所需的逐日收益')
+        returns = np.asarray([
+            row['weighted_portfolio_return'] for row in daily
+        ], dtype=np.float64)
+        return maximum_drawdown(returns)
     candidate_folds = {int(row['fold']): row for row in metrics['folds']}
     baseline_folds = {
         int(row['fold']): row for row in baseline_metrics['folds']
@@ -1018,6 +1170,11 @@ def promotion_against_baseline(metrics, baseline_metrics):
             'mean_rank_ic',
         )
     }
+    deltas['worst_weighted_portfolio_return'] = float(
+        metrics['worst_weighted_portfolio_return']
+        - baseline_metrics['worst_weighted_portfolio_return']
+    )
+    deltas['max_drawdown'] = max_drawdown(metrics) - max_drawdown(baseline_metrics)
     checks = {
         'mean_weighted_return_gain_at_least_10bp': (
             deltas['mean_weighted_portfolio_return'] >= 0.001 - tolerance
@@ -1031,6 +1188,12 @@ def promotion_against_baseline(metrics, baseline_metrics):
         'worst_fold_not_worse_than_10bp': (
             deltas['worst_fold_weighted_portfolio_return'] >= -0.001 - tolerance
         ),
+        'worst_day_not_worse_than_10bp': (
+            deltas['worst_weighted_portfolio_return'] >= -0.001 - tolerance
+        ),
+        'max_drawdown_not_worse_than_10bp': (
+            deltas['max_drawdown'] >= -0.001 - tolerance
+        ),
         'rank_ic_not_worse_than_0_005': (
             deltas['mean_rank_ic'] >= -0.005 - tolerance
         ),
@@ -1041,64 +1204,30 @@ def promotion_against_baseline(metrics, baseline_metrics):
     }
 
 
-def calibrate_v19_pre_registered_candidates(ensemble_days, calibration_kwargs):
-    """比较预注册的纯 Transformer 与纯 LGBM，不学习融合权重。"""
-    candidates = {}
-    for name, lgbm_weight in (
-        ('rankglu_transformer_only', 0.0),
-        ('rankxendcg_lgbm_only', 1.0),
-    ):
-        scored_days = fuse_lgbm_scores(ensemble_days, lgbm_weight)
-        replay = forward_fit_module_gated_policy(
-            scored_days,
-            forward_module_max_fold_loss=float(config.get(
-                'forward_module_max_fold_loss', 0.0025,
-            )),
-            forward_module_max_p10_loss=float(config.get(
-                'forward_module_max_p10_loss', 0.005,
-            )),
-            **calibration_kwargs,
-        )
-        policy = dict(replay['robust_deployment_policy'])
-        policy.update({
-            'candidate_name': name,
-            'lgbm_weight': lgbm_weight,
-            'pre_registered': True,
-        })
-        candidates[name] = {
-            'lgbm_weight': lgbm_weight,
-            'cross_fitted_policy': replay,
-            'metrics': replay['metrics'],
-            'policy': policy,
-        }
-    transformer_daily = candidates['rankglu_transformer_only'][
-        'metrics'
-    ]['daily']
-    lgbm_daily = candidates['rankxendcg_lgbm_only']['metrics']['daily']
-    pair_rows = []
-    for transformer_day, lgbm_day in zip(transformer_daily, lgbm_daily):
-        if (
-            transformer_day['prediction_date'] != lgbm_day['prediction_date']
-            or transformer_day['fold'] != lgbm_day['fold']
-        ):
-            raise ValueError('纯模型候选 OOF 日期无法对齐')
-        transformer_set = set(transformer_day['selected_stock_indices'])
-        lgbm_set = set(lgbm_day['selected_stock_indices'])
-        pair_rows.append({
-            'fold': int(transformer_day['fold']),
-            'prediction_date': transformer_day['prediction_date'],
-            'weighted_return_delta_lgbm_minus_transformer': float(
-                lgbm_day['weighted_portfolio_return']
-                - transformer_day['weighted_portfolio_return']
-            ),
-            'top5_overlap': float(
-                len(transformer_set.intersection(lgbm_set)) / 5.0
-            ),
-            'rank_ic_delta_lgbm_minus_transformer': float(
-                lgbm_day['rank_ic'] - transformer_day['rank_ic']
-            ),
-        })
-    return candidates, pair_rows
+def calibrate_v20_recent_lgbm_candidate(ensemble_days, calibration_kwargs):
+    """v1.20 的唯一预注册选股：近期 504 日 rank_xendcg，不做模型融合。"""
+    replay = forward_fit_module_gated_policy(
+        fuse_lgbm_scores(ensemble_days, 1.0),
+        forward_module_max_fold_loss=float(config.get(
+            'forward_module_max_fold_loss', 0.0025,
+        )),
+        forward_module_max_p10_loss=float(config.get(
+            'forward_module_max_p10_loss', 0.005,
+        )),
+        **calibration_kwargs,
+    )
+    policy = dict(replay['robust_deployment_policy'])
+    policy.update({
+        'candidate_name': 'recent504_rankxendcg_lgbm_indcap',
+        'lgbm_weight': 1.0,
+        'pre_registered': True,
+    })
+    return {
+        'lgbm_weight': 1.0,
+        'cross_fitted_policy': replay,
+        'metrics': replay['metrics'],
+        'policy': policy,
+    }
 
 
 def oof_strategy_checkpoint_signature(features, folds, lgbm_folds, ensemble_seeds):
@@ -4758,6 +4887,11 @@ def run_policy_only():
 
 
 def main():
+    if stress_eval_enabled():
+        if lockbox_eval_enabled():
+            raise ValueError('STRESS_EVAL 与 LOCKBOX_EVAL 不能同时启用')
+        apply_v17_profile()
+        return run_lockbox_eval(config['output_dir'], stress=True)
     if lockbox_eval_enabled():
         apply_v17_profile()
         return run_lockbox_eval(config['output_dir'])
@@ -4938,14 +5072,24 @@ def main():
                 )
         ensemble_days.extend(aligned_days)
         for seed in ensemble_seeds:
-            single_seed_days[seed].extend(align_oof_prediction_records(
+            seed_days = align_oof_prediction_records(
                 [attach_label_end_dates(
                     oof_records[fold_number][seed],
                     full_trading_dates,
                     horizon=int(config.get('purge_days', 5)),
                 )],
                 fold=fold_number,
-            ))
+            )
+            if lgbm_folds:
+                for day in seed_days:
+                    day['lgbm_scores'] = np.asarray(
+                        lgbm_by_date[day['prediction_date']], dtype=np.float64,
+                    )
+            single_seed_days[seed].extend(seed_days)
+
+    attach_oof_strategy_metadata(ensemble_days, full_data)
+    for days in single_seed_days.values():
+        attach_oof_strategy_metadata(days, full_data)
 
     policy_calibration_kwargs = dict(
         min_exposure=config['min_exposure'],
@@ -5010,6 +5154,11 @@ def main():
             'fixed_exposure_baseline',
             0.6231689453125,
         )),
+        max_stocks_per_industry=(
+            int(config['max_stocks_per_industry'])
+            if config.get('industry_cap_enabled', False) else None
+        ),
+        industry_candidate_k=int(config.get('industry_candidate_k', 10)),
         downside_weight=config.get('ensemble_downside_weight', 0.5),
         top_k=5,
     )
@@ -5026,19 +5175,18 @@ def main():
         else:
             print('OOF 策略校准 checkpoint 与当前工件不匹配，将重新校准')
     if calibration is None:
-        print('阶段 OOF 策略校准：预注册纯 Transformer / 纯 LightGBM 候选')
-        candidates, pair_rows = calibrate_v19_pre_registered_candidates(
+        print('阶段 OOF 策略校准：固定近期 504 日纯 LightGBM + 行业最多两只')
+        candidate = calibrate_v20_recent_lgbm_candidate(
             ensemble_days, policy_calibration_kwargs,
         )
-        calibration = {'candidates': candidates, 'pair_rows': pair_rows}
+        calibration = {'candidate': candidate}
         save_joblib_checkpoint(
             {
                 'signature': signature, 'calibration': calibration,
             }, checkpoint_path,
         )
         print('OOF 策略校准 checkpoint 已保存')
-    candidates = calibration['candidates']
-    pair_rows = calibration['pair_rows']
+    candidate = calibration['candidate']
     baseline_path = os.path.abspath(config['baseline_source_dir'])
     with open(
         os.path.join(baseline_path, 'cross_validation_summary.json'),
@@ -5046,27 +5194,17 @@ def main():
     ) as file:
         baseline_summary = json.load(file)
     baseline_metrics = baseline_summary['cross_fitted_oof']['metrics']
-    for candidate in candidates.values():
-        candidate['promotion_criteria'] = promotion_against_baseline(
-            candidate['metrics'], baseline_metrics,
-        )
-    eligible = [
-        candidate for candidate in candidates.values()
-        if candidate['promotion_criteria']['passed']
-    ]
-    selected = max(
-        eligible or [candidates['rankglu_transformer_only']],
-        key=lambda candidate: (
-            candidate['metrics']['mean_weighted_portfolio_return'],
-            candidate['metrics']['p10_weighted_portfolio_return'],
-        ),
+    candidate['promotion_criteria'] = promotion_against_baseline(
+        candidate['metrics'], baseline_metrics,
     )
+    selected = candidate
     selected_name = selected['policy']['candidate_name']
     deployment_lgbm_weight = float(selected['lgbm_weight'])
     policy = dict(selected['policy'])
     cross_fitted_policy = selected['cross_fitted_policy']
     ensemble_metrics = selected['metrics']
     promotion_criteria = selected['promotion_criteria']
+    market_states = market_state_diagnostics(ensemble_metrics, full_data, folds)
     single_seed_summaries = {}
     for seed in ensemble_seeds:
         single_seed_summaries[str(seed)] = evaluate_ensemble_policy(
@@ -5155,12 +5293,14 @@ def main():
         'model_paths': model_paths,
         'lgbm_model_path': lgbm_model_path,
         'lgbm_weight': deployment_lgbm_weight,
+        'lgbm_train_window_days': int(config['lgbm_train_window_days']),
+        'max_stocks_per_industry': int(config['max_stocks_per_industry']),
+        'industry_candidate_k': int(config['industry_candidate_k']),
         'pre_registered_candidates': {
-            name: {
+            selected_name: {
                 'lgbm_weight': candidate['lgbm_weight'],
                 'promotion_criteria': candidate['promotion_criteria'],
-            }
-            for name, candidate in candidates.items()
+            },
         },
         'scaler_path': 'scaler.pkl',
         'config_path': 'config.json',
@@ -5212,6 +5352,10 @@ def main():
         'p10_weighted_portfolio_return': ensemble_metrics[
             'p10_weighted_portfolio_return'
         ],
+        'worst_weighted_portfolio_return': ensemble_metrics[
+            'worst_weighted_portfolio_return'
+        ],
+        'max_drawdown': ensemble_metrics['max_drawdown'],
         'std_weighted_portfolio_return': ensemble_metrics[
             'std_weighted_portfolio_return'
         ],
@@ -5286,6 +5430,16 @@ def main():
         'mean_diversification_return_contribution': ensemble_metrics[
             'mean_diversification_return_contribution'
         ],
+        'industry_constraint_application_rate': ensemble_metrics[
+            'industry_constraint_application_rate'
+        ],
+        'industry_constraint_fallback_rate': ensemble_metrics[
+            'industry_constraint_fallback_rate'
+        ],
+        'mean_industry_count': ensemble_metrics['mean_industry_count'],
+        'mean_industry_hhi': ensemble_metrics['mean_industry_hhi'],
+        'mean_max_industry_weight': ensemble_metrics['mean_max_industry_weight'],
+        'market_state_diagnostics': market_states,
         'max_selected_cluster_count': ensemble_metrics[
             'max_selected_cluster_count'
         ],
@@ -5325,17 +5479,15 @@ def main():
         'promotion_criteria': promotion_criteria,
         'selected_candidate': selected_name,
         'pre_registered_candidates': {
-            name: {
+            selected_name: {
                 'lgbm_weight': candidate['lgbm_weight'],
                 'metrics': {
                     key: value for key, value in candidate['metrics'].items()
                     if key != 'daily'
                 },
                 'promotion_criteria': candidate['promotion_criteria'],
-            }
-            for name, candidate in candidates.items()
+            },
         },
-        'lgbm_pair_report': pair_rows,
         'baseline_comparison': {
             'baseline_source_dir': os.path.relpath(baseline_path, output_dir),
             'selected_metric_deltas': promotion_criteria['metric_deltas'],

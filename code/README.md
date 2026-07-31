@@ -15,7 +15,7 @@
 1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）与行业历史快照；
 2. 做单股量价特征工程，并增加短期反转、下行波动、市场压力和行业 as-of 残差特征；
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
-4. v1.19 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月 lockbox，每折训练/验证之间 purge 5 日；
+4. v1.20 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月新锁箱，每折训练/验证之间 purge 5 日；
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
    回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
@@ -27,24 +27,25 @@
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
 
-### v1.19 RankGLU + 固定纯模型候选
+### v1.20 近期窗口 RankXENDCG + 行业分散
 
-当前实验 `threefold_rankglu_rankxendcg_v19` 保持 205 维
-`158+39_reduced25_relmarket12_risk15_indresid12` 输入、单种子 42、三折和末两月 lockbox。
+当前实验 `threefold_recent504_rankxendcg_indcap_v20` 保持 205 维
+`158+39_reduced25_relmarket12_risk15_indresid12` 输入、单种子 42、三折和 5 日 purge。
 Transformer 仅将排序头替换为 RankGLU：`LayerNorm → Linear` 的基础分数，加上 bottleneck=32
 的 GLU 残差；可学习 `gamma` 经 `0.5*tanh()` 限制在 `[-0.5, 0.5]`。manifest 会记录
 `score_head_variant=rankglu_v1`、bottleneck 和上界，推理拒绝旧 MLP checkpoint。
 
 LightGBM 使用 `rank_xendcg`，每个交易日一个 query group，五日行业中性收益固定离散成 10 档
-relevance。三折中预注册并完整评估两条候选：`rankglu_transformer_only` 与
-`rankxendcg_lgbm_only`；不搜索中间融合权重，部署只可选择通过全部三折护栏的单一候选。
+relevance；每个验证折只使用 `train_end` 前最后 **504 个交易日**，全开发期树模型也使用最后
+504 个开发交易日。选股固定为纯 LightGBM（权重 1.0），不搜索融合权重。原始 Top-10 按行业
+as-of 标签贪心选择 Top-5，每行业最多两只；无法选满时完整回退原始 Top-5，行业名称不输入模型。
 Allocation 固定为 Head 25% + 等权 75%，Exposure 固定为 Head 25% + `0.999999` fallback 75%；
 风险惩罚、反转、相关性降仓和相关簇替换均关闭。
 
 候选相对冻结 v1.17 三折 baseline 的晋级条件为：动态组合平均收益至少 +10bp、至少两折正增益、
-P10 与最差折不差于 -10bp、平均 Rank IC 不低于 -0.005。`cross_validation_summary.json` 写入两条
-候选、逐日配对收益/Top-5 重合率、被选候选和各项门槛；`test.csv` 若不含预测日之后的价格会被硬拒绝，
-不作为收益结论。
+P10、最差折、最差单日和最大回撤均不差于 -10bp、平均 Rank IC 不低于 -0.005。
+`cross_validation_summary.json` 还会写入行业约束的收益差/集中度，以及按每折训练期中位数划分的四类
+市场状态诊断；这些状态不参与选型。`test.csv` 若不含预测日之后的价格会被硬拒绝，不作为收益结论。
 
 ---
 
@@ -77,7 +78,7 @@ P10 与最差折不差于 -10bp、平均 Rank IC 不低于 -0.005。`cross_valid
 - 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做
   dropout；可学习门控初值为0.20并带平方正则，限制 ID 分支影响；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
-- `score_head`：v1.19 为受限 RankGLU（线性基线 + GLU 残差），`return_head` 输出原始收益预测；
+- `score_head`：v1.20 为受限 RankGLU（线性基线 + GLU 残差），`return_head` 输出原始收益预测；
 - `risk_1d_head`、`risk_3d_head`、`risk_5d_head`：分别预测1、3、5日软下跌概率；
 - `tail_5d_head`：直接预测 `future_return_5d <= -3%`，四个风险头按
   `0.15/0.20/0.30/0.35` 固定融合；
@@ -126,15 +127,15 @@ P10 与最差折不差于 -10bp、平均 Rank IC 不低于 -0.005。`cross_valid
 
 共193个连续输入，全部只依赖预测日及以前行情。
 
-当前 v1.19 的 `158+39_reduced25_relmarket12_risk15_indresid12` 保留这193项，再增加12项
+当前 v1.20 的 `158+39_reduced25_relmarket12_risk15_indresid12` 保留这193项，再增加12项
 行业 as-of 输入，共205维：相对市场、相对所属行业的1/3/5日收益残差，以及它们各自的同日横截面百分位。
 字段固定为 `indresid_market_return_{1,3,5}`、`indresid_industry_return_{1,3,5}`、
 `indresid_market_return_{1,3,5}_pct` 和 `indresid_industry_return_{1,3,5}_pct`。行业代码、名称和
 未来快照不进入 Transformer；每条记录只连接 `effective_date <= 日期` 的最后一份行业快照。
 
-### v1.19 工件复现协议
+### v1.20 工件复现协议
 
-205维 v1.19 工件根目录必须包含 `artifact_manifest.json`，并与 `config.json`、`scaler.pkl`、
+205维 v1.20 工件根目录必须包含 `artifact_manifest.json`，并与 `config.json`、`scaler.pkl`、
 `stockid2idx.json` 和每个 checkpoint 一起保留。manifest 至少包含：
 `feature_num`、`feature_count`（205）、`sequence_length`、`stock_mapping_size`，以及
 `architecture` 中的 `d_model`、`nhead`、`num_layers`、`dim_feedforward`，以及 RankGLU 的
@@ -218,7 +219,7 @@ Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
 	 - `stock_id`
 	 - `weight`（5只股票之和严格位于 `[0.20, 0.999999]`）
 
-v1.19 在特征工程前还会验证 manifest、205维特征表、Scaler、股票映射、RankGLU 架构和 checkpoint，防止
+v1.20 在特征工程前还会验证 manifest、205维特征表、Scaler、股票映射、RankGLU 架构和 checkpoint，防止
 不同输入维度的工件混用。写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
@@ -263,18 +264,19 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 训练当前 v1.19 工件（RankGLU、`rank_xendcg`、205维 manifest、Scaler 和 checkpoint）
+3) 训练当前 v1.20 工件（RankGLU、近期504日 `rank_xendcg`、行业最多两只、205维 manifest、Scaler 和 checkpoint）
 
 ```
 ./train.sh
 ```
 
-训练会在默认 candidate 目录完成三折，并对固定的纯 Transformer 与纯 LightGBM 候选做完整比较；
-先检查 `cross_validation_summary.json` 的 `promotion_criteria.passed`。通过后才可一次性执行
-`LOCKBOX_EVAL=1 ./train.sh`；只有生成的 `lockbox_report.json` 许可最终部署，才可运行
+训练会在默认 candidate 目录完成三折固定纯 LightGBM 评估；先检查
+`cross_validation_summary.json` 的 `promotion_criteria.passed`。已知的 2026-06-01～2026-07-29
+只能用 `STRESS_EVAL=1 ./train.sh` 写入压力诊断，不能授权部署。新的最后两自然月数据到来后，
+`LOCKBOX_EVAL=1 ./train.sh` 才可产生可授权的 `lockbox_report.json`；通过后才可运行
 `V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh`。最终重训始终写入独立
-`v1.19_full5y_deployment` 目录，并复用锁箱前冻结的策略、epoch 与 LightGBM 迭代数，不再执行 OOF
-或策略标定；禁止据此再调参。
+`v1.20_full_history_deployment` 目录，并复用新锁箱前冻结的策略、epoch 与 LightGBM 迭代数，不再执行
+OOF 或策略标定；禁止据此再调参。
 
 4) 生成预测结果
 

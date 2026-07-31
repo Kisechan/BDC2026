@@ -1138,6 +1138,15 @@ def percentile_ranks(values):
     return (rankdata(values, method='average') - 1.0) / (values.size - 1.0)
 
 
+def maximum_drawdown(returns):
+    """按时间顺序的简单收益计算组合最大回撤。"""
+    values = np.asarray(returns, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+        raise ValueError('最大回撤需要非空有限的一维收益')
+    wealth = np.cumprod(1.0 + values)
+    return float(np.min(wealth / np.maximum.accumulate(wealth) - 1.0))
+
+
 def project_long_only_weights(weights, min_weight=0.05, max_weight=0.35):
     """欧氏投影至和为一的 long-only 有界单纯形。"""
     weights = np.asarray(weights, dtype=np.float64)
@@ -2128,6 +2137,8 @@ def summarize_ensemble_days(
     cluster_max_raw_rank=None,
     tail_5d_threshold=-0.03,
     fixed_exposure_baseline=0.6231689453125,
+    max_stocks_per_industry=None,
+    industry_candidate_k=10,
     downside_weight=0.5,
     top_k=5,
     include_daily=False,
@@ -2214,6 +2225,9 @@ def summarize_ensemble_days(
             correlation_exposure_gamma=correlation_exposure_gamma,
             exposure_head_blend=exposure_head_blend,
             fixed_exposure_baseline=fixed_exposure_baseline,
+            industry_labels=day.get('industry_labels'),
+            max_stocks_per_industry=max_stocks_per_industry,
+            industry_candidate_k=industry_candidate_k,
             top_k=top_k,
         )
         selected = portfolio['top_indices']
@@ -2274,6 +2288,22 @@ def summarize_ensemble_days(
             portfolio['ensemble_scores'],
             day['targets'],
         ).statistic
+        industry_labels = np.asarray(day.get(
+            'industry_labels',
+            np.full(len(day['stock_indices']), None, dtype=object),
+        ), dtype=object)
+        industry_weights = {}
+        for industry, weight in zip(
+            industry_labels[selected], portfolio['positions'],
+        ):
+            name = (
+                'UNCLASSIFIED'
+                if industry is None or pd.isna(industry) else str(industry)
+            )
+            industry_weights[name] = industry_weights.get(name, 0.0) + float(weight)
+        industry_shares = np.asarray(
+            list(industry_weights.values()), dtype=np.float64,
+        ) / max(float(portfolio['exposure']), 1e-12)
         daily.append({
             'fold': int(day['fold']),
             'prediction_date': day['prediction_date'],
@@ -2286,8 +2316,21 @@ def summarize_ensemble_days(
             'diversification_return_contribution': (
                 equal_full_return - raw_top5_return
             ),
+            'industry_constraint_applied': bool(
+                portfolio['industry_constraint_applied']
+            ),
+            'industry_constraint_fallback': bool(
+                portfolio['industry_constraint_fallback']
+            ),
+            'industry_count': int(len(industry_weights)),
+            'industry_hhi': float(np.square(industry_shares).sum()),
+            'max_industry_weight': float(max(industry_weights.values())),
             'market_future_return': market_future_return,
             'market_tail_share': market_tail_share,
+            'market_return_20': float(day.get('market_return_20', 0.0)),
+            'market_downside_vol_20': float(
+                day.get('market_downside_vol_20', 0.0)
+            ),
             'equal_weight_at_exposure_return': (
                 equal_full_return * portfolio['exposure']
             ),
@@ -2404,6 +2447,12 @@ def summarize_ensemble_days(
     weighted_returns = np.asarray([
         row['weighted_portfolio_return'] for row in daily
     ], dtype=np.float64)
+    ordered_returns = np.asarray([
+        row['weighted_portfolio_return'] for row in sorted(
+            daily, key=lambda row: row['prediction_date'],
+        )
+    ], dtype=np.float64)
+    max_drawdown = maximum_drawdown(ordered_returns)
     negative_returns = np.minimum(weighted_returns, 0.0)
     downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
     fixed_exposure_returns = np.asarray([
@@ -2494,12 +2543,27 @@ def summarize_ensemble_days(
         'mean_diversification_return_contribution': mean(
             'diversification_return_contribution'
         ),
+        'industry_constraint_application_rate': float(np.mean([
+            row['industry_constraint_applied'] for row in daily
+        ])),
+        'industry_constraint_fallback_rate': float(np.mean([
+            row['industry_constraint_fallback'] for row in daily
+        ])),
+        'mean_industry_count': mean('industry_count'),
+        'mean_industry_hhi': mean('industry_hhi'),
+        'mean_max_industry_weight': mean('max_industry_weight'),
+        'max_stocks_per_industry': (
+            None if max_stocks_per_industry is None
+            else int(max_stocks_per_industry)
+        ),
+        'industry_candidate_k': int(industry_candidate_k),
         'mean_equal_weight_at_exposure_return': mean(
             'equal_weight_at_exposure_return'
         ),
         'mean_allocation_only_return': mean('allocation_only_return'),
         'mean_weighted_portfolio_return': float(weighted_returns.mean()),
         'worst_weighted_portfolio_return': float(weighted_returns.min()),
+        'max_drawdown': max_drawdown,
         'p10_weighted_portfolio_return': float(
             np.quantile(weighted_returns, 0.10)
         ),
@@ -2880,6 +2944,8 @@ def evaluate_ensemble_policy(ensemble_days, policy, include_daily=False):
         cluster_max_raw_rank=policy.get('cluster_max_raw_rank'),
         tail_5d_threshold=policy.get('tail_5d_threshold', -0.03),
         fixed_exposure_baseline=policy['fixed_exposure_baseline'],
+        max_stocks_per_industry=policy.get('max_stocks_per_industry'),
+        industry_candidate_k=policy.get('industry_candidate_k', 10),
         downside_weight=policy['downside_weight'],
         top_k=policy['top_k'],
         include_daily=include_daily,
@@ -2906,6 +2972,12 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         return float(value) if np.isfinite(value) else 0.0
 
     weighted_returns = values('weighted_portfolio_return')
+    ordered_returns = np.asarray([
+        row['weighted_portfolio_return'] for row in sorted(
+            daily, key=lambda row: row['prediction_date'],
+        )
+    ], dtype=np.float64)
+    max_drawdown = maximum_drawdown(ordered_returns)
     negative_returns = np.minimum(weighted_returns, 0.0)
     downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
     top5_returns = values('top5_return')
@@ -3002,6 +3074,7 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'worst_weighted_portfolio_return': float(
             weighted_returns.min()
         ),
+        'max_drawdown': max_drawdown,
         'p10_weighted_portfolio_return': float(
             np.quantile(weighted_returns, 0.10)
         ),
@@ -3057,6 +3130,15 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'cluster_constraint_skip_rate': float(np.mean([
             row.get('cluster_constraint_skipped', False) for row in daily
         ])),
+        'industry_constraint_application_rate': float(np.mean([
+            row.get('industry_constraint_applied', False) for row in daily
+        ])),
+        'industry_constraint_fallback_rate': float(np.mean([
+            row.get('industry_constraint_fallback', False) for row in daily
+        ])),
+        'mean_industry_count': mean('industry_count'),
+        'mean_industry_hhi': mean('industry_hhi'),
+        'mean_max_industry_weight': mean('max_industry_weight'),
         'max_selected_raw_rank': int(max(
             row.get('max_selected_raw_rank', 5) for row in daily
         )),
@@ -3300,6 +3382,12 @@ def _module_policy_base(calibration_kwargs):
         'fixed_exposure_baseline': float(calibration_kwargs.get(
             'fixed_exposure_baseline',
             0.6231689453125,
+        )),
+        'max_stocks_per_industry': calibration_kwargs.get(
+            'max_stocks_per_industry'
+        ),
+        'industry_candidate_k': int(calibration_kwargs.get(
+            'industry_candidate_k', 10,
         )),
         'min_exposure': float(calibration_kwargs['min_exposure']),
         'max_exposure': float(calibration_kwargs['max_exposure']),

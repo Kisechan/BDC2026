@@ -2,8 +2,8 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'threefold_rankglu_rankxendcg_v19'
-# v1.19 从独立目录训练 RankGLU；仅 v1.17 基线用于三折晋级对照，
+experiment_name = 'threefold_recent504_rankxendcg_indcap_v20'
+# v1.20 从独立目录训练 RankGLU；仅 v1.17 基线用于三折晋级对照，
 # 不把不同 score head 的 checkpoint、scaler 或 manifest 混用。
 artifact_experiment_name = (
     'threefold_industryresidual_lgbmblend_pathrisk_v17_candidate'
@@ -82,7 +82,7 @@ config = {
     # 排序主干输出原始分数；风险惩罚强度只用 OOF 网格校准。
     'risk_penalty_scale': 0.0,
     'oof_risk_penalty_enabled': True,
-    # v1.19 收益优先：这些可选风险/相关模块固定关闭，不再搜索。
+    # v1.20 收益优先：这些可选风险/相关模块固定关闭，不再搜索。
     'risk_score_penalty_grid': [0.0],
     'risk_1d_target_temperature': 0.01,
     'risk_3d_target_temperature': 0.02,
@@ -129,8 +129,8 @@ config = {
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
     'lgbm_enabled': True,
-    # 预注册的完整候选，禁止在三折结果后搜索中间融合权重。
-    'lgbm_blend_grid': [0.0, 1.0],
+    # v1.20 的主选股固定为近期窗口 rank_xendcg；不搜索模型融合权重。
+    'lgbm_blend_grid': [1.0],
     'lgbm_objective': 'rank_xendcg',
     'lgbm_relevance_levels': 10,
     'lgbm_learning_rate': 0.03,
@@ -142,6 +142,12 @@ config = {
     'lgbm_n_estimators': 4000,
     'lgbm_early_stopping_rounds': 200,
     'lgbm_n_jobs': -1,
+    # 只限制树模型的训练日期，Transformer 仍按既有 504 日半衰期使用开发期。
+    'lgbm_train_window_days': 504,
+    # 原始 Top-10 内最多保留同一行业两只；缺行业快照的股票不受约束。
+    'industry_cap_enabled': True,
+    'max_stocks_per_industry': 2,
+    'industry_candidate_k': 10,
     'nested_oof_enabled': True,
     # 策略层纯收益优先，但保留较轻的下行波动惩罚。
     'ensemble_downside_weight': 0.25,
@@ -229,8 +235,11 @@ config = {
         'threefold_industryresidual_lgbmblend_pathrisk_v17_baseline'
     ),
     'full_deployment_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.19_full5y_deployment'
+        f'./model/{sequence_length}_{feature_num}_v1.20_full_history_deployment'
     ),
+    # v1.19 已消费这段压力期；它只能做诊断，不能充当 v1.20 新锁箱。
+    'known_stress_start': '2026-06-01',
+    'known_stress_end': '2026-07-29',
     # 五年历史数据与原三年数据隔离存放，避免覆盖已有实验的切分文件。
     'data_path': './data_5y',
     'industry_history_path': './data_5y/stock_industry_history.csv',
