@@ -210,7 +210,8 @@ config = {
     'num_workers': 0,
     'deterministic_training': True,
 
-    'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
+    # 推理默认从策略目录读取；训练例外由 train.py 明确改写为部署目录。
+    'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}_policy',
     'policy_output_dir': (
         f'./model/{sequence_length}_{feature_num}_{experiment_name}_policy'
     ),
