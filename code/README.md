@@ -176,8 +176,6 @@ manifest、Scaler 宽度、checkpoint 的 `input_proj.weight` 宽度和股票 em
 	  `ΔNDCG@5 × 真实收益差` 加权；
 	- Ranking阶段只训练Rank IC、收益回归及排序目标；风险BCE和状态门控BCE在
 	  冻结Ranking主干后独立训练，避免多任务负迁移；
-	- 绝对收益排序保持主目标，并增加权重0.15的行业内超额收益排序；行业只用于
-	  as-of 分组，不作为 Transformer 输入或 Embedding；
 	- 对真实Top-k样本施加更高权重。
 	- TensorBoard分别记录各加权损失分量与ID门控正则，便于检查目标是否失衡；
 	- `allocation_loss` 监督 ranking head 当前 Top-20 内的相对仓位分布，目标收益
@@ -202,7 +200,6 @@ manifest、Scaler 宽度、checkpoint 的 `input_proj.weight` 宽度和股票 em
 - `scaler.pkl`：全量标准化器；
 - `ensemble_policy.json`：训练模式、模型路径及 OOF 选择的仓位策略；
 - `stockid2idx.json`：训练与推理共用的股票 ID 映射；
-- `industry2idx.json`：行业分组与组合诊断使用的稳定映射（不进入 Transformer）；
 - `cross_validation_summary.json`：多折汇总；
 - `config.json`：训练时配置快照；
 - `fold_N/log/`：逐折 TensorBoard 日志。
@@ -223,9 +220,9 @@ Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
    训练配置、全量 `scaler.pkl`、股票映射与 checkpoint；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
-5. 先按稳健部署策略决定是否应用风险、行业拥挤和相关性软惩罚；候选严格限制
-   在原始 Top-10，两个软惩罚为0时完全复现原始 Top-5。严格前向 OOF 是唯一
-   晋级依据，全量 OOF 候选还必须通过前向模块资格检查才能进入部署策略。集成模式会
+5. 先按稳健部署策略决定是否应用风险、反转和相关簇模块；相关簇启用时严格限制
+   在原始 Top-10，无法满足时原样回退。交叉拟合 OOF 是唯一晋级依据，全量 OOF
+   候选还必须通过跨折模块资格检查才能进入部署策略。集成模式会
    平均各模型 Allocation 分布，并可按模型排名分歧将总仓位向0.20收缩，输出到
    `result.csv`：
 	 - `stock_id`
@@ -249,9 +246,7 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 ### [get_stock_data.py](get_stock_data.py)
 数据抓取脚本（Baostock）：
 - 获取沪深300成分股；
-- 抓取历史日线数据并保存为训练所需格式；
-- 通过 `query_stock_industry(date=...)` 增量维护年度及折边界行业快照
-  `data_5y/stock_industry_history.csv`。
+- 抓取历史日线数据并保存为训练所需格式。
 
 ---
 
@@ -291,7 +286,7 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 `V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh`。最终重训始终写入独立
 `v1.21_full_history_deployment` 目录；在新的未见锁箱到来之前，v1.21 会硬拒绝最终提交重训。
 
-5) 生成预测结果
+4) 生成预测结果
 
 ```
 ./test.sh

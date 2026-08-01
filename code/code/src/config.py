@@ -41,18 +41,12 @@ config = {
     'lockbox_months': 2,
     'lockbox_enabled': True,
     'evaluation_stride': 5,
-    'reference_validation_windows': [
-        ['2026-01-14', '2026-03-13'],
-        ['2026-03-16', '2026-05-13'],
-        ['2026-05-14', '2026-07-13'],
-    ],
     'seed': 42,
     'ensemble_enabled': False,
-    # 默认只运行 seed=42；仅在 ensemble_enabled=True 时使用下列种子。
+    # 默认只运行 seed=42 的三折；仅在 ensemble_enabled=True 时使用下列种子。
     'ensemble_seeds': [42, 142, 242],
-    'checkpoint_metric': 'risk_adjusted_top5_plus_rank_ic',
+    'checkpoint_metric': 'top5_return_plus_rank_ic',
     'checkpoint_rank_ic_weight': 0.2,
-    'checkpoint_top5_downside_weight': 0.25,
     'purge_days': 5,
 
     'regression_weight': 0.05,
@@ -73,7 +67,6 @@ config = {
     'exposure_market_encoder_enabled': True,
     'exposure_market_hidden_size': 16,
     'exposure_portfolio_summary_enabled': True,
-    'exposure_industry_summary_enabled': True,
     # 原5个市场状态 + 新增8个市场压力特征。
     'market_state_feature_indices': [
         173, 174, 175, 176, 177,
@@ -135,7 +128,6 @@ config = {
     'selection_correlation_lookbacks': [20, 60],
     'cluster_cap_enabled': False,
     'cluster_cap_grid': [False],
-    'cluster_cap_grid': [False],
     'cluster_correlation_threshold': 0.60,
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
@@ -178,11 +170,8 @@ config = {
     # 策略层纯收益优先，但保留较轻的下行波动惩罚。
     'ensemble_downside_weight': 0.25,
     'policy_only_experiment': False,
-    'policy_only_experiment': False,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
-    # 风险模块必须在候选股票中呈现明确的反向收益关系，才允许参与选股。
-    'risk_module_max_return_spearman': -0.05,
     'forward_module_max_fold_loss': 0.0025,
     'forward_module_max_p10_loss': 0.005,
     'minimum_allocation_deployment_blend': 0.0,
@@ -196,8 +185,6 @@ config = {
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
     'pairwise_weight': 0.3, # 降低 LambdaRank@5 对排序主目标的支配
-    # 恢复 v8 的行业残差排序目标；行业标识仍不进入 Transformer。
-    'industry_residual_ranking_weight': 0.15,
     'lambdarank_candidate_k': 20,
     'lambdarank_hard_negative_k': 20,
     'lambdarank_return_gap_scale': 0.02,
@@ -211,8 +198,8 @@ config = {
     'ranking_learning_rate': 3e-5,
     'ranking_max_epochs': 50,
     'ranking_patience': 12,
-    'ranking_checkpoint_metric': 'risk_adjusted_top5_plus_rank_ic',
-    'ranking_min_final_epochs': 5,
+    'ranking_checkpoint_metric': 'top5_return_plus_rank_ic',
+    'ranking_min_final_epochs': 1,
     'risk_learning_rate': 1e-4,
     'risk_max_epochs': 12,
     'risk_patience': 4,
@@ -256,6 +243,7 @@ config = {
     'fused_optimizer': True,
     'pin_memory': True,
     'non_blocking_transfer': True,
+    'num_workers': 0,
     'deterministic_training': True,
 
     'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}_candidate',

@@ -40,11 +40,8 @@ def print_cross_validation() -> None:
     seeds = summary.get("ensemble_seeds", [])
     cross_fitted = summary.get("cross_fitted_oof", {})
     validation_label = (
-        "严格前向 OOF"
-        if cross_fitted.get("method")
-        == "strict_forward_historical_folds_only"
-        else "嵌套交叉拟合 OOF"
-        if cross_fitted.get("method") not in {None, "disabled"}
+        "嵌套交叉拟合 OOF"
+        if cross_fitted.get("method") != "disabled"
         else "OOF"
     )
     if len(seeds) > 1:
@@ -62,13 +59,6 @@ def print_cross_validation() -> None:
         )
     print(f"平均 Top-5 收益: {_pct(float(summary['mean_top5_return']))}")
     print(f"最差折 Top-5 收益: {_pct(float(summary['worst_fold_top5_return']))}")
-    if "mean_top5_excess_return" in summary:
-        print(
-            "平均市场收益/Top-5超额、最差折超额: "
-            f"{_pct(float(summary['mean_market_return']))} / "
-            f"{_pct(float(summary['mean_top5_excess_return']))} / "
-            f"{_pct(float(summary['worst_fold_top5_excess_return']))}"
-        )
     if "mean_weighted_portfolio_return" in summary:
         portfolio_label = (
             '平均固定等权组合收益'
@@ -108,12 +98,6 @@ def print_cross_validation() -> None:
                 f"{float(summary['std_weighted_portfolio_return']):.4%} / "
                 f"{float(summary['weighted_portfolio_positive_rate']):.2%}"
             )
-            if "p10_fixed_exposure_return" in summary:
-                print(
-                    "动态/固定仓位 P10: "
-                    f"{_pct(float(summary['p10_weighted_portfolio_return']))} / "
-                    f"{_pct(float(summary['p10_fixed_exposure_return']))}"
-                )
             print(
                 "平均 Allocation贡献/Exposure相对固定仓位贡献: "
                 f"{_pct(float(summary['mean_allocation_contribution']))} / "
@@ -162,12 +146,6 @@ def print_cross_validation() -> None:
                 f"{float(summary['mean_risk_3d_brier_skill']):+.4f} / "
                 f"{float(summary['mean_risk_5d_brier_skill']):+.4f}"
             )
-            if "candidate_tail_risk_return_spearman" in summary:
-                print(
-                    "Ranking Top-20风险与未来收益相关（尾部/融合）: "
-                    f"{float(summary['candidate_tail_risk_return_spearman']):+.4f} / "
-                    f"{float(summary['candidate_combined_risk_return_spearman']):+.4f}"
-                )
         print(
             "Regime Gate 与 Top-5/市场收益/尾部扩散相关: "
             f"{float(summary['regime_return_spearman']):+.4f} / "
@@ -194,18 +172,6 @@ def print_cross_validation() -> None:
                 f"{float(summary['cluster_constraint_skip_rate']):.2%} / "
                 f"{int(summary['max_selected_raw_rank'])}"
             )
-    if "mean_industry_hhi" in summary:
-        print(
-            "原始/软选择后行业 HHI、最大行业占比: "
-            f"{float(summary['mean_raw_industry_hhi']):.4f} / "
-            f"{float(summary['mean_industry_hhi']):.4f}, "
-            f"{float(summary['mean_raw_max_industry_share']):.2%} / "
-            f"{float(summary['mean_max_industry_share']):.2%}"
-        )
-        print(
-            "Allocation 同仓位行业 HHI 变化: "
-            f"{float(summary['mean_allocation_industry_hhi_change']):+.4f}"
-        )
     if "risk_score_penalty" in summary:
         print(
             "OOF Allocation混合/Exposure混合/风险分数惩罚/"
@@ -216,20 +182,13 @@ def print_cross_validation() -> None:
             f"{float(summary.get('selection_risk_gamma', 0.0)):.2f} / "
             f"{float(summary.get('correlation_exposure_gamma', 0.0)):.2f}"
         )
-        print(
-            "风险方案/行业软惩罚/相关性软惩罚: "
-            f"{summary.get('risk_blend_profile', 'configured_default')} / "
-            f"{float(summary.get('industry_penalty', 0.0)):.2f} / "
-            f"{float(summary.get('soft_correlation_penalty', 0.0)):.2f}"
-        )
     if cross_fitted.get("fold_policies"):
-        print("严格前向 OOF 留出折策略:")
+        print("嵌套 OOF 留出折策略:")
         for row in cross_fitted["fold_policies"]:
             selected = row.get("policy", row)
             print(
                 f"  Fold {row['held_out_fold']} <- calibration "
-                f"{row['calibration_folds']} "
-                f"({row.get('num_calibration_folds', len(row['calibration_folds']))}折): "
+                f"{row['calibration_folds']}: "
                 f"Allocation={float(selected['allocation_blend']):.2f}, "
                 f"Exposure={float(selected.get('exposure_head_blend', 0.0)):.2f}, "
                 f"Risk={float(selected.get('risk_score_penalty', 0.0)):.2f}, "
@@ -266,8 +225,6 @@ def print_cross_validation() -> None:
                 "risk_score_penalty",
                 "selection_risk_gamma",
                 "cluster_cap_enabled",
-                "industry_penalty",
-                "soft_correlation_penalty",
                 "allocation_blend",
                 "exposure_head_blend",
                 "correlation_exposure_gamma",
@@ -287,10 +244,6 @@ def print_cross_validation() -> None:
                 f"Exposure={float(deployment['exposure_head_blend']):.2f}, "
                 f"Risk={float(deployment['risk_score_penalty']):.2f}, "
                 f"Reversal={float(deployment['selection_risk_gamma']):.2f}, "
-                f"Industry="
-                f"{float(deployment.get('industry_penalty', 0.0)):.2f}, "
-                f"SoftCorr="
-                f"{float(deployment.get('soft_correlation_penalty', 0.0)):.2f}, "
                 f"CorrExposure="
                 f"{float(deployment['correlation_exposure_gamma']):.2f}"
             )
@@ -300,21 +253,11 @@ def print_cross_validation() -> None:
         )
         if differences:
             print(
-                "部署策略相对各留出策略的差值: "
+                "部署策略相对三个留出策略的差值: "
                 + ", ".join(
                     f"{name}={['%+.2f' % float(value) for value in values]}"
                     for name, values in differences.items()
                 )
-            )
-    reference_windows = summary.get("reference_validation_windows", [])
-    if reference_windows:
-        print("2026年原三折日期区间参考（不用于晋级）:")
-        for row in reference_windows:
-            print(
-                f"  {row['start']} ~ {row['end']}: "
-                f"Top-5 {_pct(float(row['mean_top5_return']))}, "
-                f"组合 {_pct(float(row['mean_weighted_portfolio_return']))}, "
-                f"Rank IC {float(row['mean_rank_ic']):+.4f}"
             )
     random_baselines = []
     policy_folds = {
@@ -340,19 +283,10 @@ def print_cross_validation() -> None:
             "mean_rank_ic",
             metrics["rank_ic"],
         ))
-        actual_dates = [
-            row["prediction_date"] for row in policy_days
-            if int(row["fold"]) == int(fold["fold"])
-        ]
-        validation_range = (
-            f"{min(actual_dates)} ~ {max(actual_dates)}"
-            if actual_dates
-            else f"{fold['val_start']} ~ {fold['val_end']}"
-        )
         random_baselines.append(random_top5)
         print(
             f"  Seed {fold.get('base_seed', '-')} Fold {fold['fold']} "
-            f"({validation_range}): "
+            f"({fold['val_start']} ~ {fold['val_end']}): "
             f"Top-5 {_pct(top5_return)}, "
             f"随机/全池等权 {_pct(random_top5)}, "
             f"超额 {_pct(top5_return - random_top5)}, "

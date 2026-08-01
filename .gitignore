@@ -1,11 +1,9 @@
 docs
 # Local competition data variants, including the five-year training set.
-data**
+data*
 model
 output
 temp
 test
 # Training and policy-replay runtime logs.
-*.log
-
 *.log
