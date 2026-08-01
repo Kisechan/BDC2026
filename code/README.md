@@ -12,10 +12,10 @@
 核心目标是学习“当天应优先持有哪些股票”的排序函数，而不是单只股票二分类。
 
 训练与推理主流程如下：
-1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）与行业历史快照；
-2. 做单股量价特征工程，并增加短期反转、下行波动、市场压力和行业 as-of 残差特征；
+1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）；
+2. 做单股量价特征工程，并增加短期反转、下行波动和市场压力特征；
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
-4. v1.21 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月新锁箱，每折训练/验证之间 purge 5 日；
+4. 默认用固定随机种子 `42` 构造三折 walk-forward 验证，每折训练/验证之间 purge 5 日；
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
    回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
@@ -26,35 +26,6 @@
 
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
-
-### v1.21 严格 Top-5 LambdaRank
-
-当前实验 `threefold_recent504_lambdarank_top5_strict_v21` 保持 205 维
-`158+39_reduced25_relmarket12_risk15_indresid12`、单种子 42、三折、5 日 purge 和近期 504 日窗口。
-它不重训 Transformer：冻结的 v1.20.1 RankGLU 工件只提供兼容的特征/Scaler/推理 checkpoint；v1.21
-唯一重训的是独立目录中的 LightGBM。
-
-每个交易日按官方 `open_t5 / open_t1 - 1` 排名，恰好前五只的 relevance 为 `1`，其余为 `0`；
-`LGBMRanker(lambdarank)` 固定 `ndcg@5`、`lambdarank_truncation_level=8`、`label_gain=[0,1]`。
-每个外层折先在最近 504 个训练日内切出最后 40 个交易日作内层早停验证，并 purge 5 日；随后用选出的
-树数在完整外层训练窗口重训，外层验证集只评分，绝不参与早停。
-
-组合固定为纯 LightGBM 原始 Top-5、五只各 `0.1999998`、总仓位 `0.999999`。Allocation、Exposure、
-风险、反转、相关性和行业约束均关闭。晋级基线是冻结 v1.17 OOF 的相同满仓等权纯排序重放，而不是其
-历史低仓位策略；门槛仍为平均收益 +10bp、两折正增益、P10/最差折 -10bp 护栏和 Rank IC -0.005 护栏。
-`test.csv` 缺少未来完整价格时会硬拒绝收益结论。
-
-### v1.22 严格前向 Allocation Head 权重
-
-v1.22 保留 v1.21 的纯 LightGBM Top-5 选股，只重放冻结 v1.20.1 Transformer 的 Allocation Head。
-候选仅为等权、25% Allocation 混合和 50% Allocation 混合，且混合权重投影到每只 5%--35%。Fold 1 固定
-等权，Fold 2 只能读取 Fold 1 标签，Fold 3 和最终部署只能读取 Fold 1--2；非等权须较等权至少 +10bp、
-各校准折不差、P10 和最差日不恶化超过 10bp 才会启用。否则部署明确回退等权，绝不使用 2026-07-31
-的未知未来收益调权。
-
-候选通过后运行 `FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh` 创建隔离的最终树模型。
-该模型只以截至 2026-07-24 已完成标签的最近 504 日拟合；7 月 31 日仅用作推理 as-of。`test.sh` 优先使用
-最终目录，并可自动从赛事挂载的 `stock_data.csv` 或本地 `train.csv` 读取行情。
 
 ---
 
@@ -87,7 +58,7 @@ v1.22 保留 v1.21 的纯 LightGBM Top-5 选股，只重放冻结 v1.20.1 Transf
 - 股票 ID Embedding：训练时随机将部分 ID 替换成 UNK，并对 embedding 向量做
   dropout；可学习门控初值为0.20并带平方正则，限制 ID 分支影响；
 - `CrossStockAttention`：使用 padding mask 建模同日股票间关系；
-- `score_head`：v1.20 为受限 RankGLU（线性基线 + GLU 残差），`return_head` 输出原始收益预测；
+- `score_head` 与 `return_head`：分别输出5日Alpha分数和原始收益预测；
 - `risk_1d_head`、`risk_3d_head`、`risk_5d_head`：分别预测1、3、5日软下跌概率；
 - `tail_5d_head`：直接预测 `future_return_5d <= -3%`，四个风险头按
   `0.15/0.20/0.30/0.35` 固定融合；
@@ -128,30 +99,13 @@ v1.22 保留 v1.21 的纯 LightGBM Top-5 选股，只重放冻结 v1.20.1 Transf
 共178个连续输入。横截面只使用同一交易日可观测股票，市场状态值广播给当天所有股票；
 每折 StandardScaler 仍只使用该折训练期拟合。
 
-`158+39_reduced25_relmarket12_risk15` 在上述178维上继续增加：
+当前 `158+39_reduced25_relmarket12_risk15` 在上述178维上继续增加：
 
 - 1/3日收益、5日相对20/60日动量差、5/20日下行波动和20日回撤的横截面百分位；
 - 市场1/3日收益、5/20日下行波动、20日回撤、5日宽度变化、5日MA20宽度变化和
   20日市场拥挤度。
 
 共193个连续输入，全部只依赖预测日及以前行情。
-
-当前 v1.20 的 `158+39_reduced25_relmarket12_risk15_indresid12` 保留这193项，再增加12项
-行业 as-of 输入，共205维：相对市场、相对所属行业的1/3/5日收益残差，以及它们各自的同日横截面百分位。
-字段固定为 `indresid_market_return_{1,3,5}`、`indresid_industry_return_{1,3,5}`、
-`indresid_market_return_{1,3,5}_pct` 和 `indresid_industry_return_{1,3,5}_pct`。行业代码、名称和
-未来快照不进入 Transformer；每条记录只连接 `effective_date <= 日期` 的最后一份行业快照。
-
-### v1.20 工件复现协议
-
-205维 v1.20 工件根目录必须包含 `artifact_manifest.json`，并与 `config.json`、`scaler.pkl`、
-`stockid2idx.json` 和每个 checkpoint 一起保留。manifest 至少包含：
-`feature_num`、`feature_count`（205）、`sequence_length`、`stock_mapping_size`，以及
-`architecture` 中的 `d_model`、`nhead`、`num_layers`、`dim_feedforward`，以及 RankGLU 的
-`score_head_variant`、`rankglu_bottleneck`、`rankglu_gamma_max`。推理会交叉检查
-manifest、Scaler 宽度、checkpoint 的 `input_proj.weight` 宽度和股票 embedding 行数；任意一项
-不一致即拒绝运行。旧 v1.16 的193维工件没有 manifest 时仍可推理，但不能与205维策略、Scaler
-或 checkpoint 混用。
 
 ### [train.py](train.py)
 训练主脚本，关键内容：
@@ -207,20 +161,18 @@ manifest、Scaler 宽度、checkpoint 的 `input_proj.weight` 宽度和股票 em
 - `config.json`：训练时配置快照；
 - `fold_N/log/`：逐折 TensorBoard 日志。
 
-v1.16 的历史策略输出目录为
-`model/60_158+39_reduced25_relmarket12_risk15_nested_oof_forward_policy_v7_1/`。
-该目录不复制模型；`artifact_source_dir` 指向
-`nested_oof_diverse_tailregime_v6_decay5y` 的 checkpoint、scaler、股票映射和
-训练配置。`ensemble_policy.json` 同时保留严格前向策略、全 OOF 候选策略及经过
-历史折模块资格过滤的实际部署策略。Fold 1 使用保守预热策略，Fold 2 只使用
-Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
+当前模型目录为
+`model/60_158+39_reduced25_relmarket12_risk15_industryalpha_softconcentration_v8/`。
+`ensemble_policy.json` 同时保留严格前向策略、全 OOF 候选策略及经过历史折模块
+资格过滤的实际部署策略。Fold 1 使用保守预热策略，Fold 2 只使用 Fold 1 已完成
+标签，Fold 3 只使用 Fold 1–2 已完成标签。晋级结果与 v6 在 v1.16.1 协议下生成
+的同日期基准比较。
 
 ### [predict.py](predict.py)
 推理主脚本，流程：
 1. 加载历史数据，取最新交易日；
 2. 执行与训练一致的特征工程；
-3. 从策略目录加载部署参数，并通过 `artifact_source_dir` 从训练工件目录加载
-   训练配置、全量 `scaler.pkl`、股票映射与 checkpoint；
+3. 从模型目录加载训练配置、全量 `scaler.pkl`、股票/行业映射与 checkpoint；
 4. 默认加载一个全量模型；启用集成实验时加载多个模型，并将各自 ranking score
    转为横截面百分位后求均值；
 5. 先按稳健部署策略决定是否应用风险、行业拥挤和相关性软惩罚；候选严格限制
@@ -231,14 +183,11 @@ Fold 1 已完成标签，Fold 3 只使用 Fold 1–2 已完成标签。
 	 - `stock_id`
 	 - `weight`（5只股票之和严格位于 `[0.20, 0.999999]`）
 
-v1.20 在特征工程前还会验证 manifest、205维特征表、Scaler、股票映射、RankGLU 架构和 checkpoint，防止
-不同输入维度的工件混用。写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
+写出前后都会检查列名、股票数量、股票唯一性、候选范围、权重有限性和权重和，
 避免浮点序列化导致提交权重超过 1。现金不写入股票行，隐含权重为
 `1 - sum(weight)`。另写出 `output/prediction_diagnostics.json`，记录每个模型的
 Top-5、原始 Top-5、选择前后名次、相关簇编号、ID 消融、反转风险、组合相关性、
-策略参数、1/3/5日软风险、5日尾部事件风险、市场状态门控、股票仓位和现金。v1.17 另记录逐日
-组合状态、行业集中度（as-of 行业 HHI/权重）、资金约束和融合风险诊断；缺少行业历史时只跳过该
-诊断，不改变选股结果。
+策略参数、1/3/5日软风险、5日尾部事件风险、市场状态门控、股票仓位和现金。
 
 `sequence_length=60` 不代表模型只看到两个月的信息：单日输入已包含最长60日窗口
 特征，再拼接60个时点后，最早的显式输入可追溯到`t-119`，覆盖约120个行情观测；
@@ -278,29 +227,23 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 训练当前 v1.21 工件（仅近期504日严格 Top-5 LambdaRank；不会运行 Transformer epoch）
+3) 下载历史行业快照（首次训练 v1.17 前必须执行）
+
+```
+python get_stock_data.py --industry-only --start-date 2021-01-01 \
+  --end-date 2026-07-20 --output-dir ./data_5y
+```
+
+4) 训练单种子42三折与一次全量模型
 
 ```
 ./train.sh
 ```
 
-训练会在默认 candidate 目录完成三折内层早停、外层重训和外层评分；先检查
-`cross_validation_summary.json` 的 `promotion_criteria.passed`。已知的 2026-06-01～2026-07-29
-只能用 `KNOWN_STRESS_EVAL=1 ./train.sh` 写入压力诊断，不能授权部署。新的最后两自然月数据到来后，
-`LOCKBOX_EVAL=1 ./train.sh` 才可产生可授权的 `lockbox_report.json`；通过后才可运行
-`V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh`。最终重训始终写入独立
-`v1.21_full_history_deployment` 目录；在新的未见锁箱到来之前，v1.21 会硬拒绝最终提交重训。
-
 5) 生成预测结果
 
 ```
 ./test.sh
-```
-
-7 月 24 日审计已经消费，只能保留既有报告，不能据它调参：
-
-```
-KNOWN_STRESS_EVAL=1 ./train.sh
 ```
 
 ---

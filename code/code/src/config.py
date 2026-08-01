@@ -1,15 +1,10 @@
 # 配置参数
 sequence_length = 60
-feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
+feature_num = '158+39_reduced25_relmarket12_risk15'
 patience_num = 12
-experiment_name = 'threefold_recent504_lambdarank_top5_allocation_strict_v22'
-# v1.20 从独立目录训练 RankGLU；仅 v1.17 基线用于三折晋级对照，
-# 不把不同 score head 的 checkpoint、scaler 或 manifest 混用。
-artifact_experiment_name = (
-    'threefold_industryresidual_lgbmblend_pathrisk_v17_candidate'
-)
+experiment_name = 'threefold_industryranking_recovery_v12'
+artifact_experiment_name = 'threefold_rawranking_riskcheckpoint_v11_memorysafe'
 config = {
-    'experiment_name': experiment_name,
     # 单个样本输入最近 60 个交易日；最早时点的 60 日特征可追溯到
     # t-119，因此显式窗口已覆盖约 120 个行情观测。
     'sequence_length': sequence_length,
@@ -30,16 +25,12 @@ config = {
     'id_gate_init': 0.20,
     'id_gate_regularization': 0.01,
     'identity_sensitivity_seed': 20260728,
-    # 166个reduced25 + 12个相对市场 + 15个短期风险/市场压力 +
-    # 12个因果行业残差输入；行业代码和名称不作为模型输入。
+    # 166个reduced25 + 12个相对市场 + 15个短期风险/市场压力输入。
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'grad_clip': True,
-    # 三折仍满足 F3 仅使用 F1/F2 已完全实现 OOF 标签的前向标定约束。
     'num_folds': 3,
     'validation_months': 2,
-    'lockbox_months': 2,
-    'lockbox_enabled': True,
     'evaluation_stride': 5,
     'reference_validation_windows': [
         ['2026-01-14', '2026-03-13'],
@@ -57,9 +48,6 @@ config = {
 
     'regression_weight': 0.05,
     'regression_beta': 0.02,
-    'industry_residual_head_enabled': True,
-    'industry_residual_weight': 0.05,
-    'industry_residual_beta': 0.02,
     'allocation_weight': 0.1,
     'exposure_weight': 1.0,
     'allocation_candidate_k': 20,
@@ -89,9 +77,17 @@ config = {
     # 排序主干输出原始分数；风险惩罚强度只用 OOF 网格校准。
     'risk_penalty_scale': 0.0,
     'oof_risk_penalty_enabled': True,
-    # v1.20.1 按赛事的五日开盘到开盘绝对收益最大化：可选风险/相关
-    # 模块固定关闭，不参与任何搜索。
-    'risk_score_penalty_grid': [0.0],
+    'risk_score_penalty_grid': [0.0, 0.05, 0.10, 0.15, 0.25],
+    'risk_blend_profiles': [
+        {
+            'name': 'off',
+            'weights': [0.0, 0.0, 0.0, 1.0],
+            'force_zero_penalty': True,
+        },
+        {'name': 'tail_only', 'weights': [0.0, 0.0, 0.0, 1.0]},
+        {'name': 'risk3d_tail', 'weights': [0.0, 0.5, 0.0, 0.5]},
+        {'name': 'current_four_head', 'weights': [0.15, 0.20, 0.30, 0.35]},
+    ],
     'risk_1d_target_temperature': 0.01,
     'risk_3d_target_temperature': 0.02,
     'risk_5d_target_temperature': 0.03,
@@ -101,9 +97,8 @@ config = {
     'tail_5d_weight': 0.20,
     'tail_5d_threshold': -0.03,
     'tail_5d_target_mode': 'holding_path_min',
-    'path_loss_5d_head_enabled': True,
-    'path_loss_5d_weight': 0.10,
-    'path_loss_5d_beta': 0.02,
+    # v1.18.2恢复原始5日收益排序；路径尾部风险只由风险头和checkpoint使用。
+    'ranking_downside_penalty': 0.0,
     'regime_gate_enabled': True,
     'regime_market_hidden_size': 16,
     'regime_market_feature_indices': [
@@ -120,64 +115,25 @@ config = {
     'exposure_risk_penalty_init': 0.25,
     'min_exposure': 0.20,
     'max_exposure': 0.999999,
-    # v1.22 仅比较已经预注册的等权与 Allocation Head 混合；绝不在
-    # 7 月 31 日持仓的未知收益上继续搜索权重。
-    'allocation_blend_grid': [0.0, 0.25, 0.50],
-    'allocation_weight_floor': 0.05,
-    'allocation_weight_cap': 0.35,
-    'disagreement_gamma_grid': [0.0],
+    'allocation_blend_grid': [0.0, 0.25, 0.5, 0.75, 1.0],
+    'disagreement_gamma_grid': [0.0, 2.0, 4.0, 8.0],
     'selection_risk_gamma_grid': [0.0],
+    'industry_penalty_grid': [0.0, 0.02, 0.05, 0.10],
+    'soft_correlation_penalty_grid': [0.0, 0.02, 0.05],
     'correlation_exposure_gamma_grid': [0.0],
-    # 比赛现金收益为零；v1.20.1 固定等权近满仓，不让辅助头改变提交。
-    'exposure_head_blend_grid': [0.0],
-    'selection_candidate_k': 30,
+    # Exposure Head 必须保留；OOF 只校准其相对固定基线的占比。
+    'exposure_head_blend_grid': [0.25, 0.50, 0.75, 1.0],
+    'selection_candidate_k': 10,
     'selection_risk_lookback': 60,
     'selection_correlation_lookbacks': [20, 60],
     'cluster_cap_enabled': False,
     'cluster_cap_grid': [False],
-    'cluster_cap_grid': [False],
     'cluster_correlation_threshold': 0.60,
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
-    'lgbm_enabled': True,
-    # v1.21 只重训主选股树模型。Transformer 仅作为冻结的205维特征、
-    # scaler 与推理兼容性来源，不参与训练或选股。
-    'tree_only_lgbm': True,
-    'allocation_strict_policy': True,
-    'tree_only_artifact_source_dir': (
-        './model/60_158+39_reduced25_relmarket12_risk15_indresid12_'
-        'threefold_recent504_rankxendcg_officialraw_v20_1_candidate'
-    ),
-    # 主选股严格对齐赛事 Top-5：每日官方 T+1 开盘至 T+5 开盘收益
-    # 前五名为正类，其余为负类。树数只由训练段内层验证决定。
-    'lgbm_blend_grid': [1.0],
-    'lgbm_objective': 'lambdarank',
-    'lgbm_label_mode': 'top5_binary',
-    'lgbm_top_k': 5,
-    'lgbm_label_gain': [0, 1],
-    'lgbm_truncation_level': 8,
-    'lgbm_target_column': 'label',
-    'lgbm_learning_rate': 0.03,
-    'lgbm_num_leaves': 31,
-    'lgbm_min_child_samples': 80,
-    'lgbm_feature_fraction': 0.80,
-    'lgbm_bagging_fraction': 0.80,
-    'lgbm_lambda_l2': 5.0,
-    'lgbm_n_estimators': 4000,
-    'lgbm_early_stopping_rounds': 200,
-    'lgbm_n_jobs': -1,
-    # 只限制树模型的训练日期，Transformer 仍按既有 504 日半衰期使用开发期。
-    'lgbm_train_window_days': 504,
-    'lgbm_inner_validation_days': 40,
-    'lgbm_inner_purge_days': 5,
-    # 行业约束在 v1.20 OOF 中拖累官方收益；v1.20.1 固定原始 Top-5。
-    'industry_cap_enabled': False,
-    'max_stocks_per_industry': 2,
-    'industry_candidate_k': 10,
     'nested_oof_enabled': True,
     # 策略层纯收益优先，但保留较轻的下行波动惩罚。
     'ensemble_downside_weight': 0.25,
-    'policy_only_experiment': False,
     'policy_only_experiment': False,
     'policy_simplicity_tolerance': 0.001,
     'module_min_positive_fold_fraction': 2 / 3,
@@ -185,13 +141,9 @@ config = {
     'risk_module_max_return_spearman': -0.05,
     'forward_module_max_fold_loss': 0.0025,
     'forward_module_max_p10_loss': 0.005,
-    'minimum_allocation_deployment_blend': 0.0,
-    'minimum_exposure_deployment_blend': 0.0,
-    # v1.22 只做严格前向的 Allocation Head 权重选择；其余模块保持关闭。
-    'fixed_equal_top5_policy': False,
-    'allocation_forward_min_mean_gain': 0.001,
-    'allocation_forward_max_p10_loss': 0.001,
-    'allocation_forward_max_worst_day_loss': 0.001,
+    'forward_min_calibration_folds': 2,
+    'minimum_allocation_deployment_blend': 0.25,
+    'minimum_exposure_deployment_blend': 0.25,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
@@ -243,12 +195,10 @@ config = {
     'promotion_id_top5_overlap': 0.40,
     'promotion_min_exposure_std': 0.01,
     'promotion_min_regime_gate_std': 0.01,
-    # 固定纯 LGBM Top-5、等权与近满仓；辅助 Head 仍训练用于诊断。
-    'fixed_exposure_baseline': 0.999999,
-    'score_head_variant': 'rankglu_v1',
-    'rankglu_bottleneck': 32,
-    'rankglu_gamma_init': 0.05,
-    'rankglu_gamma_max': 0.5,
+    'fixed_exposure_baseline': 0.6231689453125,
+    'minimum_industry_coverage': 0.95,
+    'industry_history_path': './data_5y/stock_industry_history.csv',
+    'promotion_rank_ic_floor': 0.05,
 
     # 保持损失为 FP32，仅对 Transformer 前向启用 AMP。
     'amp_enabled': True,
@@ -258,27 +208,13 @@ config = {
     'non_blocking_transfer': True,
     'deterministic_training': True,
 
-    'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}_candidate',
+    'output_dir': f'./model/{sequence_length}_{feature_num}_{experiment_name}',
     'policy_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_{experiment_name}_policy'
+        f'./model/{sequence_length}_{feature_num}_{experiment_name}'
     ),
     'policy_only_source_dir': (
         f'./model/{sequence_length}_{feature_num}_{artifact_experiment_name}'
     ),
-    'baseline_source_dir': (
-        './model/60_158+39_reduced25_relmarket12_risk15_'
-        'threefold_industryresidual_lgbmblend_pathrisk_v17_baseline'
-    ),
-    'full_deployment_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.22_full_history_deployment'
-    ),
-    'final_submission_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.22_submission_2026-07-31'
-    ),
-    # v1.19 已消费这段压力期；它只能做诊断，不能充当 v1.20 新锁箱。
-    'known_stress_start': '2026-06-01',
-    'known_stress_end': '2026-07-29',
     # 五年历史数据与原三年数据隔离存放，避免覆盖已有实验的切分文件。
     'data_path': './data_5y',
-    'industry_history_path': './data_5y/stock_industry_history.csv',
 }

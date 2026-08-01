@@ -42,138 +42,12 @@ MARKET_PRESSURE_FEATURES = (
     'market_crowding_20',
 )
 RISK_MARKET_FEATURES = (*STOCK_RISK_FEATURES, *MARKET_PRESSURE_FEATURES)
-INDUSTRY_RESIDUAL_FEATURE_SET = (
-    '158+39_reduced25_relmarket12_risk15_indresid12'
-)
-INDUSTRY_RESIDUAL_FEATURES = (
-    'indresid_market_return_1', 'indresid_market_return_3',
-    'indresid_market_return_5', 'indresid_industry_return_1',
-    'indresid_industry_return_3', 'indresid_industry_return_5',
-    'indresid_market_return_1_pct', 'indresid_market_return_3_pct',
-    'indresid_market_return_5_pct', 'indresid_industry_return_1_pct',
-    'indresid_industry_return_3_pct', 'indresid_industry_return_5_pct',
-)
-INDUSTRY_ASOF_COLUMN = '_industry_asof'
-INDUSTRY_NEUTRAL_TARGET = 'industry_neutral_label'
 SELECTION_MOMENTUM_FEATURES = (
     'cs_return_5_pct',
     'cs_return_20_pct',
     'cs_return_60_pct',
 )
 SELECTION_RETURN_FEATURE = 'return_1'
-
-
-def _industry_stock_key(values):
-    """统一数值/零填充股票代码，供行业快照关联使用。"""
-    raw = pd.Series(values, copy=False).astype('string').str.strip()
-    numeric = pd.to_numeric(raw, errors='coerce')
-    integer = numeric.notna() & np.isclose(numeric, np.round(numeric))
-    result = raw.copy()
-    result.loc[integer] = numeric.loc[integer].round().astype('Int64').astype('string')
-    return result
-
-
-def _prepare_industry_history(industry_history):
-    if isinstance(industry_history, (str, os.PathLike)):
-        industry_history = pd.read_csv(industry_history)
-    required = {'effective_date', 'stock_id', 'industry'}
-    missing = required.difference(industry_history.columns)
-    if missing:
-        raise ValueError(f'行业快照缺少必要列: {sorted(missing)}')
-    history = industry_history.loc[:, ['effective_date', 'stock_id', 'industry']].copy()
-    history['effective_date'] = pd.to_datetime(history['effective_date'], errors='coerce')
-    history['_industry_key'] = _industry_stock_key(history['stock_id'])
-    history['industry'] = history['industry'].astype('string').str.strip()
-    history = history.dropna(subset=['effective_date', '_industry_key', 'industry'])
-    duplicate = ['effective_date', '_industry_key']
-    if (history.groupby(duplicate)['industry'].nunique() > 1).any():
-        raise ValueError('同一股票和生效日存在冲突的行业快照')
-    return history.drop_duplicates(duplicate).sort_values(
-        ['effective_date', '_industry_key'], kind='mergesort'
-    )
-
-
-def attach_industry_asof(df, industry_history, industry_column=INDUSTRY_ASOF_COLUMN):
-    """以最近且不晚于行情日的行业快照关联；绝不使用未来行业信息。"""
-    required = {'股票代码', '日期'}
-    missing = required.difference(df.columns)
-    if missing:
-        raise ValueError(f'行业 as-of 关联缺少基础列: {sorted(missing)}')
-    panel = df.copy()
-    panel['_industry_order'] = np.arange(len(panel))
-    panel['_industry_date'] = pd.to_datetime(panel['日期'], errors='coerce')
-    if panel['_industry_date'].isna().any():
-        raise ValueError('行业 as-of 关联包含无效日期')
-    panel['_industry_key'] = _industry_stock_key(panel['股票代码'])
-    history = _prepare_industry_history(industry_history)
-    joined = pd.merge_asof(
-        panel.sort_values(['_industry_date', '_industry_key'], kind='mergesort'),
-        history.loc[:, ['effective_date', '_industry_key', 'industry']],
-        left_on='_industry_date', right_on='effective_date', by='_industry_key',
-        direction='backward', allow_exact_matches=True,
-    ).sort_values('_industry_order', kind='mergesort')
-    joined[industry_column] = joined['industry'].astype('string')
-    return joined.drop(columns=[
-        '_industry_order', '_industry_date', '_industry_key',
-        'effective_date', 'industry',
-    ])
-
-
-def add_industry_residual_features(
-    df, industry_history, min_industry_size=3,
-    industry_column=INDUSTRY_ASOF_COLUMN,
-):
-    """添加12项当日市场/行业残差和百分位；缺失行业退化为市场统计。"""
-    required = {'股票代码', '日期', '收盘'}
-    missing = required.difference(df.columns)
-    if missing:
-        raise ValueError(f'行业残差特征缺少基础列: {sorted(missing)}')
-    if min_industry_size < 2:
-        raise ValueError('min_industry_size 至少为2')
-    panel = attach_industry_asof(df, industry_history, industry_column)
-    panel['日期'] = pd.to_datetime(panel['日期'])
-    panel['收盘'] = pd.to_numeric(panel['收盘'], errors='coerce')
-    panel = panel.sort_values(['股票代码', '日期'], kind='mergesort')
-    dates = panel['日期']
-    closes = panel.groupby('股票代码', sort=False)['收盘']
-    for period in (1, 3, 5):
-        returns = closes.pct_change(periods=period, fill_method=None)
-        market_mean = returns.groupby(dates).transform('mean')
-        market_pct = returns.groupby(dates).rank(method='average', pct=True)
-        group_keys = [dates, panel[industry_column]]
-        industry_count = returns.notna().groupby(group_keys).transform('sum')
-        valid = panel[industry_column].notna() & industry_count.ge(min_industry_size)
-        industry_mean = returns.groupby(group_keys).transform('mean').where(valid, market_mean)
-        industry_pct = returns.groupby(group_keys).rank(method='average', pct=True).where(valid, market_pct)
-        panel[f'indresid_market_return_{period}'] = returns - market_mean
-        panel[f'indresid_industry_return_{period}'] = returns - industry_mean
-        panel[f'indresid_market_return_{period}_pct'] = market_pct
-        panel[f'indresid_industry_return_{period}_pct'] = industry_pct
-    panel[list(INDUSTRY_RESIDUAL_FEATURES)] = panel[
-        list(INDUSTRY_RESIDUAL_FEATURES)
-    ].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return panel.sort_index()
-
-
-def add_industry_neutral_label(
-    df, target_column='label', industry_column=INDUSTRY_ASOF_COLUMN,
-    output_column=INDUSTRY_NEUTRAL_TARGET, min_industry_size=3,
-):
-    """用预测日所属行业同期均值去除五日收益；无行业时用市场均值。"""
-    required = {'日期', target_column, industry_column}
-    missing = required.difference(df.columns)
-    if missing:
-        raise ValueError(f'行业中性标签缺少必要列: {sorted(missing)}')
-    dates = pd.to_datetime(df['日期'])
-    targets = pd.to_numeric(df[target_column], errors='coerce')
-    market_mean = targets.groupby(dates).transform('mean')
-    group_keys = [dates, df[industry_column]]
-    count = targets.notna().groupby(group_keys).transform('sum')
-    valid = df[industry_column].notna() & count.ge(min_industry_size)
-    industry_mean = targets.groupby(group_keys).transform('mean').where(valid, market_mean)
-    result = df.copy()
-    result[output_column] = (targets - industry_mean).replace([np.inf, -np.inf], np.nan)
-    return result
 
 
 def attach_label_end_dates(records, trading_dates, horizon=5):
@@ -689,7 +563,7 @@ def engineer_features_39(df):
     df['obv'] = talib.OBV(close, volume)
 
     # Volume-related features
-    df['volume_change'] = volume.pct_change(fill_method=None)
+    df['volume_change'] = volume.pct_change()
     df['volume_ma_5'] = talib.SMA(volume, timeperiod=5)
     df['volume_ma_20'] = talib.SMA(volume, timeperiod=20)
     df['volume_ratio'] = df['volume_ma_5'] / df['volume_ma_20']
@@ -1298,143 +1172,6 @@ def percentile_ranks(values):
     return (rankdata(values, method='average') - 1.0) / (values.size - 1.0)
 
 
-def maximum_drawdown(returns):
-    """按时间顺序的简单收益计算组合最大回撤。"""
-    values = np.asarray(returns, dtype=np.float64)
-    if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
-        raise ValueError('最大回撤需要非空有限的一维收益')
-    wealth = np.cumprod(1.0 + values)
-    return float(np.min(wealth / np.maximum.accumulate(wealth) - 1.0))
-
-
-def project_long_only_weights(weights, min_weight=0.05, max_weight=0.35):
-    """欧氏投影至和为一的 long-only 有界单纯形。"""
-    weights = np.asarray(weights, dtype=np.float64)
-    if weights.ndim != 1 or weights.size == 0 or not np.isfinite(weights).all():
-        raise ValueError('权重必须是有限的非空一维数组')
-    if not (0.0 <= min_weight <= max_weight <= 1.0):
-        raise ValueError('权重边界必须满足 0 <= min <= max <= 1')
-    if weights.size * min_weight > 1.0 or weights.size * max_weight < 1.0:
-        raise ValueError('权重边界与持仓数量不可行')
-    lower = float(weights.min() - max_weight)
-    upper = float(weights.max() - min_weight)
-    for _ in range(80):
-        offset = (lower + upper) / 2.0
-        if np.clip(weights - offset, min_weight, max_weight).sum() > 1.0:
-            lower = offset
-        else:
-            upper = offset
-    projected = np.clip(weights - (lower + upper) / 2.0, min_weight, max_weight)
-    projected[np.argmax(projected)] += 1.0 - projected.sum()
-    return projected
-
-
-def select_industry_capped_top_indices(
-    scores, industries, top_k=5, max_stocks_per_industry=2, candidate_k=10,
-):
-    """仅在原始 Top-``candidate_k`` 中用行业上限替换名称；不可行则回退 Top-5。"""
-    scores = np.asarray(scores, dtype=np.float64)
-    industries = np.asarray(industries, dtype=object)
-    if scores.ndim != 1 or industries.shape != scores.shape:
-        raise ValueError('行业选择的分数和行业标签长度必须一致')
-    if scores.size < top_k or max_stocks_per_industry < 1:
-        raise ValueError('行业选择的股票数或行业上限无效')
-    order = np.lexsort((np.arange(scores.size), -scores))
-    raw_top = order[:top_k]
-    selected, counts = [], {}
-    for index in order[:min(max(int(candidate_k), top_k), scores.size)]:
-        industry = industries[index]
-        # 无行业快照不施加行业约束，避免快照缺失改变股票池可用性。
-        constrained = industry is not None and not pd.isna(industry)
-        key = str(industry) if constrained else None
-        if constrained and counts.get(key, 0) >= max_stocks_per_industry:
-            continue
-        selected.append(int(index))
-        if constrained:
-            counts[key] = counts.get(key, 0) + 1
-        if len(selected) == top_k:
-            return {
-                'top_indices': np.asarray(selected, dtype=np.int64),
-                'raw_top_indices': raw_top,
-                'applied': True,
-                'fallback': False,
-            }
-    return {
-        'top_indices': raw_top,
-        'raw_top_indices': raw_top,
-        'applied': False,
-        'fallback': True,
-    }
-
-
-def build_exposure_confidence(scores, tail_probabilities, disagreement, market_pressure, top_k=5):
-    """构造可校准的置信度：Top-5/6 间距减尾部风险、分歧和市场压力。"""
-    scores = np.asarray(scores, dtype=np.float64)
-    tail_probabilities = np.asarray(tail_probabilities, dtype=np.float64)
-    if scores.ndim != 1 or tail_probabilities.shape != scores.shape:
-        raise ValueError('置信度分数和尾部风险必须是一维且长度一致')
-    if scores.size <= top_k or not (
-        np.isfinite(scores).all() and np.isfinite(tail_probabilities).all()
-    ):
-        raise ValueError('置信度至少需要 Top-k+1 个有限股票分数')
-    if disagreement < 0 or not np.isfinite(disagreement) or not np.isfinite(market_pressure):
-        raise ValueError('分歧和市场压力必须为有限值，且分歧非负')
-    ordered = np.sort(scores)[::-1]
-    selected = np.argsort(scores)[::-1][:top_k]
-    gap = float(ordered[top_k - 1] - ordered[top_k])
-    tail_risk = float(tail_probabilities[selected].mean())
-    return {
-        'raw_confidence': gap - tail_risk - float(disagreement) - float(market_pressure),
-        'top5_top6_gap': gap,
-        'top5_tail_risk': tail_risk,
-    }
-
-
-def fit_strict_forward_confidence_calibrator(
-    prediction_date, label_end_dates, confidence_values, utility_values,
-    min_exposure=0.20, max_exposure=0.999999, min_samples=20,
-):
-    """仅用标签结束日早于 ``prediction_date`` 的 OOF 样本拟合单调仓位校准。"""
-    from sklearn.isotonic import IsotonicRegression
-
-    ends = pd.to_datetime(label_end_dates)
-    confidence = np.asarray(confidence_values, dtype=np.float64)
-    utility = np.asarray(utility_values, dtype=np.float64)
-    if not (ends.size == confidence.size == utility.size):
-        raise ValueError('置信度校准输入长度不一致')
-    if not 0.0 <= min_exposure < max_exposure < 1.0:
-        raise ValueError('置信度校准仓位范围无效')
-    resolved = (ends < pd.Timestamp(prediction_date)) & np.isfinite(confidence) & np.isfinite(utility)
-    if int(resolved.sum()) < min_samples:
-        return None
-    x = confidence[resolved]
-    median = float(np.median(x))
-    scale = float(np.quantile(x, .75) - np.quantile(x, .25))
-    scale = max(scale, 1e-8)
-    target = min_exposure + (max_exposure - min_exposure) * percentile_ranks(utility[resolved])
-    model = IsotonicRegression(
-        increasing=True, y_min=min_exposure, y_max=max_exposure,
-        out_of_bounds='clip',
-    ).fit((x - median) / scale, target)
-    return {
-        'model': model, 'median': median, 'scale': scale,
-        'sample_count': int(resolved.sum()),
-        'latest_label_end_date': pd.Timestamp(ends[resolved].max()).strftime('%Y-%m-%d'),
-    }
-
-
-def predict_calibrated_exposure(calibration, confidence):
-    """应用 ``fit_strict_forward_confidence_calibrator`` 的已保存结果。"""
-    if calibration is None:
-        return None
-    value = np.asarray([confidence], dtype=np.float64)
-    if not np.isfinite(value).all():
-        raise ValueError('置信度必须为有限数值')
-    return float(calibration['model'].predict(
-        (value - calibration['median']) / calibration['scale']
-    )[0])
-
-
 def _stable_softmax(values):
     values = np.asarray(values, dtype=np.float64)
     shifted = values - np.max(values)
@@ -1876,10 +1613,6 @@ def build_ensemble_portfolio(
     correlation_exposure_gamma=0.0,
     exposure_head_blend=1.0,
     fixed_exposure_baseline=0.6231689453125,
-    industry_labels=None,
-    max_stocks_per_industry=None,
-    industry_candidate_k=10,
-    position_weight_bounds=None,
     top_k=5,
 ):
     """用 rank ensemble 选股，并按模型分歧将仓位向最低仓位收缩。"""
@@ -1912,11 +1645,6 @@ def build_ensemble_portfolio(
         raise ValueError('allocation_blend 必须位于 [0, 1]')
     if not 0.0 <= exposure_head_blend <= 1.0:
         raise ValueError('exposure_head_blend 必须位于 [0, 1]')
-    if max_stocks_per_industry is not None:
-        if industry_labels is None:
-            raise ValueError('行业上限需要提供行业标签')
-        if int(max_stocks_per_industry) < 1:
-            raise ValueError('max_stocks_per_industry 必须大于0')
 
     raw_percentile_matrix = np.stack(
         [percentile_ranks(scores) for scores in score_matrix],
@@ -2038,26 +1766,6 @@ def build_ensemble_portfolio(
             top_k=top_k,
         )
     top_indices = risk_selection['top_indices']
-    industry_selection = {
-        'raw_top_indices': top_indices,
-        'applied': False,
-        'fallback': False,
-    }
-    if max_stocks_per_industry is not None:
-        industry_selection = select_industry_capped_top_indices(
-            ensemble_scores,
-            industry_labels,
-            top_k=top_k,
-            max_stocks_per_industry=int(max_stocks_per_industry),
-            candidate_k=industry_candidate_k,
-        )
-        top_indices = industry_selection['top_indices']
-        score_order = np.lexsort((np.arange(num_stocks), -ensemble_scores))
-        raw_rank = np.empty(num_stocks, dtype=np.int64)
-        raw_rank[score_order] = np.arange(1, num_stocks + 1)
-        risk_selection = dict(risk_selection)
-        risk_selection['selected_raw_ranks'] = raw_rank[top_indices]
-        risk_selection['max_selected_raw_rank'] = int(raw_rank[top_indices].max())
 
     learned_weights = np.stack([
         _stable_softmax(
@@ -2071,14 +1779,6 @@ def build_ensemble_portfolio(
         + (1.0 - allocation_blend) * equal_weights
     )
     relative_weights /= relative_weights.sum(dtype=np.float64)
-    if position_weight_bounds is not None:
-        if len(position_weight_bounds) != 2:
-            raise ValueError('position_weight_bounds 必须为 (min_weight, max_weight)')
-        relative_weights = project_long_only_weights(
-            relative_weights,
-            min_weight=float(position_weight_bounds[0]),
-            max_weight=float(position_weight_bounds[1]),
-        )
 
     selected_disagreement = percentile_matrix[:, top_indices].std(axis=0)
     mean_disagreement = float(selected_disagreement.mean())
@@ -2116,8 +1816,6 @@ def build_ensemble_portfolio(
     return {
         'top_indices': top_indices,
         'positions': positions,
-        # 保留 Head softmax，供提交诊断显示；不参与二次计算或选型。
-        'learned_weights': learned_weights,
         'relative_weights': relative_weights,
         'ensemble_scores': ensemble_scores,
         'raw_ensemble_scores': raw_ensemble_scores,
@@ -2164,17 +1862,6 @@ def build_ensemble_portfolio(
         ],
         'cluster_max_raw_rank': risk_selection['cluster_max_raw_rank'],
         'max_selected_raw_rank': risk_selection['max_selected_raw_rank'],
-        'industry_constraint_applied': industry_selection['applied'],
-        'industry_constraint_fallback': industry_selection['fallback'],
-        'max_stocks_per_industry': (
-            None if max_stocks_per_industry is None
-            else int(max_stocks_per_industry)
-        ),
-        'industry_candidate_k': int(industry_candidate_k),
-        'position_weight_bounds': (
-            None if position_weight_bounds is None
-            else [float(value) for value in position_weight_bounds]
-        ),
         'mean_positive_correlation': risk_selection[
             'mean_positive_correlation'
         ],
@@ -2451,9 +2138,6 @@ def summarize_ensemble_days(
     soft_correlation_penalty=0.0,
     tail_5d_threshold=-0.03,
     fixed_exposure_baseline=0.6231689453125,
-    max_stocks_per_industry=None,
-    industry_candidate_k=10,
-    position_weight_bounds=None,
     downside_weight=0.5,
     top_k=5,
     include_daily=False,
@@ -2543,10 +2227,6 @@ def summarize_ensemble_days(
             correlation_exposure_gamma=correlation_exposure_gamma,
             exposure_head_blend=exposure_head_blend,
             fixed_exposure_baseline=fixed_exposure_baseline,
-            industry_labels=day.get('industry_labels'),
-            max_stocks_per_industry=max_stocks_per_industry,
-            industry_candidate_k=industry_candidate_k,
-            position_weight_bounds=position_weight_bounds,
             top_k=top_k,
         )
         selected = portfolio['top_indices']
@@ -2629,53 +2309,17 @@ def summarize_ensemble_days(
             portfolio['ensemble_scores'],
             day['targets'],
         ).statistic
-        industry_labels = np.asarray(day.get(
-            'industry_labels',
-            np.full(len(day['stock_indices']), None, dtype=object),
-        ), dtype=object)
-        industry_weights = {}
-        for industry, weight in zip(
-            industry_labels[selected], portfolio['positions'],
-        ):
-            name = (
-                'UNCLASSIFIED'
-                if industry is None or pd.isna(industry) else str(industry)
-            )
-            industry_weights[name] = industry_weights.get(name, 0.0) + float(weight)
-        industry_shares = np.asarray(
-            list(industry_weights.values()), dtype=np.float64,
-        ) / max(float(portfolio['exposure']), 1e-12)
         daily.append({
             'fold': int(day['fold']),
             'prediction_date': day['prediction_date'],
             'label_end_date': day['label_end_date'],
             'top5_return': equal_full_return,
-            'selected_stock_indices': [
-                int(value) for value in day['stock_indices'][selected]
-            ],
-            'relative_weights': [
-                float(value) for value in portfolio['relative_weights']
-            ],
-            'positions': [float(value) for value in portfolio['positions']],
             'raw_top5_return': raw_top5_return,
             'diversification_return_contribution': (
                 equal_full_return - raw_top5_return
             ),
-            'industry_constraint_applied': bool(
-                portfolio['industry_constraint_applied']
-            ),
-            'industry_constraint_fallback': bool(
-                portfolio['industry_constraint_fallback']
-            ),
-            'industry_count': int(len(industry_weights)),
-            'industry_hhi': float(np.square(industry_shares).sum()),
-            'max_industry_weight': float(max(industry_weights.values())),
             'market_future_return': market_future_return,
             'market_tail_share': market_tail_share,
-            'market_return_20': float(day.get('market_return_20', 0.0)),
-            'market_downside_vol_20': float(
-                day.get('market_downside_vol_20', 0.0)
-            ),
             'equal_weight_at_exposure_return': (
                 equal_full_return * portfolio['exposure']
             ),
@@ -2818,12 +2462,6 @@ def summarize_ensemble_days(
     weighted_returns = np.asarray([
         row['weighted_portfolio_return'] for row in daily
     ], dtype=np.float64)
-    ordered_returns = np.asarray([
-        row['weighted_portfolio_return'] for row in sorted(
-            daily, key=lambda row: row['prediction_date'],
-        )
-    ], dtype=np.float64)
-    max_drawdown = maximum_drawdown(ordered_returns)
     negative_returns = np.minimum(weighted_returns, 0.0)
     downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
     fixed_exposure_returns = np.asarray([
@@ -2900,27 +2538,12 @@ def summarize_ensemble_days(
         'mean_diversification_return_contribution': mean(
             'diversification_return_contribution'
         ),
-        'industry_constraint_application_rate': float(np.mean([
-            row['industry_constraint_applied'] for row in daily
-        ])),
-        'industry_constraint_fallback_rate': float(np.mean([
-            row['industry_constraint_fallback'] for row in daily
-        ])),
-        'mean_industry_count': mean('industry_count'),
-        'mean_industry_hhi': mean('industry_hhi'),
-        'mean_max_industry_weight': mean('max_industry_weight'),
-        'max_stocks_per_industry': (
-            None if max_stocks_per_industry is None
-            else int(max_stocks_per_industry)
-        ),
-        'industry_candidate_k': int(industry_candidate_k),
         'mean_equal_weight_at_exposure_return': mean(
             'equal_weight_at_exposure_return'
         ),
         'mean_allocation_only_return': mean('allocation_only_return'),
         'mean_weighted_portfolio_return': float(weighted_returns.mean()),
         'worst_weighted_portfolio_return': float(weighted_returns.min()),
-        'max_drawdown': max_drawdown,
         'p10_weighted_portfolio_return': float(
             np.quantile(weighted_returns, 0.10)
         ),
@@ -3334,9 +2957,6 @@ def evaluate_ensemble_policy(ensemble_days, policy, include_daily=False):
         ),
         tail_5d_threshold=policy.get('tail_5d_threshold', -0.03),
         fixed_exposure_baseline=policy['fixed_exposure_baseline'],
-        max_stocks_per_industry=policy.get('max_stocks_per_industry'),
-        industry_candidate_k=policy.get('industry_candidate_k', 10),
-        position_weight_bounds=policy.get('position_weight_bounds'),
         downside_weight=policy['downside_weight'],
         top_k=policy['top_k'],
         include_daily=include_daily,
@@ -3363,12 +2983,6 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         return float(value) if np.isfinite(value) else 0.0
 
     weighted_returns = values('weighted_portfolio_return')
-    ordered_returns = np.asarray([
-        row['weighted_portfolio_return'] for row in sorted(
-            daily, key=lambda row: row['prediction_date'],
-        )
-    ], dtype=np.float64)
-    max_drawdown = maximum_drawdown(ordered_returns)
     negative_returns = np.minimum(weighted_returns, 0.0)
     downside_deviation = float(np.sqrt(np.mean(negative_returns ** 2)))
     top5_returns = values('top5_return')
@@ -3458,7 +3072,6 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'worst_weighted_portfolio_return': float(
             weighted_returns.min()
         ),
-        'max_drawdown': max_drawdown,
         'p10_weighted_portfolio_return': float(
             np.quantile(weighted_returns, 0.10)
         ),
@@ -3530,15 +3143,6 @@ def _summarize_cross_fitted_daily(daily, downside_weight):
         'cluster_constraint_skip_rate': float(np.mean([
             row.get('cluster_constraint_skipped', False) for row in daily
         ])),
-        'industry_constraint_application_rate': float(np.mean([
-            row.get('industry_constraint_applied', False) for row in daily
-        ])),
-        'industry_constraint_fallback_rate': float(np.mean([
-            row.get('industry_constraint_fallback', False) for row in daily
-        ])),
-        'mean_industry_count': mean('industry_count'),
-        'mean_industry_hhi': mean('industry_hhi'),
-        'mean_max_industry_weight': mean('max_industry_weight'),
         'max_selected_raw_rank': int(max(
             row.get('max_selected_raw_rank', 5) for row in daily
         )),
@@ -3796,12 +3400,6 @@ def _module_policy_base(calibration_kwargs):
             'fixed_exposure_baseline',
             0.6231689453125,
         )),
-        'max_stocks_per_industry': calibration_kwargs.get(
-            'max_stocks_per_industry'
-        ),
-        'industry_candidate_k': int(calibration_kwargs.get(
-            'industry_candidate_k', 10,
-        )),
         'min_exposure': float(calibration_kwargs['min_exposure']),
         'max_exposure': float(calibration_kwargs['max_exposure']),
         'allocation_temperature': float(calibration_kwargs[
@@ -3812,15 +3410,6 @@ def _module_policy_base(calibration_kwargs):
             'downside_weight',
             0.5,
         )),
-    }
-
-
-def _runtime_module_fallbacks(calibration_kwargs):
-    """使用当前配置的回退值，避免把旧版 25% 强行写回部署策略。"""
-    base = _module_policy_base(calibration_kwargs)
-    return {
-        module: base.get(field, default)
-        for module, (field, default) in _MODULE_POLICY_FIELDS.items()
     }
 
 
@@ -4214,9 +3803,7 @@ def calibrate_module_gated_policy(
         },
     }
 
-    minimum_allocation_blend = float(calibration_kwargs.get(
-        'minimum_allocation_blend', _MODULE_POLICY_FIELDS['allocation'][1],
-    ))
+    minimum_allocation_blend = _MODULE_POLICY_FIELDS['allocation'][1]
     allocation_grid = sorted({
         max(minimum_allocation_blend, float(value))
         for value in calibration_kwargs.get(
@@ -4277,9 +3864,7 @@ def calibrate_module_gated_policy(
         'module_gate': module_eligibility['allocation'],
     }
 
-    minimum_exposure_blend = float(calibration_kwargs.get(
-        'minimum_exposure_blend', _MODULE_POLICY_FIELDS['exposure_head'][1],
-    ))
+    minimum_exposure_blend = _MODULE_POLICY_FIELDS['exposure_head'][1]
     exposure_blend_grid = sorted({
         max(minimum_exposure_blend, float(value))
         for value in calibration_kwargs.get(
@@ -4324,8 +3909,6 @@ def calibrate_module_gated_policy(
     })
     for module in ('exposure_head', 'correlation_exposure'):
         field, fallback = _MODULE_POLICY_FIELDS[module]
-        if module == 'exposure_head':
-            fallback = minimum_exposure_blend
         if policy[field] == fallback:
             module_eligibility[module] = {
                 'enabled': False,
@@ -4493,7 +4076,6 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
     held_out_daily = []
     held_module_pairs = {module: [] for module in _MODULE_POLICY_FIELDS}
     fold_policies = []
-    module_fallbacks = _runtime_module_fallbacks(calibration_kwargs)
     policy_fields = tuple(
         field for field, _ in _MODULE_POLICY_FIELDS.values()
     ) + (
@@ -4536,7 +4118,6 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
         held_out_daily.extend(held_metrics['daily'])
         held_module_reports = {}
         for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
-            fallback = module_fallbacks[module]
             if policy[field] == fallback:
                 held_module_reports[module] = {
                     'active': False,
@@ -4658,7 +4239,6 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
     )
     robust_deployment = dict(all_oof_candidate)
     for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
-        fallback = module_fallbacks[module]
         if not deployment_eligibility[module]['eligible']:
             robust_deployment[field] = fallback
             if module == 'risk_score':
@@ -4715,7 +4295,6 @@ def forward_fit_module_gated_policy(
     held_out_daily = []
     fold_policies = []
     module_pairs = {module: [] for module in _MODULE_POLICY_FIELDS}
-    module_fallbacks = _runtime_module_fallbacks(calibration_kwargs)
     policy_fields = tuple(
         field for field, _ in _MODULE_POLICY_FIELDS.values()
     ) + ('disagreement_gamma',)
@@ -4739,14 +4318,17 @@ def forward_fit_module_gated_policy(
             if int(day['fold']) < held_out_fold
             and pd.Timestamp(day['label_end_date']) < evaluation_start
         ]
-        if fold_position < 2:
+        calibration_folds = sorted({
+            int(day['fold']) for day in calibration_days
+        })
+        if len(calibration_folds) < forward_min_calibration_folds:
             policy = dict(fallback_policy)
-            calibration_mode = 'warmup_fallback_requires_two_earlier_folds'
+            calibration_mode = 'insufficient_history_fallback'
+            fallback_reason = (
+                f'需要至少{forward_min_calibration_folds}个完整历史折，当前仅'
+                f'{len(calibration_folds)}个'
+            )
         else:
-            if len({int(day['fold']) for day in calibration_days}) < 2:
-                raise ValueError(
-                    f'Fold {held_out_fold} 前没有两折已完成标签的校准日期'
-                )
             policy = calibrate_module_gated_policy(
                 calibration_days,
                 **calibration_kwargs,
@@ -4768,7 +4350,6 @@ def forward_fit_module_gated_policy(
         held_out_daily.extend(held_metrics['daily'])
         held_module_reports = {}
         for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
-            fallback = module_fallbacks[module]
             if policy[field] == fallback:
                 held_module_reports[module] = {
                     'active': False,
@@ -4900,7 +4481,6 @@ def forward_fit_module_gated_policy(
     )
     robust_deployment = dict(all_oof_candidate)
     for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
-        fallback = module_fallbacks[module]
         if not deployment_eligibility[module]['eligible']:
             robust_deployment[field] = fallback
             if module == 'risk_score':

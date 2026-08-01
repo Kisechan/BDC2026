@@ -60,20 +60,3 @@ checkpoints from different architectures or input dimensions are incompatible.
   reported.
 - Progress output must identify the active phase and advance at meaningful
   units so users can distinguish computation from a hang.
-
-## Submission and test reporting
-
-- Competition submission files named `result.csv` must contain exactly the two
-  columns `stock_id,weight`, in that order. Do not add names, diagnostics, or
-  any other columns to the submission file.
-- `./test.sh` must always print the selected holdings as stock code, stock
-  name, and weight, even when future prices are unavailable and realized-return
-  scoring is correctly refused. Read names from `hs300_stock_list.csv` and use
-  `未知` only when a mapping is genuinely unavailable.
-- Human-readable diagnostics belong in terminal output or diagnostic/report
-  artifacts; they must never alter the competition submission schema.
-- The final deadline requires both reproducible code and `result.csv`. A
-  2026-07-31 holding has no completed future holding-period label: never use
-  its realized return to validate, tune, select weights, or claim backtest
-  performance. Any final allocation decision must use only earlier resolved
-  OOF labels.

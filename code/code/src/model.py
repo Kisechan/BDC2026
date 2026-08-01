@@ -60,36 +60,6 @@ class FeatureAttention(nn.Module):
         attended = torch.sum(x * attention_weights, dim=1)  # [batch*num_stocks, d_model]
         return self.dropout(attended)
 
-
-class RankGLUHead(nn.Module):
-    """线性排序基线加受限 GLU 残差，保持输出为每股一个分数。"""
-    def __init__(self, input_dim, bottleneck, gamma_init, gamma_max):
-        super().__init__()
-        if bottleneck < 1 or not 0.0 < gamma_init < gamma_max:
-            raise ValueError('RankGLU bottleneck 或 gamma 配置不合法')
-        self.norm = nn.LayerNorm(input_dim)
-        self.base = nn.Linear(input_dim, 1)
-        self.value = nn.Linear(input_dim, bottleneck)
-        self.gate = nn.Linear(input_dim, bottleneck)
-        self.residual = nn.Linear(bottleneck, 1)
-        self.gamma_max = float(gamma_max)
-        initial_ratio = float(gamma_init) / self.gamma_max
-        self.gamma_raw = nn.Parameter(torch.tensor(
-            math.atanh(initial_ratio), dtype=torch.float32,
-        ))
-
-    @property
-    def gamma(self):
-        """有界残差系数，暴露为属性便于 manifest/测试审计。"""
-        return self.gamma_max * torch.tanh(self.gamma_raw)
-
-    def forward(self, features):
-        normalized = self.norm(features)
-        residual = self.residual(
-            self.value(normalized) * torch.sigmoid(self.gate(normalized))
-        )
-        return self.base(normalized) + self.gamma * residual
-
 class StockTransformer(nn.Module):
     def __init__(self, input_dim, config, num_stocks, emb_dim=None):
         super(StockTransformer, self).__init__()
@@ -145,25 +115,13 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'])
         )
         
-        # v1.19 仅替换排序头；旧工件仍按原始 MLP 头加载。
-        rank_dim = config['d_model'] // 2
-        self.score_head_variant = config.get('score_head_variant', 'mlp_v1')
-        if self.score_head_variant == 'rankglu_v1':
-            self.score_head = RankGLUHead(
-                rank_dim,
-                int(config.get('rankglu_bottleneck', 32)),
-                float(config.get('rankglu_gamma_init', 0.05)),
-                float(config.get('rankglu_gamma_max', 0.5)),
-            )
-        elif self.score_head_variant == 'mlp_v1':
-            self.score_head = nn.Sequential(
-                nn.Linear(rank_dim, config['d_model'] // 4),
-                nn.ReLU(),
-                nn.Dropout(config['dropout'] * 0.5),
-                nn.Linear(config['d_model'] // 4, 1),
-            )
-        else:
-            raise ValueError(f'不支持的 score_head_variant: {self.score_head_variant}')
+        # 最终排序分数输出
+        self.score_head = nn.Sequential(
+            nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
+            nn.ReLU(),
+            nn.Dropout(config['dropout'] * 0.5),
+            nn.Linear(config['d_model'] // 4, 1)
+        )
         self.risk_heads_enabled = bool(
             config.get('risk_heads_enabled', False)
         )
@@ -184,13 +142,6 @@ class StockTransformer(nn.Module):
         )
         self.tail_5d_head_enabled = bool(
             config.get('tail_5d_head_enabled', False)
-        )
-        # V17 的两个辅助目标默认关闭，因而旧 checkpoint/config 保持兼容。
-        self.industry_residual_head_enabled = bool(
-            config.get('industry_residual_head_enabled', False)
-        )
-        self.path_loss_5d_head_enabled = bool(
-            config.get('path_loss_5d_head_enabled', False)
         )
         self.tail_5d_blend = float(
             config.get('tail_5d_blend', 0.0)
@@ -244,15 +195,6 @@ class StockTransformer(nn.Module):
                     nn.Dropout(config['dropout'] * 0.5),
                     nn.Linear(risk_head_hidden, 1),
                 )
-            if self.path_loss_5d_head_enabled:
-                self.path_loss_5d_head = nn.Sequential(
-                    nn.Linear(risk_head_input, risk_head_hidden),
-                    nn.ReLU(),
-                    nn.Dropout(config['dropout'] * 0.5),
-                    nn.Linear(risk_head_hidden, 1),
-                )
-        elif self.path_loss_5d_head_enabled:
-            raise ValueError('path_loss_5d_head_enabled 需要 risk_heads_enabled=True')
         if self.regime_gate_enabled:
             regime_feature_indices = [
                 int(index)
@@ -296,13 +238,6 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1),
         )
-        if self.industry_residual_head_enabled:
-            self.industry_residual_head = nn.Sequential(
-                nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
-                nn.ReLU(),
-                nn.Dropout(config['dropout'] * 0.5),
-                nn.Linear(config['d_model'] // 4, 1),
-            )
 
         # Top-k 内相对仓位分配头；输出 logits，推理时经 softmax 后乘总仓位。
         self.allocation_head = nn.Sequential(
@@ -528,8 +463,6 @@ class StockTransformer(nn.Module):
         risk_3d_logits = None
         risk_5d_logits = None
         tail_5d_logits = None
-        path_loss_5d_output = None
-        industry_residual_returns = None
         combined_risk = None
         if self.risk_heads_enabled:
             risk_1d_logits = self.risk_1d_head(flat_features).view(
@@ -548,10 +481,6 @@ class StockTransformer(nn.Module):
                 tail_5d_logits = self.tail_5d_head(
                     flat_features
                 ).view(batch_size, num_stocks)
-            if self.path_loss_5d_head_enabled:
-                path_loss_5d_output = self.path_loss_5d_head(
-                    flat_features
-                ).view(batch_size, num_stocks)
             combined_risk = (
                 self.risk_1d_blend * torch.sigmoid(risk_1d_logits)
                 + self.risk_3d_blend * torch.sigmoid(risk_3d_logits)
@@ -566,10 +495,6 @@ class StockTransformer(nn.Module):
                     combined_risk
                     + self.tail_5d_blend * torch.sigmoid(tail_5d_logits)
                 )
-        if self.industry_residual_head_enabled:
-            industry_residual_returns = self.industry_residual_head(
-                flat_features
-            ).view(batch_size, num_stocks)
 
         regime_gate = raw_score_output.new_zeros(batch_size)
         if self.regime_gate_enabled:
@@ -752,8 +677,6 @@ class StockTransformer(nn.Module):
                     'risk_3d_logits': risk_3d_logits,
                     'risk_5d_logits': risk_5d_logits,
                     'tail_5d_logits': tail_5d_logits,
-                    'path_loss_5d_output': path_loss_5d_output,
-                    'industry_residual_returns': industry_residual_returns,
                     'combined_risk': combined_risk,
                     'regime_gate': regime_gate,
                     'exposure_base_probability': base_exposure_probability,

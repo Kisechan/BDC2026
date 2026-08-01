@@ -49,66 +49,17 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v1.22 使用 205维 `158+39_reduced25_relmarket12_risk15_indresid12` 与独立的近期窗口
-Top-5 LambdaRank LightGBM；冻结 v1.20.1 Transformer 工件只用于特征/Scaler/Allocation Head 推理，
-不会重训 Transformer，也不复用或覆盖旧版本树模型或策略工件。除五年行情外，需准备
-`data_5y/stock_industry_history.csv`，其中必须包含 `effective_date,stock_id,industry`；特征只使用
-预测日期当日或之前的行业快照。运行 `./train.sh` 后，模型工件根目录必须同时保留 `config.json`、
-`scaler.pkl`、`stockid2idx.json`、checkpoint、LightGBM 模型和 `artifact_manifest.json`。
+当前 v1.17 使用历史行业快照，但不把行业代码或名称输入 Transformer。首次训练前
+先运行：
 
-`artifact_manifest.json` 的 `feature_count` 必须为205；v1.21 还记录冻结来源哈希、内层日期边界、
-目标定义和各折树数。推理会校验205维列名顺序，而不仅是列数。
-`./test.sh` 会在特征工程前检查 manifest、Scaler、checkpoint 输入宽度、RankGLU 头和股票 embedding；
-不得把 v1.16 的193维或旧 MLP score-head 工件接入 v1.20。
-旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
-
-在 `code/` 目录执行 `./train.sh` 开始 v1.22 单种子三折 tree-only 训练。每折先在最近504个训练日内
-以最后40个交易日做内层早停验证，并在其前 purge 5 日；树数确定后才以完整外层训练窗口重训，外层验证
-只用于 OOF 评分。每日官方 T+1 开盘至 T+5 开盘收益的前五名为二元 relevance 正类，LightGBM 固定
-`lambdarank`、`ndcg@5`、truncation=8。v1.22 只比较五只等权、75/25 等权/Allocation Head 与
-50/50 等权/Allocation Head 三个预注册候选，权重被投影到每只 5%--35%。F1 强制等权，F2 只用 F1、
-F3 与最终策略只用 F1/F2 的已实现标签；未通过 +10bp、逐折不差、P10/最差日 10bp 护栏时回退等权。
-行业、风险和 Exposure 调整关闭。训练完成后查看 `promotion_criteria.passed` 和
-`allocation_weight_protocol`；最大回撤只作诊断。
-
-最终提交前，在 candidate 已通过后运行一次：
-
-```bash
-FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh
-./test.sh
+```
+python get_stock_data.py --industry-only --start-date 2021-01-01 \
+  --end-date 2026-07-20 --output-dir ./data_5y
 ```
 
-最终树模型只使用截至 2026-07-24 已完整实现标签的最近 504 个交易日；7 月 31 日只用于 as-of 推理。
-`test.sh` 默认优先选择独立的 `v1.22_submission_2026-07-31` 工件。它会显示代码、名称、最终权重和
-Allocation Head 原始相对权重，但 `output/result.csv` 始终只有 `stock_id,weight` 两列。若赛事挂载的是
-`data/stock_data.csv`，推理会自动优先使用它；本地 `train.csv` 仍兼容。
-
-2026-06-01～2026-07-29（包括 7 月 24 日历史审计）已消费，只能作为 v1.21 的只读压力诊断：
-
-```bash
-KNOWN_STRESS_EVAL=1 ./train.sh
-```
-
-结果原子写入 `observed_stress_report.json`，仅报告相对 v1.17 的收益、P10 和最大回撤，绝不授权
-最终部署。只有在 2026-07-29 之后新增数据已形成新的最后两个自然月时，才可运行：
-
-```bash
-LOCKBOX_EVAL=1 ./train.sh
-```
-
-旧数据会被硬拒绝。新的 `lockbox_report.json` 通过后，才可以运行：
-
-```bash
-V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh
-```
-
-新的未见锁箱通过前，v1.21 会拒绝最终提交重训；当前 v1.17 仍是唯一部署候选。
-`test.sh` 只在具有完整未来五日开盘价时计算官方收益；输出股票名称、逐股收益、严格单股最优和 Top-5
-等权 oracle。7 月 30/31 数据到齐后，先执行一次不可用于调参的历史审计：
-
-```bash
-HISTORICAL_SCORE_DATE=2026-07-24 ./test.sh
-```
+随后运行 `./train.sh` 完成单种子42三折和一次全量重训，再运行 `./test.sh`
+生成预测。策略层按 Fold 1 预热、Fold 2 仅用 Fold 1、Fold 3 仅用 Fold 1–2 的
+已完成标签严格前向校准。
 
 成功完成训练
 
@@ -122,9 +73,7 @@ windows可以直接运行`python code/src/predict.py`
 
 <img src="./asset/predict.png" alt="predict" width="50%">
 
-训练和测试都完成之后，会在output目录下生成 `result.csv` 与
-`prediction_diagnostics.json`。后者记录提交日状态、行业集中度、资金约束和风险诊断，供
-`report_metrics.py` 展示；它不参与赛事提交。
+训练和测试都完成之后，会在output目录下生成result.csv，即为预测的后五个交易日收益率最高的五个股票及权重
 
 得到result.csv之后，可以运行`python test/score_self.py`，将选手的预测股票与测试集比较，在计算出最终的加权收益率，作为选手可自行参考的得分，默认保存在/temp/tmp.csv。
 
@@ -132,8 +81,7 @@ windows可以直接运行`python code/src/predict.py`
 
 <img src="./asset/score.png" alt="score" width="50%">
 
-**注意**当前策略从 ranking score 选择最多五只股票，再使用 Allocation/Exposure 头和策略校准
-分配权重；权重和不得超过1，现金权重为 `1 - sum(weight)`。
+**注意**目前代码中直接选择排序得分最高的五个股票，平均权重。选手可以自行更改代码逻辑，只要满足最多五个股票，权重之和为1即可。
 
 # 打包docker
 在训练与测试完成之后，需要首先将项目整体打包成一个docker镜像（打包），再将该镜像导出为一个.tar文件（导出），最终提交该tar文件即可，里面需要包含运行时的所有环境及依赖，具体可以参考或修改Dockerfile
