@@ -438,12 +438,37 @@ def print_prediction_diagnostics() -> None:
     daily = diagnostics.get("daily")
     if not isinstance(daily, list) or not daily:
         daily = [_legacy_prediction_day(diagnostics)]
+    stock_names = load_stock_names(config['data_path'])
+    result_path = os.path.join(prediction_output_dir(), 'result.csv')
+    holding_weights = {}
+    if os.path.exists(result_path):
+        try:
+            result = pd.read_csv(result_path, dtype={'stock_id': str})
+            if result.columns.tolist() == ['stock_id', 'weight']:
+                holding_weights = dict(zip(
+                    _normalize_ids(result['stock_id']),
+                    pd.to_numeric(result['weight'], errors='coerce'),
+                ))
+        except (OSError, ValueError, pd.errors.ParserError):
+            # 推理诊断仍应可用；写盘约束由 predict.py 单独严格校验。
+            holding_weights = {}
     print("\n[推理逐日状态]")
     for day in daily:
         state = day.get("portfolio_state", {})
         funding = day.get("funding_constraints", {})
         risk = day.get("risk_state", {})
-        print(f"{day.get('date', '-')}: {', '.join(day.get('stock_ids', [])) or '-'}")
+        stock_ids = [_normalize_ids(pd.Series([stock_id])).iat[0]
+                     for stock_id in day.get('stock_ids', [])]
+        print(f"{day.get('date', '-')}: {', '.join(stock_ids) or '-'}")
+        if stock_ids:
+            print('  持仓—代码 / 名称 / 权重:')
+            for stock_id in stock_ids:
+                weight = holding_weights.get(stock_id)
+                weight_text = _pct(float(weight)) if pd.notna(weight) else '-'
+                print(
+                    f"    {stock_id} / {stock_names.get(stock_id, '未知')} / "
+                    f"{weight_text}"
+                )
         print(
             "  状态—"
             f"Top-5变化={state.get('raw_top5_changed', '-')}, "
