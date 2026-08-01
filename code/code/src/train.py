@@ -6050,6 +6050,9 @@ def run_v22_allocation_tree_only(full_df, full_data, features, folds, output_dir
         key: value for key, value in cross_metrics.items()
         if key not in {'daily', 'folds'}
     })
+    summary['weighted_portfolio_positive_rate'] = float(
+        cross_metrics['positive_rate']
+    )
     atomic_write_json(os.path.join(output_dir, 'cross_validation_summary.json'), summary)
     print(
         'v1.22 严格前向权重选择：'
