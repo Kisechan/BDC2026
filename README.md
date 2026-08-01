@@ -4,7 +4,7 @@
 
 - **赛题**：基于沪深300成分股历史日线行情，预测未来一周收益最大的 ≤5 只股票组合（T+1 开盘买入、T+5 开盘卖出），权重累加和 ≤ 1，按组合收益率 `R_total = Σ wᵢ × (P_open,T+5 − P_open,T+1) / P_open,T+1` 排名。
 - **提交格式**：`result.csv`，仅两列 `stock_id,weight`（UTF-8）。
-- **比赛文档**：见 [docs/](docs/)（大赛介绍、赛制、赛题数据、提交评审、晋级奖项、参赛须知）。
+- **比赛文档**：官方大赛介绍、赛制、提交评审等资料存放在本地 `docs/`（未纳入版本库），可到[比赛页面](https://www.heywhale.com/org/r9xi8/competition/area/69c0dfa34f302f8f0122e1bb/content)查看。
 
 ## 技术方案
 
@@ -27,18 +27,18 @@
 ## 目录结构
 
 ```
-├── docs/               # 比赛官方文档与赛制说明
 ├── code/
 │   ├── code/src/       # config.py / model.py / train.py / predict.py / utils.py / report_metrics.py
-│   ├── data/           # 行情数据（data_5y/train.csv 等）
-│   ├── model/          # 训练工件：checkpoint、scaler、OOF 策略与报告（按实验分目录）
-│   ├── output/         # 推理结果与诊断
+│   ├── asset/          # 使用说明截图
 │   ├── test/           # 回归测试
 │   ├── get_stock_data.py  # Baostock 数据抓取（沪深300 日线）
 │   ├── train.sh / test.sh # 训练 / 推理入口
-│   └── Dockerfile      # 比赛 docker 复现环境
+│   ├── Dockerfile / docker-compose.yml  # 比赛 docker 复现环境
+│   └── pyproject.toml / uv.lock
 └── AGENTS.md           # 项目工程约定
 ```
+
+> 行情数据、训练工件与推理输出（`data*/`、`model/`、`output/`、`temp/` 等）由 `.gitignore` 排除，不入库：数据需自行用 `get_stock_data.py` 抓取（或放置五年训练集 `data_5y/train.csv`），训练与推理产物在本地按实验目录生成。
 
 ## 快速开始
 
@@ -52,6 +52,8 @@ source .venv/bin/activate
 ./train.sh          # 训练当前 v1.22 工件（三折内层早停 → 外层重训 → OOF 评估）
 ./test.sh           # 生成 output/result.csv 并打印持仓（股票代码/名称/权重）
 ```
+
+训练在双卡 RTX 2080Ti 服务器上约 50 分钟完成（当前 v1.22 为纯 LightGBM 重训，不含 Transformer 训练；如需完整四阶段 Transformer 训练，参考 `code/code/src/train.py` 的 `ensemble_enabled` 与历史版本说明）。
 
 最终提交重训（写入隔离部署目录）：
 
