@@ -6044,6 +6044,12 @@ def run_v22_allocation_tree_only(full_df, full_data, features, folds, output_dir
         'worst_fold_weighted_portfolio_return': cross_metrics['worst_fold_weighted_portfolio_return'],
         'mean_rank_ic': cross_metrics['mean_rank_ic'],
     }
+    # report_metrics.py 与历史工件都从顶层读取组合统计；保留 LGBM 折元数据，
+    # 但同步暴露严格前向实际留出策略的全部汇总字段。
+    summary.update({
+        key: value for key, value in cross_metrics.items()
+        if key not in {'daily', 'folds'}
+    })
     atomic_write_json(os.path.join(output_dir, 'cross_validation_summary.json'), summary)
     print(
         'v1.22 严格前向权重选择：'

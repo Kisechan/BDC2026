@@ -1841,6 +1841,8 @@ def build_ensemble_portfolio(
     return {
         'top_indices': top_indices,
         'positions': positions,
+        # 保留 Head softmax，供提交诊断显示；不参与二次计算或选型。
+        'learned_weights': learned_weights,
         'relative_weights': relative_weights,
         'ensemble_scores': ensemble_scores,
         'raw_ensemble_scores': raw_ensemble_scores,
