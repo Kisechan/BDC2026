@@ -49,9 +49,9 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v1.21 使用 205维 `158+39_reduced25_relmarket12_risk15_indresid12` 与独立的近期窗口
-Top-5 LambdaRank LightGBM；冻结 v1.20.1 Transformer 工件只用于特征/Scaler/推理兼容，不会重训
-Transformer，也不复用或覆盖 v1.17/v1.19/v1.20.1 的树模型或策略工件。除五年行情外，需准备
+当前 v1.22 使用 205维 `158+39_reduced25_relmarket12_risk15_indresid12` 与独立的近期窗口
+Top-5 LambdaRank LightGBM；冻结 v1.20.1 Transformer 工件只用于特征/Scaler/Allocation Head 推理，
+不会重训 Transformer，也不复用或覆盖旧版本树模型或策略工件。除五年行情外，需准备
 `data_5y/stock_industry_history.csv`，其中必须包含 `effective_date,stock_id,industry`；特征只使用
 预测日期当日或之前的行业快照。运行 `./train.sh` 后，模型工件根目录必须同时保留 `config.json`、
 `scaler.pkl`、`stockid2idx.json`、checkpoint、LightGBM 模型和 `artifact_manifest.json`。
@@ -62,12 +62,26 @@ Transformer，也不复用或覆盖 v1.17/v1.19/v1.20.1 的树模型或策略工
 不得把 v1.16 的193维或旧 MLP score-head 工件接入 v1.20。
 旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
 
-在 `code/` 目录执行 `./train.sh` 开始 v1.21 单种子三折 tree-only 训练。每折先在最近504个训练日内
+在 `code/` 目录执行 `./train.sh` 开始 v1.22 单种子三折 tree-only 训练。每折先在最近504个训练日内
 以最后40个交易日做内层早停验证，并在其前 purge 5 日；树数确定后才以完整外层训练窗口重训，外层验证
 只用于 OOF 评分。每日官方 T+1 开盘至 T+5 开盘收益的前五名为二元 relevance 正类，LightGBM 固定
-`lambdarank`、`ndcg@5`、truncation=8。组合固定为五只各 0.1999998、总仓位0.999999；行业、风险、
-Allocation 和 Exposure 调整均关闭。训练完成后查看 `promotion_criteria.passed`，它比较同仓位的冻结
-v1.17 纯排序基线；最大回撤只作诊断。
+`lambdarank`、`ndcg@5`、truncation=8。v1.22 只比较五只等权、75/25 等权/Allocation Head 与
+50/50 等权/Allocation Head 三个预注册候选，权重被投影到每只 5%--35%。F1 强制等权，F2 只用 F1、
+F3 与最终策略只用 F1/F2 的已实现标签；未通过 +10bp、逐折不差、P10/最差日 10bp 护栏时回退等权。
+行业、风险和 Exposure 调整关闭。训练完成后查看 `promotion_criteria.passed` 和
+`allocation_weight_protocol`；最大回撤只作诊断。
+
+最终提交前，在 candidate 已通过后运行一次：
+
+```bash
+FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh
+./test.sh
+```
+
+最终树模型只使用截至 2026-07-24 已完整实现标签的最近 504 个交易日；7 月 31 日只用于 as-of 推理。
+`test.sh` 默认优先选择独立的 `v1.22_submission_2026-07-31` 工件。它会显示代码、名称、最终权重和
+Allocation Head 原始相对权重，但 `output/result.csv` 始终只有 `stock_id,weight` 两列。若赛事挂载的是
+`data/stock_data.csv`，推理会自动优先使用它；本地 `train.csv` 仍兼容。
 
 2026-06-01～2026-07-29（包括 7 月 24 日历史审计）已消费，只能作为 v1.21 的只读压力诊断：
 

@@ -44,6 +44,18 @@
 历史低仓位策略；门槛仍为平均收益 +10bp、两折正增益、P10/最差折 -10bp 护栏和 Rank IC -0.005 护栏。
 `test.csv` 缺少未来完整价格时会硬拒绝收益结论。
 
+### v1.22 严格前向 Allocation Head 权重
+
+v1.22 保留 v1.21 的纯 LightGBM Top-5 选股，只重放冻结 v1.20.1 Transformer 的 Allocation Head。
+候选仅为等权、25% Allocation 混合和 50% Allocation 混合，且混合权重投影到每只 5%--35%。Fold 1 固定
+等权，Fold 2 只能读取 Fold 1 标签，Fold 3 和最终部署只能读取 Fold 1--2；非等权须较等权至少 +10bp、
+各校准折不差、P10 和最差日不恶化超过 10bp 才会启用。否则部署明确回退等权，绝不使用 2026-07-31
+的未知未来收益调权。
+
+候选通过后运行 `FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh` 创建隔离的最终树模型。
+该模型只以截至 2026-07-24 已完成标签的最近 504 日拟合；7 月 31 日仅用作推理 as-of。`test.sh` 优先使用
+最终目录，并可自动从赛事挂载的 `stock_data.csv` 或本地 `train.csv` 读取行情。
+
 ---
 
 ## 2. 代码结构说明
