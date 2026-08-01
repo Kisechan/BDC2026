@@ -60,13 +60,22 @@ def print_cross_validation() -> None:
     print(f"平均 Top-5 收益: {_pct(float(summary['mean_top5_return']))}")
     print(f"最差折 Top-5 收益: {_pct(float(summary['worst_fold_top5_return']))}")
     if "mean_weighted_portfolio_return" in summary:
+        portfolio_label = (
+            '平均固定等权组合收益'
+            if summary.get('fixed_equal_top5_policy', False)
+            else '平均动态权重组合收益'
+        )
         print(
-            "平均动态权重组合收益: "
+            f"{portfolio_label}: "
             f"{_pct(float(summary['mean_weighted_portfolio_return']))}"
         )
         print(
-            "最差折动态权重组合收益: "
-            f"{_pct(float(summary['worst_fold_weighted_portfolio_return']))}"
+            (
+                '最差折固定等权组合收益: '
+                if summary.get('fixed_equal_top5_policy', False)
+                else '最差折动态权重组合收益: '
+            )
+            + _pct(float(summary['worst_fold_weighted_portfolio_return']))
         )
         if 'max_drawdown' in summary:
             print(
@@ -80,8 +89,12 @@ def print_cross_validation() -> None:
         )
         if "p10_weighted_portfolio_return" in summary:
             print(
-                "动态组合收益 P10/标准差/正收益率: "
-                f"{_pct(float(summary['p10_weighted_portfolio_return']))} / "
+                (
+                    '固定等权组合收益 P10/标准差/正收益率: '
+                    if summary.get('fixed_equal_top5_policy', False)
+                    else '动态组合收益 P10/标准差/正收益率: '
+                )
+                + f"{_pct(float(summary['p10_weighted_portfolio_return']))} / "
                 f"{float(summary['std_weighted_portfolio_return']):.4%} / "
                 f"{float(summary['weighted_portfolio_positive_rate']):.2%}"
             )
@@ -296,6 +309,35 @@ def print_cross_validation() -> None:
                 f"P10={_pct(float(metrics.get('p10_weighted_portfolio_return', 0.0)))}, "
                 f"Rank IC={float(metrics.get('mean_rank_ic', 0.0)):+.4f}, "
                 f"晋级={'PASS' if gate.get('passed') else 'FAIL'}"
+            )
+    score_only_baseline = summary.get('score_only_baseline')
+    if score_only_baseline:
+        print(
+            '同仓位 v1.17 纯排序基线—'
+            f"收益 {_pct(float(score_only_baseline['mean_weighted_portfolio_return']))}，"
+            f"P10 {_pct(float(score_only_baseline['p10_weighted_portfolio_return']))}，"
+            f"Rank IC {float(score_only_baseline['mean_rank_ic']):+.4f}"
+        )
+        candidate_folds = {
+            int(row['fold']): row
+            for row in summary.get('ensemble_oof', {}).get('folds', [])
+        }
+        baseline_folds = {
+            int(row['fold']): row
+            for row in score_only_baseline.get('folds', [])
+        }
+        for fold_id in sorted(candidate_folds):
+            candidate_fold = candidate_folds[fold_id]
+            baseline_fold = baseline_folds.get(fold_id, {})
+            delta = (
+                float(candidate_fold['mean_weighted_portfolio_return'])
+                - float(baseline_fold.get('mean_weighted_portfolio_return', 0.0))
+            )
+            print(
+                f"  纯排序 Fold {fold_id}: "
+                f"候选 {_pct(float(candidate_fold['mean_weighted_portfolio_return']))}，"
+                f"基线 {_pct(float(baseline_fold.get('mean_weighted_portfolio_return', 0.0)))}，"
+                f"差值 {_pct(delta)}"
             )
     if 'industry_constraint_application_rate' in summary:
         print(

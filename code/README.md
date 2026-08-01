@@ -15,7 +15,7 @@
 1. 读取五年历史行情数据（当前为 `data_5y/train.csv`）与行业历史快照；
 2. 做单股量价特征工程，并增加短期反转、下行波动、市场压力和行业 as-of 残差特征；
 3. 构建5日收益主标签、1/3日软下跌标签和市场状态软标签；
-4. v1.20 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月新锁箱，每折训练/验证之间 purge 5 日；
+4. v1.21 用固定随机种子 `42` 构造三折 walk-forward 验证、2个月新锁箱，每折训练/验证之间 purge 5 日；
 5. Ranking阶段仅优化平滑Listwise、收益差加权LambdaRank@5、Rank IC和原始收益
    回归；随后冻结Ranking主干，独立训练1/3/5日软风险头、5日尾部事件头和市场状态门控；
 6. 验证期从末端每隔 5 个交易日抽取非重叠锚点；策略晋级采用三折嵌套 OOF，
@@ -27,23 +27,22 @@
 三随机种子集成仍作为可选实验保留。只有将 `ensemble_enabled=True` 后，程序才会
 使用 `ensemble_seeds`，运行三种子 × 三折并训练三个最终模型；默认训练不会产生九折开销。
 
-### v1.20.1 官方开盘收益 + 原始收益选股
+### v1.21 严格 Top-5 LambdaRank
 
-当前实验 `threefold_recent504_rankxendcg_indcap_v20` 保持 205 维
-`158+39_reduced25_relmarket12_risk15_indresid12` 输入、单种子 42、三折和 5 日 purge。
-Transformer 仅将排序头替换为 RankGLU：`LayerNorm → Linear` 的基础分数，加上 bottleneck=32
-的 GLU 残差；可学习 `gamma` 经 `0.5*tanh()` 限制在 `[-0.5, 0.5]`。manifest 会记录
-`score_head_variant=rankglu_v1`、bottleneck 和上界，推理拒绝旧 MLP checkpoint。
+当前实验 `threefold_recent504_lambdarank_top5_strict_v21` 保持 205 维
+`158+39_reduced25_relmarket12_risk15_indresid12`、单种子 42、三折、5 日 purge 和近期 504 日窗口。
+它不重训 Transformer：冻结的 v1.20.1 RankGLU 工件只提供兼容的特征/Scaler/推理 checkpoint；v1.21
+唯一重训的是独立目录中的 LightGBM。
 
-LightGBM 使用 `rank_xendcg`，每个交易日一个 query group，并将赛事官方的五日绝对收益
-`(open_t5-open_t1)/open_t1` 固定离散成 10 档 relevance；每个验证折只使用 `train_end` 前最后
-**504 个交易日**，全开发期树模型也使用最后 504 个开发交易日。选股固定为纯 LightGBM、原始
-Top-5、等权与近满仓；行业约束、Allocation、Exposure、风险惩罚、反转和相关性调整均关闭。
+每个交易日按官方 `open_t5 / open_t1 - 1` 排名，恰好前五只的 relevance 为 `1`，其余为 `0`；
+`LGBMRanker(lambdarank)` 固定 `ndcg@5`、`lambdarank_truncation_level=8`、`label_gain=[0,1]`。
+每个外层折先在最近 504 个训练日内切出最后 40 个交易日作内层早停验证，并 purge 5 日；随后用选出的
+树数在完整外层训练窗口重训，外层验证集只评分，绝不参与早停。
 
-候选相对冻结 v1.17 三折 baseline 的晋级条件为：官方口径组合平均收益至少 +10bp、至少两折正增益、
-P10 与最差折均不差于 -10bp、平均 Rank IC 不低于 -0.005；最差单日和最大回撤只作诊断。
-`cross_validation_summary.json` 还会写入行业约束的收益差/集中度，以及按每折训练期中位数划分的四类
-市场状态诊断；这些状态不参与选型。`test.csv` 若不含预测日之后的价格会被硬拒绝，不作为收益结论。
+组合固定为纯 LightGBM 原始 Top-5、五只各 `0.1999998`、总仓位 `0.999999`。Allocation、Exposure、
+风险、反转、相关性和行业约束均关闭。晋级基线是冻结 v1.17 OOF 的相同满仓等权纯排序重放，而不是其
+历史低仓位策略；门槛仍为平均收益 +10bp、两折正增益、P10/最差折 -10bp 护栏和 Rank IC -0.005 护栏。
+`test.csv` 缺少未来完整价格时会硬拒绝收益结论。
 
 ---
 
@@ -262,19 +261,18 @@ EMA 类特征还带有更早历史的衰减影响。直接改成90或120会增�
 
 `source .venv/bin/activate`
 
-3) 训练当前 v1.20.1 工件（RankGLU、近期504日官方绝对收益 `rank_xendcg`、205维 manifest、Scaler 和 checkpoint）
+3) 训练当前 v1.21 工件（仅近期504日严格 Top-5 LambdaRank；不会运行 Transformer epoch）
 
 ```
 ./train.sh
 ```
 
-训练会在默认 candidate 目录完成三折固定纯 LightGBM 评估；先检查
+训练会在默认 candidate 目录完成三折内层早停、外层重训和外层评分；先检查
 `cross_validation_summary.json` 的 `promotion_criteria.passed`。已知的 2026-06-01～2026-07-29
-只能用 `STRESS_EVAL=1 ./train.sh` 写入压力诊断，不能授权部署。新的最后两自然月数据到来后，
+只能用 `KNOWN_STRESS_EVAL=1 ./train.sh` 写入压力诊断，不能授权部署。新的最后两自然月数据到来后，
 `LOCKBOX_EVAL=1 ./train.sh` 才可产生可授权的 `lockbox_report.json`；通过后才可运行
 `V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh`。最终重训始终写入独立
-`v1.20.1_full_history_deployment` 目录，并复用新锁箱前冻结的策略、epoch 与 LightGBM 迭代数，不再执行
-OOF 或策略标定；禁止据此再调参。
+`v1.21_full_history_deployment` 目录；在新的未见锁箱到来之前，v1.21 会硬拒绝最终提交重训。
 
 4) 生成预测结果
 
@@ -282,16 +280,10 @@ OOF 或策略标定；禁止据此再调参。
 ./test.sh
 ```
 
-数据补齐至 2026-07-31 后，先运行不可用于调参的官方口径审计：
+7 月 24 日审计已经消费，只能保留既有报告，不能据它调参：
 
 ```
-HISTORICAL_SCORE_DATE=2026-07-24 ./test.sh
-```
-
-candidate 晋级且审计完成后，可执行一次截至 7 月 31 日的最终提交拟合：
-
-```
-FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh
+KNOWN_STRESS_EVAL=1 ./train.sh
 ```
 
 ---

@@ -62,6 +62,12 @@ def stress_eval_enabled():
     }
 
 
+def known_stress_eval_enabled():
+    return os.environ.get('KNOWN_STRESS_EVAL', '0').strip().lower() in {
+        '1', 'true', 'yes', 'on',
+    }
+
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -336,14 +342,15 @@ def run_lockbox_eval(output_dir, stress=False):
         raise FileExistsError(f'锁箱报告已存在，拒绝第二次运行: {report_path}')
     policy_path = os.path.join(output_dir, 'ensemble_policy.json')
     manifest_path = os.path.join(output_dir, 'artifact_manifest.json')
-    for path, label in ((policy_path, 'v1.20 策略'), (manifest_path, 'v1.20 manifest')):
+    experiment_label = str(config.get('experiment_name', 'candidate'))
+    for path, label in ((policy_path, '候选策略'), (manifest_path, '候选 manifest')):
         if not os.path.isfile(path):
             raise FileNotFoundError(f'LOCKBOX_EVAL 需要{label}: {path}')
     with open(policy_path, encoding='utf-8') as handle:
         policy = json.load(handle)
     promotion = policy.get('promotion_criteria', {})
-    if not promotion.get('passed', False):
-        raise ValueError('v1.20 开发期未晋级，评估回放被拒绝')
+    if not stress and not promotion.get('passed', False):
+        raise ValueError('开发期未晋级，新的 lockbox 评估被拒绝')
     with open(manifest_path, encoding='utf-8') as handle:
         manifest = json.load(handle)
     lockbox_start_raw = manifest.get('lockbox_start')
@@ -394,7 +401,7 @@ def run_lockbox_eval(output_dir, stress=False):
     )
     candidates = {
         'v1.17_baseline': baseline_dir,
-        'v1.20_candidate': os.path.abspath(output_dir),
+        'candidate': os.path.abspath(output_dir),
     }
     records = {name: [] for name in candidates}
     total_steps = len(anchors) * len(candidates)
@@ -447,7 +454,7 @@ def run_lockbox_eval(output_dir, stress=False):
         for name, rows in records.items()
     }
     baseline_stats = results['v1.17_baseline']
-    candidate_stats = results['v1.20_candidate']
+    candidate_stats = results['candidate']
     mean_passed = (
         candidate_stats['mean_return'] >= baseline_stats['mean_return']
         if stress else candidate_stats['mean_return'] > baseline_stats['mean_return']
@@ -459,8 +466,8 @@ def run_lockbox_eval(output_dir, stress=False):
     )
     report = {
         'protocol': (
-            'v1.20.1_observed_stress_t_plus_1_open_to_t_plus_5_open_stride_5'
-            if stress else 'v1.20.1_fresh_lockbox_t_plus_1_open_to_t_plus_5_open_stride_5'
+            f'{experiment_label}_observed_stress_t_plus_1_open_to_t_plus_5_open_stride_5'
+            if stress else f'{experiment_label}_fresh_lockbox_t_plus_1_open_to_t_plus_5_open_stride_5'
         ),
         'lockbox_start': lockbox_start.strftime('%Y-%m-%d'),
         'lockbox_end': (
@@ -471,8 +478,8 @@ def run_lockbox_eval(output_dir, stress=False):
         'selected_candidate': policy.get('candidate_name'),
         'hashes': {
             'train_csv': sha256_file(data_file),
-            'v1.20_policy': sha256_file(policy_path),
-            'v1.20_manifest': sha256_file(manifest_path),
+            'candidate_policy': sha256_file(policy_path),
+            'candidate_manifest': sha256_file(manifest_path),
             'v1.17_policy': sha256_file(baseline_policy),
         },
         'results': results,
@@ -697,6 +704,33 @@ def lgbm_relevance_labels(frame, target_column=None):
     target_column = target_column or config.get('lgbm_target_column', 'label')
     if target_column not in frame:
         raise ValueError(f'LightGBM relevance 缺少目标列: {target_column}')
+    if config.get('lgbm_label_mode') == 'top5_binary':
+        top_k = int(config.get('lgbm_top_k', 5))
+        if top_k < 1:
+            raise ValueError('lgbm_top_k 必须为正整数')
+        stock_column = (
+            'instrument' if 'instrument' in frame
+            else '股票代码' if '股票代码' in frame else None
+        )
+        ranked = frame.loc[:, ['日期', target_column]].copy()
+        ranked['_source_index'] = frame.index
+        # 收益并列时按股票唯一键排序，确保每次训练得到完全相同的 Top-5 标签。
+        ranked['_stock_key'] = (
+            frame[stock_column].astype(str).to_numpy()
+            if stock_column is not None
+            else np.arange(len(frame)).astype(str)
+        )
+        ranked = ranked.sort_values(
+            ['日期', target_column, '_stock_key'],
+            ascending=[True, False, True],
+            kind='mergesort',
+        )
+        ranked['_rank'] = ranked.groupby('日期', sort=False).cumcount()
+        labels = pd.Series(0, index=frame.index, dtype=np.int32)
+        labels.loc[ranked.loc[
+            ranked['_rank'] < top_k, '_source_index'
+        ].to_numpy()] = 1
+        return labels
     levels = int(config.get('lgbm_relevance_levels', 31))
     if levels < 2:
         raise ValueError('lgbm_relevance_levels 必须至少为2')
@@ -707,6 +741,81 @@ def lgbm_relevance_labels(frame, target_column=None):
     return np.floor(ranks * levels / group_sizes).clip(
         0, levels - 1,
     ).astype(np.int32)
+
+
+def build_lgbm_ranker(n_estimators):
+    """以配置创建排序器，集中固定 v1.21 的 Top-5 目标参数。"""
+    from lightgbm import LGBMRanker
+
+    kwargs = {
+        'objective': config.get('lgbm_objective', 'lambdarank'),
+        'metric': 'ndcg',
+        'learning_rate': config['lgbm_learning_rate'],
+        'n_estimators': int(n_estimators),
+        'num_leaves': config['lgbm_num_leaves'],
+        'min_child_samples': config['lgbm_min_child_samples'],
+        'colsample_bytree': config['lgbm_feature_fraction'],
+        'subsample': config['lgbm_bagging_fraction'],
+        'reg_lambda': config['lgbm_lambda_l2'],
+        'random_state': config['seed'],
+        'n_jobs': config['lgbm_n_jobs'],
+        'verbosity': -1,
+    }
+    if kwargs['objective'] == 'lambdarank':
+        kwargs.update({
+            'lambdarank_truncation_level': int(config[
+                'lgbm_truncation_level'
+            ]),
+            'label_gain': list(config['lgbm_label_gain']),
+        })
+    return LGBMRanker(**kwargs)
+
+
+def strict_lgbm_inner_split(frame, validation_days, purge_days):
+    """从外层训练窗口末端切出内层早停段，并显式 purge 标签持有期。"""
+    dates = np.sort(pd.to_datetime(frame['日期']).unique())
+    validation_days = int(validation_days)
+    purge_days = int(purge_days)
+    if validation_days < 1 or purge_days < 1:
+        raise ValueError('LightGBM 内层验证和 purge 天数必须为正整数')
+    if len(dates) <= validation_days + purge_days:
+        raise ValueError('LightGBM 近期训练窗口不足以切分内层验证和 purge')
+    inner_start_index = len(dates) - validation_days
+    inner_train_end_index = inner_start_index - purge_days - 1
+    if inner_train_end_index < 0:
+        raise ValueError('LightGBM 内层 purge 后训练日期为空')
+    inner_train = frame.loc[frame['日期'] <= dates[inner_train_end_index]].copy()
+    inner_valid = frame.loc[frame['日期'].isin(dates[inner_start_index:])].copy()
+    if inner_train.empty or inner_valid.empty:
+        raise ValueError('LightGBM 内层训练或验证样本为空')
+    return inner_train, inner_valid, {
+        'inner_train_start': pd.Timestamp(dates[0]).strftime('%Y-%m-%d'),
+        'inner_train_end': pd.Timestamp(dates[inner_train_end_index]).strftime('%Y-%m-%d'),
+        'inner_purge_start': pd.Timestamp(dates[inner_train_end_index + 1]).strftime('%Y-%m-%d'),
+        'inner_purge_end': pd.Timestamp(dates[inner_start_index - 1]).strftime('%Y-%m-%d'),
+        'inner_val_start': pd.Timestamp(dates[inner_start_index]).strftime('%Y-%m-%d'),
+        'inner_val_end': pd.Timestamp(dates[-1]).strftime('%Y-%m-%d'),
+        'inner_validation_days': validation_days,
+        'inner_purge_days': purge_days,
+    }
+
+
+def atomic_write_json(path, payload):
+    """原子写入可恢复的小型元数据工件。"""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix='.metadata.', suffix='.json', dir=directory,
+    )
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def lgbm_progress_callback(description, total_iterations):
@@ -885,7 +994,7 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
     if not config.get('lgbm_enabled', False):
         return []
     try:
-        from lightgbm import LGBMRanker, early_stopping
+        from lightgbm import early_stopping
     except ImportError as exc:
         raise RuntimeError('v1.20 需要 lightgbm；请在 code 目录运行 uv sync') from exc
     target_column = str(config.get('lgbm_target_column', 'label'))
@@ -925,14 +1034,7 @@ def fit_lgbm_oof_scores(data, features, folds, oof_records, output_dir):
                 f"({pd.Timestamp(train_dates[0]).date()} ~ {pd.Timestamp(train_dates[-1]).date()})，"
                 f"训练 {len(train):,} / 验证 {len(valid):,} 行"
             )
-            model = LGBMRanker(
-                objective=config.get('lgbm_objective', 'lambdarank'), metric='ndcg',
-                learning_rate=config['lgbm_learning_rate'], n_estimators=config['lgbm_n_estimators'],
-                num_leaves=config['lgbm_num_leaves'], min_child_samples=config['lgbm_min_child_samples'],
-                colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
-                reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
-                n_jobs=config['lgbm_n_jobs'], verbosity=-1,
-            )
+            model = build_lgbm_ranker(config['lgbm_n_estimators'])
             progress, update_progress = lgbm_progress_callback(
                 description, config['lgbm_n_estimators'],
             )
@@ -975,7 +1077,6 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
     """以折中位最佳轮数重训部署树模型；锁箱仍不进入数据。"""
     if not fold_results:
         return None
-    from lightgbm import LGBMRanker
     iterations = int(np.median([row['best_iteration'] for row in fold_results]))
     path = os.path.join(output_dir, 'lgbm_ranker.joblib')
     if resume_training_enabled() and os.path.isfile(path):
@@ -991,14 +1092,7 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
     labels = lgbm_relevance_labels(
         data, str(config.get('lgbm_target_column', 'label')),
     )
-    model = LGBMRanker(
-        objective=config.get('lgbm_objective', 'lambdarank'), learning_rate=config['lgbm_learning_rate'],
-        n_estimators=iterations, num_leaves=config['lgbm_num_leaves'],
-        min_child_samples=config['lgbm_min_child_samples'],
-        colsample_bytree=config['lgbm_feature_fraction'], subsample=config['lgbm_bagging_fraction'],
-        reg_lambda=config['lgbm_lambda_l2'], random_state=config['seed'],
-        n_jobs=config['lgbm_n_jobs'], verbosity=-1,
-    )
+    model = build_lgbm_ranker(iterations)
     print(
         f'阶段 LightGBM：全量开发期近期 {window_days} 日重训 '
         f'({pd.Timestamp(window_dates[0]).date()} ~ {pd.Timestamp(window_dates[-1]).date()})，'
@@ -1015,13 +1109,337 @@ def fit_lgbm_final(data, features, fold_results, output_dir):
     return os.path.basename(path)
 
 
+def _lgbm_group_sizes(frame):
+    return frame.groupby('日期', sort=False).size().to_numpy(dtype=np.int64)
+
+
+def _strict_lgbm_signature(features, fold, train_dates):
+    """绑定近期窗口、内层边界和目标定义，禁止恢复不兼容树模型。"""
+    payload = {
+        'features': list(features),
+        'fold': {
+            key: (int(value) if key == 'fold' else pd.Timestamp(value).strftime('%Y-%m-%d'))
+            for key, value in fold.items()
+        },
+        'train_dates': [pd.Timestamp(date).strftime('%Y-%m-%d') for date in train_dates],
+        'objective': config['lgbm_objective'],
+        'label_mode': config.get('lgbm_label_mode'),
+        'label_gain': config.get('lgbm_label_gain'),
+        'truncation_level': config.get('lgbm_truncation_level'),
+        'inner_validation_days': config['lgbm_inner_validation_days'],
+        'inner_purge_days': config['lgbm_inner_purge_days'],
+        'target_column': config['lgbm_target_column'],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+
+
+def _strict_lgbm_record(reference, rows, scores):
+    """以当前官方标签填充一条 OOF 排序分数记录。
+
+    冻结 v1.17 工件只提供当日股票顺序和历史模型分数；它的旧训练
+    标签不能混入官方 open-to-open 口径的 v1.21 比较。
+    """
+    targets = rows['label'].to_numpy(dtype=np.float64)
+    count = len(rows)
+    if count < int(config['lgbm_top_k']):
+        raise ValueError('v1.21 OOF 单日股票数不足 Top-5')
+    sigmoid_risk_5d = 1.0 / (1.0 + np.exp(np.clip(
+        targets / float(config.get('risk_5d_target_temperature', 0.03)),
+        -30.0, 30.0,
+    )))
+    return {
+        'prediction_date': reference['prediction_date'],
+        'label_end_date': reference['label_end_date'],
+        'stock_indices': np.asarray(reference['stock_indices'], dtype=np.int64),
+        'targets': targets,
+        'scores': np.asarray(scores, dtype=np.float64),
+        'allocation_logits': np.zeros(count, dtype=np.float64),
+        'exposure': float(config['fixed_exposure_baseline']),
+        'regime_gate': 0.5,
+        'risk_1d_probabilities': np.full(count, 0.5, dtype=np.float64),
+        'risk_3d_probabilities': np.full(count, 0.5, dtype=np.float64),
+        'risk_5d_probabilities': np.full(count, 0.5, dtype=np.float64),
+        'tail_5d_probabilities': np.full(count, 0.5, dtype=np.float64),
+        'risk_1d_targets': rows['risk_1d_target'].to_numpy(dtype=np.float64),
+        'risk_3d_targets': rows['risk_3d_target'].to_numpy(dtype=np.float64),
+        'risk_5d_targets': sigmoid_risk_5d,
+        'tail_5d_targets': rows['tail_5d_target'].to_numpy(dtype=np.float64),
+        'regime_target': float(rows['regime_target'].median()),
+    }
+
+
+def remap_oof_records_to_official_labels(records_by_fold, data):
+    """保留冻结模型分数，同时用当前官方收益标签重放 OOF。"""
+    needed = [
+        '日期', 'instrument', 'label', 'risk_1d_target', 'risk_3d_target',
+        'tail_5d_target', 'regime_target',
+    ]
+    missing = [name for name in needed if name not in data]
+    if missing:
+        raise ValueError(f'v1.21 无法重放官方标签，缺少列: {missing}')
+    lookup = data.loc[:, needed].set_index(['日期', 'instrument'])
+    remapped = {}
+    for fold_id, records in records_by_fold.items():
+        fold_records = []
+        for reference in records:
+            index = pd.MultiIndex.from_arrays([
+                np.repeat(pd.Timestamp(reference['prediction_date']), len(reference['stock_indices'])),
+                np.asarray(reference['stock_indices'], dtype=np.int64),
+            ], names=['日期', 'instrument'])
+            rows = lookup.reindex(index)
+            if rows['label'].isna().any():
+                raise ValueError(
+                    'v1.21 冻结 OOF 无法映射到官方标签: '
+                    f"{reference['prediction_date']}"
+                )
+            fold_records.append(_strict_lgbm_record(
+                reference, rows, reference['scores'],
+            ))
+        remapped[int(fold_id)] = fold_records
+    return remapped
+
+
+def load_frozen_v17_oof_records(folds, trading_dates):
+    """读取冻结 v1.17 的原始 OOF，作为同仓位纯排序基线。"""
+    source_dir = os.path.abspath(config['baseline_source_dir'])
+    summary_path = os.path.join(source_dir, 'cross_validation_summary.json')
+    policy_path = os.path.join(source_dir, 'ensemble_policy.json')
+    for path, label in ((summary_path, 'v1.17 基线摘要'), (policy_path, 'v1.17 基线策略')):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'v1.21 缺少{label}: {path}')
+    with open(summary_path, encoding='utf-8') as handle:
+        summary = json.load(handle)
+    source_folds = {int(row['fold']): row for row in summary.get('folds', [])}
+    records_by_fold = {}
+    for fold in folds:
+        fold_id = int(fold['fold'])
+        source_fold = source_folds.get(fold_id)
+        if source_fold is None:
+            raise ValueError(f'冻结 v1.17 基线缺少 Fold {fold_id}')
+        for field in ('train_end', 'val_start', 'val_end'):
+            expected = pd.Timestamp(fold[field]).strftime('%Y-%m-%d')
+            if source_fold.get(field) != expected:
+                raise ValueError(
+                    f'v1.17 基线 Fold {fold_id} 的 {field} 与 v1.21 不一致'
+                )
+        path = os.path.join(
+            source_dir, 'seed_42', f'fold_{fold_id}', 'oof_predictions.joblib',
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'冻结 v1.17 基线缺少 OOF: {path}')
+        records_by_fold[fold_id] = attach_label_end_dates(
+            joblib.load(path), trading_dates,
+            horizon=int(config['purge_days']),
+        )
+    with open(policy_path, encoding='utf-8') as handle:
+        policy = json.load(handle)
+    return source_dir, policy, records_by_fold
+
+
+def fit_strict_lgbm_oof_records(
+    data, features, folds, reference_records_by_fold, output_dir,
+):
+    """内层早停、外层重训并仅在外层留出日评分的 v1.21 Tree OOF。"""
+    try:
+        from lightgbm import early_stopping
+    except ImportError as exc:
+        raise RuntimeError('v1.21 需要 lightgbm；请在 code 目录运行 uv sync') from exc
+
+    target_column = str(config['lgbm_target_column'])
+    lgbm_dir = os.path.join(output_dir, 'lgbm')
+    os.makedirs(lgbm_dir, exist_ok=True)
+    results, output_records = [], {}
+    for fold in folds:
+        fold_id = int(fold['fold'])
+        outer_train, train_dates = recent_lgbm_training_frame(
+            data, fold['train_end'], int(config['lgbm_train_window_days']),
+        )
+        outer_train = outer_train.sort_values(
+            ['日期', 'instrument'], kind='mergesort',
+        ).replace([np.inf, -np.inf], np.nan)
+        outer_train[features] = outer_train[features].fillna(0.0)
+        inner_train, inner_valid, boundary = strict_lgbm_inner_split(
+            outer_train,
+            config['lgbm_inner_validation_days'],
+            config['lgbm_inner_purge_days'],
+        )
+        if pd.Timestamp(boundary['inner_val_end']) > pd.Timestamp(fold['train_end']):
+            raise AssertionError('LightGBM 内层验证越过外层训练结束日')
+        if pd.Timestamp(boundary['inner_val_end']) >= pd.Timestamp(fold['val_start']):
+            raise AssertionError('LightGBM 外层验证集泄漏进内层早停')
+        signature = _strict_lgbm_signature(features, fold, train_dates)
+        model_path = os.path.join(lgbm_dir, f'fold_{fold_id}.joblib')
+        metadata_path = os.path.join(lgbm_dir, f'fold_{fold_id}_metadata.json')
+        metadata = None
+        if resume_training_enabled() and os.path.isfile(model_path) and os.path.isfile(metadata_path):
+            with open(metadata_path, encoding='utf-8') as handle:
+                cached = json.load(handle)
+            if cached.get('signature') == signature:
+                model = joblib.load(model_path)
+                validate_lgbm_checkpoint(
+                    model, features, model_path,
+                    expected_iterations=cached['outer_iterations'],
+                )
+                metadata = cached
+                print(f'恢复 v1.21 LightGBM Fold {fold_id} checkpoint')
+        if metadata is None:
+            inner_groups = _lgbm_group_sizes(inner_train)
+            valid_groups = _lgbm_group_sizes(inner_valid)
+            if inner_groups.min() < 2 or valid_groups.min() < 2:
+                raise ValueError(f'v1.21 Fold {fold_id} 的内层日期分组不足')
+            print(
+                f'阶段 LightGBM 内层早停：Fold {fold_id}，训练 '
+                f"{boundary['inner_train_start']} ~ {boundary['inner_train_end']}，"
+                f"验证 {boundary['inner_val_start']} ~ {boundary['inner_val_end']}"
+            )
+            selector = build_lgbm_ranker(config['lgbm_n_estimators'])
+            progress, update_progress = lgbm_progress_callback(
+                f'LightGBM Fold {fold_id} 内层早停', config['lgbm_n_estimators'],
+            )
+            try:
+                selector.fit(
+                    inner_train[features],
+                    lgbm_relevance_labels(inner_train, target_column),
+                    group=inner_groups,
+                    eval_X=inner_valid[features],
+                    eval_y=lgbm_relevance_labels(inner_valid, target_column),
+                    eval_group=[valid_groups],
+                    eval_at=[5],
+                    callbacks=[
+                        update_progress,
+                        early_stopping(config['lgbm_early_stopping_rounds'], verbose=False),
+                    ],
+                )
+            finally:
+                progress.close()
+            best_iteration = max(1, int(
+                selector.best_iteration_ or config['lgbm_n_estimators']
+            ))
+            print(
+                f'阶段 LightGBM 外层重训：Fold {fold_id}，近期 '
+                f'{len(train_dates)} 日 {pd.Timestamp(train_dates[0]).date()} ~ '
+                f'{pd.Timestamp(train_dates[-1]).date()}，固定 {best_iteration} 棵树'
+            )
+            model = build_lgbm_ranker(best_iteration)
+            progress, update_progress = lgbm_progress_callback(
+                f'LightGBM Fold {fold_id} 外层重训', best_iteration,
+            )
+            try:
+                model.fit(
+                    outer_train[features],
+                    lgbm_relevance_labels(outer_train, target_column),
+                    group=_lgbm_group_sizes(outer_train),
+                    callbacks=[update_progress],
+                )
+            finally:
+                progress.close()
+            save_joblib_checkpoint(model, model_path)
+            metadata = {
+                'signature': signature,
+                'fold': fold_id,
+                'objective': config['lgbm_objective'],
+                'label_mode': config['lgbm_label_mode'],
+                'label_gain': list(config['lgbm_label_gain']),
+                'truncation_level': int(config['lgbm_truncation_level']),
+                'outer_train_start': pd.Timestamp(train_dates[0]).strftime('%Y-%m-%d'),
+                'outer_train_end': pd.Timestamp(train_dates[-1]).strftime('%Y-%m-%d'),
+                'outer_train_days': int(len(train_dates)),
+                **boundary,
+                'inner_best_iteration': best_iteration,
+                'outer_iterations': int(model.booster_.current_iteration()),
+                'outer_validation_used_for_early_stopping': False,
+            }
+            atomic_write_json(metadata_path, metadata)
+
+        valid = data.loc[
+            (data['日期'] >= fold['val_start']) & (data['日期'] <= fold['val_end'])
+        ].sort_values(['日期', 'instrument'], kind='mergesort').copy()
+        by_date = {
+            pd.Timestamp(date).strftime('%Y-%m-%d'): rows.set_index('instrument')
+            for date, rows in valid.groupby('日期', sort=False)
+        }
+        records = []
+        for reference in reference_records_by_fold[fold_id]:
+            rows = by_date.get(reference['prediction_date'])
+            if rows is None:
+                raise ValueError(
+                    f"v1.21 Fold {fold_id} 缺少冻结评估日 {reference['prediction_date']}"
+                )
+            ordered = rows.reindex(
+                np.asarray(reference['stock_indices'], dtype=np.int64),
+            )
+            if ordered[features].isna().any().any():
+                raise ValueError('v1.21 OOF 股票集合与特征表不一致')
+            records.append(_strict_lgbm_record(
+                reference, ordered,
+                model.predict(ordered[features]),
+            ))
+        output_records[fold_id] = records
+        results.append({
+            **metadata,
+            'best_iteration': int(metadata['outer_iterations']),
+            'outer_validation_dates_scored': [
+                record['prediction_date'] for record in records
+            ],
+        })
+        print(
+            f'阶段 LightGBM 外层评分：Fold {fold_id}，'
+            f'{len(records)} 个非重叠验证日；外层验证未参与早停'
+        )
+    return results, output_records
+
+
+def fixed_equal_top5_policy():
+    """v1.21 的唯一预注册组合：纯树排序、等权、近满仓。"""
+    policy = {
+        'allocation_blend': 0.0,
+        'disagreement_gamma': 0.0,
+        'selection_risk_gamma': 0.0,
+        'risk_score_penalty': 0.0,
+        'risk_1d_blend': 1.0,
+        'risk_3d_blend': 0.0,
+        'risk_5d_blend': 0.0,
+        'tail_5d_blend': 0.0,
+        'correlation_exposure_gamma': 0.0,
+        'exposure_head_blend': 0.0,
+        'selection_candidate_k': int(config['lgbm_top_k']),
+        'correlation_lookbacks': [20],
+        'cluster_cap_enabled': False,
+        'cluster_correlation_threshold': float(config['cluster_correlation_threshold']),
+        'max_stocks_per_cluster': int(config['max_stocks_per_cluster']),
+        'cluster_max_raw_rank': int(config['cluster_max_raw_rank']),
+        'tail_5d_threshold': float(config['tail_5d_threshold']),
+        'fixed_exposure_baseline': float(config['fixed_exposure_baseline']),
+        'min_exposure': float(config['min_exposure']),
+        'max_exposure': float(config['max_exposure']),
+        'allocation_temperature': float(config['allocation_temperature']),
+        'top_k': int(config['lgbm_top_k']),
+        'downside_weight': float(config['ensemble_downside_weight']),
+        'max_stocks_per_industry': None,
+        'industry_candidate_k': int(config['industry_candidate_k']),
+    }
+    if not (
+        policy['allocation_blend'] == 0.0
+        and policy['exposure_head_blend'] == 0.0
+        and policy['fixed_exposure_baseline'] == 0.999999
+    ):
+        raise AssertionError('v1.21 固定等权近满仓策略配置错误')
+    return policy
+
+
 def attach_oof_strategy_metadata(ensemble_days, data):
     """把预测日已知的行业快照和市场状态接到 OOF，绝不写入模型输入。"""
     required = [INDUSTRY_ASOF_COLUMN, 'market_return_20', 'market_downside_vol_20']
     missing = [name for name in required if name not in data]
     if missing:
         raise ValueError(f'OOF 策略元数据缺少列: {missing}')
-    lookup = data.set_index(['日期', 'instrument'])[required]
+    # 只保留策略诊断需要的列；直接对205维完整面板 set_index 会在 OOF
+    # 汇总时复制大量无关特征并产生不必要的内存峰值。
+    lookup = data.loc[:, ['日期', 'instrument', *required]].set_index(
+        ['日期', 'instrument']
+    )
     for day in ensemble_days:
         index = pd.MultiIndex.from_arrays([
             np.repeat(pd.Timestamp(day['prediction_date']), len(day['stock_indices'])),
@@ -4954,10 +5372,235 @@ def run_policy_only():
     return summary['mean_weighted_portfolio_return']
 
 
+def run_v21_tree_only(full_df, full_data, features, folds, output_dir, lockbox_start):
+    """运行 v1.21：只训练严格内层早停的树排序器，不触发 Transformer epoch。"""
+    print('阶段 v1.21 1/5：校验冻结205维 Transformer/Scaler 推理来源')
+    source_dir = os.path.abspath(config['tree_only_artifact_source_dir'])
+    required_source_files = (
+        'config.json', 'ensemble_policy.json', 'artifact_manifest.json',
+        'scaler.pkl', 'stockid2idx.json',
+    )
+    missing = [
+        name for name in required_source_files
+        if not os.path.isfile(os.path.join(source_dir, name))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'v1.21 冻结推理来源缺少工件: {missing}'
+        )
+    with open(os.path.join(source_dir, 'config.json'), encoding='utf-8') as handle:
+        source_config = json.load(handle)
+    with open(os.path.join(source_dir, 'ensemble_policy.json'), encoding='utf-8') as handle:
+        source_policy = json.load(handle)
+    if source_config.get('feature_num') != config['feature_num']:
+        raise ValueError('v1.21 来源工件不是兼容的205维特征集')
+    if source_policy.get('ensemble_seeds') != [42]:
+        raise ValueError('v1.21 只允许引用冻结的单种子42推理工件')
+
+    print('阶段 v1.21 2/5：加载冻结 v1.17 纯排序 OOF 基线')
+    trading_dates = full_df['日期'].dropna().unique()
+    baseline_dir, _, baseline_records = load_frozen_v17_oof_records(
+        folds, trading_dates,
+    )
+    baseline_records = remap_oof_records_to_official_labels(
+        baseline_records, full_data,
+    )
+    baseline_days = []
+    for fold in folds:
+        baseline_days.extend(align_oof_prediction_records(
+            [baseline_records[int(fold['fold'])]], int(fold['fold']),
+        ))
+    attach_oof_strategy_metadata(baseline_days, full_data)
+
+    print('阶段 v1.21 3/5：内层早停、外层重训和严格 OOF 评分')
+    lgbm_folds, candidate_records = fit_strict_lgbm_oof_records(
+        full_data, features, folds, baseline_records, output_dir,
+    )
+    candidate_days = []
+    for fold in folds:
+        candidate_days.extend(align_oof_prediction_records(
+            [candidate_records[int(fold['fold'])]], int(fold['fold']),
+        ))
+    attach_oof_strategy_metadata(candidate_days, full_data)
+
+    print('阶段 v1.21 4/5：按同仓位 Top-5 等权基线评估晋级')
+    fixed_policy = fixed_equal_top5_policy()
+    baseline_metrics = evaluate_ensemble_policy(
+        baseline_days, fixed_policy, include_daily=True,
+    )
+    candidate_metrics = evaluate_ensemble_policy(
+        candidate_days, fixed_policy, include_daily=True,
+    )
+    for row in candidate_metrics['daily']:
+        expected = row['top5_return'] * fixed_policy['fixed_exposure_baseline']
+        if not np.isclose(row['weighted_portfolio_return'], expected, atol=1e-12):
+            raise AssertionError('v1.21 OOF 未保持严格等权近满仓')
+    promotion_criteria = promotion_against_baseline(
+        candidate_metrics, baseline_metrics,
+    )
+    print('阶段 v1.21 5/5：用三折中位树数重训最终近期树模型')
+    lgbm_model_path = fit_lgbm_final(
+        full_data, features, lgbm_folds, output_dir,
+    )
+
+    artifact_source_dir = os.path.relpath(source_dir, output_dir)
+    policy = {
+        **fixed_policy,
+        'candidate_name': 'recent504_lambdarank_binary_top5_strict_inner',
+        'pre_registered': True,
+        'tree_only_lgbm': True,
+        'fixed_equal_top5_policy': True,
+        'policy_role': 'fixed_equal_top5_lgbm_only',
+        'promotion_metric_source': 'outer_oof_score_only_equal_top5',
+        'ensemble_enabled': False,
+        'ensemble_seeds': [42],
+        'mode': 'tree_only_lgbm',
+        'artifact_source_dir': artifact_source_dir,
+        'model_paths': source_policy['model_paths'],
+        'scaler_path': source_policy.get('scaler_path', 'scaler.pkl'),
+        'config_path': source_policy.get('config_path', 'config.json'),
+        'manifest_path': source_policy.get('manifest_path', 'artifact_manifest.json'),
+        'lgbm_model_path': lgbm_model_path,
+        'lgbm_artifact_dir': '.',
+        'lgbm_weight': 1.0,
+        'lgbm_train_window_days': int(config['lgbm_train_window_days']),
+        'lgbm_training_protocol': 'inner_40d_purge5_outer_refit_no_outer_early_stop',
+        'lgbm_objective': config['lgbm_objective'],
+        'lgbm_label_mode': config['lgbm_label_mode'],
+        'lgbm_label_gain': list(config['lgbm_label_gain']),
+        'lgbm_truncation_level': int(config['lgbm_truncation_level']),
+        'max_stocks_per_industry': None,
+        'promotion_criteria': promotion_criteria,
+    }
+    if policy['allocation_blend'] != 0.0 or policy['exposure_head_blend'] != 0.0:
+        raise AssertionError('v1.21 部署策略不得保留 Allocation 或 Exposure 混合')
+    with open(os.path.join(output_dir, 'ensemble_policy.json'), 'w', encoding='utf-8') as handle:
+        json.dump(policy, handle, indent=2, ensure_ascii=False)
+
+    manifest_path = os.path.join(output_dir, 'artifact_manifest.json')
+    with open(manifest_path, encoding='utf-8') as handle:
+        manifest = json.load(handle)
+    manifest.update({
+        'schema_version': 2,
+        'tree_only_lgbm': True,
+        'artifact_source_dir': artifact_source_dir,
+        'artifact_source_manifest_sha256': sha256_file(
+            os.path.join(source_dir, 'artifact_manifest.json')
+        ),
+        'lgbm': {
+            'objective': config['lgbm_objective'],
+            'label_mode': config['lgbm_label_mode'],
+            'label_gain': list(config['lgbm_label_gain']),
+            'truncation_level': int(config['lgbm_truncation_level']),
+            'train_window_days': int(config['lgbm_train_window_days']),
+            'inner_validation_days': int(config['lgbm_inner_validation_days']),
+            'inner_purge_days': int(config['lgbm_inner_purge_days']),
+            'folds': lgbm_folds,
+        },
+    })
+    atomic_write_json(manifest_path, manifest)
+
+    cross_fitted = {
+        'method': 'fixed_equal_top5_outer_oof_no_policy_calibration',
+        'metrics': candidate_metrics,
+        'fold_policies': [{
+            'held_out_fold': int(fold['fold']),
+            'calibration_folds': [],
+            'policy': {
+                key: policy[key] for key in (
+                    'allocation_blend', 'exposure_head_blend',
+                    'risk_score_penalty', 'selection_risk_gamma',
+                    'correlation_exposure_gamma',
+                )
+            },
+        } for fold in folds],
+    }
+    summary = {
+        'training_mode': 'tree_only_lgbm_strict_inner_early_stopping',
+        'num_folds': len(folds),
+        'evaluation_stride': int(config['evaluation_stride']),
+        'ensemble_seeds': [42],
+        'source_training_folds': [],
+        'folds': lgbm_folds,
+        'lgbm_training': {
+            'protocol': policy['lgbm_training_protocol'],
+            'folds': lgbm_folds,
+            'final_model_iterations': int(np.median([
+                row['outer_iterations'] for row in lgbm_folds
+            ])),
+        },
+        'fixed_equal_top5_policy': True,
+        'promotion_baseline': 'frozen_v1.17_score_only_equal_top5_full_exposure',
+        'score_only_baseline': baseline_metrics,
+        'ensemble_oof': candidate_metrics,
+        'cross_fitted_oof': cross_fitted,
+        'deployment_oof': candidate_metrics,
+        'deployment_policy': policy,
+        'promotion_criteria': promotion_criteria,
+        'pre_registered_candidates': {
+            policy['candidate_name']: {
+                'lgbm_weight': 1.0,
+                'metrics': candidate_metrics,
+                'promotion_criteria': promotion_criteria,
+            },
+        },
+        'full_training': {
+            'skipped': True,
+            'reason': 'v1.21_only_retrains_lightgbm',
+            'models': [],
+        },
+    }
+    summary.update({
+        'allocation_blend': 0.0,
+        'selection_risk_gamma': 0.0,
+        'risk_score_penalty': 0.0,
+        'correlation_exposure_gamma': 0.0,
+        'exposure_head_blend': 0.0,
+        'mean_top5_return': candidate_metrics['mean_top5_return'],
+        'worst_fold_top5_return': candidate_metrics['worst_fold_top5_return'],
+        'mean_weighted_portfolio_return': candidate_metrics['mean_weighted_portfolio_return'],
+        'worst_fold_weighted_portfolio_return': candidate_metrics['worst_fold_weighted_portfolio_return'],
+        'p10_weighted_portfolio_return': candidate_metrics['p10_weighted_portfolio_return'],
+        'worst_weighted_portfolio_return': candidate_metrics['worst_weighted_portfolio_return'],
+        'max_drawdown': candidate_metrics['max_drawdown'],
+        'std_weighted_portfolio_return': candidate_metrics['std_weighted_portfolio_return'],
+        'weighted_portfolio_positive_rate': candidate_metrics['positive_rate'],
+        'mean_gross_exposure': candidate_metrics['mean_gross_exposure'],
+        'mean_head_gross_exposure': candidate_metrics['mean_head_gross_exposure'],
+        'mean_cash_weight': candidate_metrics['mean_cash_weight'],
+        'mean_rank_ic': candidate_metrics['mean_rank_ic'],
+        'worst_rank_ic': candidate_metrics['worst_rank_ic'],
+        'worst_daily_rank_ic': candidate_metrics['worst_daily_rank_ic'],
+        'worst_fold_mean_rank_ic': candidate_metrics['worst_fold_mean_rank_ic'],
+        'mean_model_disagreement': 0.0,
+        'mean_allocation_contribution': candidate_metrics['mean_allocation_contribution'],
+        'mean_exposure_contribution': candidate_metrics['mean_exposure_contribution'],
+        'mean_exposure_policy_contribution': candidate_metrics['mean_exposure_policy_contribution'],
+        'industry_constraint_application_rate': candidate_metrics['industry_constraint_application_rate'],
+        'industry_constraint_fallback_rate': candidate_metrics['industry_constraint_fallback_rate'],
+        'mean_industry_count': candidate_metrics['mean_industry_count'],
+        'mean_industry_hhi': candidate_metrics['mean_industry_hhi'],
+        'mean_max_industry_weight': candidate_metrics['mean_max_industry_weight'],
+    })
+    atomic_write_json(
+        os.path.join(output_dir, 'cross_validation_summary.json'), summary,
+    )
+    print(
+        '\n########## v1.21 Tree-only 训练完成！'
+        f"OOF 平均组合收益: {candidate_metrics['mean_weighted_portfolio_return']:.6f} ##########"
+    )
+    print(
+        'v1.21 晋级：'
+        + ('PASS' if promotion_criteria['passed'] else 'FAIL')
+        + '（基线为同仓位 v1.17 纯排序重放）'
+    )
+    return float(candidate_metrics['mean_weighted_portfolio_return'])
+
+
 def main():
-    if stress_eval_enabled():
+    if stress_eval_enabled() or known_stress_eval_enabled():
         if lockbox_eval_enabled():
-            raise ValueError('STRESS_EVAL 与 LOCKBOX_EVAL 不能同时启用')
+            raise ValueError('压力诊断与 LOCKBOX_EVAL 不能同时启用')
         apply_v17_profile()
         return run_lockbox_eval(config['output_dir'], stress=True)
     if lockbox_eval_enabled():
@@ -4973,6 +5616,11 @@ def main():
     final_submission = os.environ.get('FINAL_SUBMISSION_FIT', '0') == '1'
     if final_deployment and final_submission:
         raise ValueError('最终部署重训与 FINAL_SUBMISSION_FIT 不能同时启用')
+    if final_submission and config.get('tree_only_lgbm', False):
+        raise ValueError(
+            'v1.21 没有新的未见两个月 lockbox，禁止最终提交重训；'
+            '请保留 v1.17 部署工件。'
+        )
     if final_deployment:
         require_accepted_lockbox_for_deployment()
         return run_frozen_final_deployment(config['output_dir'])
@@ -5050,6 +5698,11 @@ def main():
     write_v17_manifest(
         output_dir, features, folds, lockbox_start, len(stockid2idx),
     )
+    if config.get('tree_only_lgbm', False):
+        print('阶段 v1.21：特征与 manifest 已就绪，进入纯 LightGBM 训练')
+        return run_v21_tree_only(
+            full_df, full_data, features, folds, output_dir, lockbox_start,
+        )
     if config.get('exposure_market_encoder_enabled', False):
         market_feature_names = [
             *RELATIVE_MARKET_FEATURES[-5:],

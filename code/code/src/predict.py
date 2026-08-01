@@ -225,7 +225,7 @@ def cross_sectional_percentiles(scores):
 	) / (scores.size - 1.0)
 
 
-def resolve_lgbm_ranker(policy, artifact_source_dir):
+def resolve_lgbm_ranker(policy, artifact_source_dir, strategy_dir=None):
 	"""解析可选 LightGBM 排序器；零权重时不要求本地工件。"""
 	weight = float(policy.get('lgbm_weight', 0.0))
 	if not 0.0 <= weight <= 1.0:
@@ -237,7 +237,12 @@ def resolve_lgbm_ranker(policy, artifact_source_dir):
 		raise ValueError('lgbm_weight 大于 0 时必须设置 lgbm_model_path')
 	model_path = configured_path
 	if not os.path.isabs(model_path):
-		model_path = os.path.join(artifact_source_dir, model_path)
+		model_root = (
+			strategy_dir
+			if policy.get('lgbm_artifact_dir') == '.' and strategy_dir
+			else artifact_source_dir
+		)
+		model_path = os.path.join(model_root, model_path)
 	if not os.path.exists(model_path):
 		raise FileNotFoundError(f'未找到 LightGBM 排序器: {model_path}')
 	return joblib.load(model_path), weight, model_path
@@ -568,6 +573,24 @@ def main():
 		strategy_config = json.load(f)
 	with open(policy_path, 'r', encoding='utf-8') as f:
 		policy = json.load(f)
+	if policy.get('fixed_equal_top5_policy', False):
+		for field in (
+			'allocation_blend', 'exposure_head_blend', 'disagreement_gamma',
+			'selection_risk_gamma', 'risk_score_penalty',
+			'correlation_exposure_gamma',
+		):
+			if not np.isclose(float(policy.get(field, 0.0)), 0.0, atol=1e-12):
+				raise ValueError(f'固定等权策略禁止非零 {field}')
+		if not (
+			float(policy.get('lgbm_weight', 0.0)) == 1.0
+			and int(policy.get('top_k', 0)) == 5
+			and np.isclose(
+				float(policy.get('fixed_exposure_baseline', 0.0)),
+				0.999999,
+				atol=1e-12,
+			)
+		):
+			raise ValueError('固定等权策略的 Top-5、LightGBM 或近满仓配置不一致')
 	artifact_source = policy.get('artifact_source_dir', '.')
 	artifact_source_dir = (
 		artifact_source
@@ -949,6 +972,7 @@ def main():
 	lgbm_ranker, lgbm_weight, lgbm_model_path = resolve_lgbm_ranker(
 		policy,
 		artifact_source_dir,
+		strategy_dir=output_dir,
 	)
 	lgbm_diagnostics = {
 		'enabled': False,
@@ -964,6 +988,9 @@ def main():
 			lgbm_ranker,
 			len(features),
 		)
+		model_feature_names = list(getattr(lgbm_ranker, 'feature_name_', []))
+		if model_feature_names and model_feature_names != list(features):
+			raise ValueError('LightGBM 特征列名或顺序与205维训练工件不一致')
 		# 保留列名，既校验205维顺序，也避免 sklearn 对 ndarray 的无名列警告。
 		lgbm_input = pd.DataFrame(lgbm_raw_latest, columns=features)
 		lgbm_scores = np.asarray(

@@ -49,29 +49,30 @@ end_date = "***"
 
 # 训练与预测
 
-当前 v1.20.1 训练独立的 205维 `158+39_reduced25_relmarket12_risk15_indresid12` RankGLU
-Transformer 和近期窗口 `rank_xendcg` LightGBM，不复用或覆盖 v1.17/v1.19 工件。除五年行情外，需准备
+当前 v1.21 使用 205维 `158+39_reduced25_relmarket12_risk15_indresid12` 与独立的近期窗口
+Top-5 LambdaRank LightGBM；冻结 v1.20.1 Transformer 工件只用于特征/Scaler/推理兼容，不会重训
+Transformer，也不复用或覆盖 v1.17/v1.19/v1.20.1 的树模型或策略工件。除五年行情外，需准备
 `data_5y/stock_industry_history.csv`，其中必须包含 `effective_date,stock_id,industry`；特征只使用
 预测日期当日或之前的行业快照。运行 `./train.sh` 后，模型工件根目录必须同时保留 `config.json`、
 `scaler.pkl`、`stockid2idx.json`、checkpoint、LightGBM 模型和 `artifact_manifest.json`。
 
-`artifact_manifest.json` 的 `feature_count` 必须为205，且记录 `feature_num`、
-`sequence_length`、`stock_mapping_size`、`score_head_variant=rankglu_v1`、bottleneck 与 gamma 上界。
+`artifact_manifest.json` 的 `feature_count` 必须为205；v1.21 还记录冻结来源哈希、内层日期边界、
+目标定义和各折树数。推理会校验205维列名顺序，而不仅是列数。
 `./test.sh` 会在特征工程前检查 manifest、Scaler、checkpoint 输入宽度、RankGLU 头和股票 embedding；
 不得把 v1.16 的193维或旧 MLP score-head 工件接入 v1.20。
 旧 v1.16 工件仅在切回其193维配置与策略目录后兼容运行。
 
-在 `code/` 目录执行 `./train.sh` 开始 v1.20.1 单种子三折训练和全开发期重训。树模型每折和全开发期
-重训都只使用最近 504 个交易日；主选股固定为纯 `rank_xendcg` LightGBM，禁止中间融合搜索。原始
-LightGBM 使用官方 T+1 开盘至 T+5 开盘的绝对收益做日期内 `rank_xendcg` relevance，固定原始
-Top-5、每只等权和近满仓。行业约束、风险、Allocation 与 Exposure 调整均关闭；辅助 Head 仍保留训练
-诊断。训练完成后查看 `promotion_criteria.passed`：平均收益、折级收益、P10 和 Rank IC 必须满足门槛；
-最大回撤只作诊断。
+在 `code/` 目录执行 `./train.sh` 开始 v1.21 单种子三折 tree-only 训练。每折先在最近504个训练日内
+以最后40个交易日做内层早停验证，并在其前 purge 5 日；树数确定后才以完整外层训练窗口重训，外层验证
+只用于 OOF 评分。每日官方 T+1 开盘至 T+5 开盘收益的前五名为二元 relevance 正类，LightGBM 固定
+`lambdarank`、`ndcg@5`、truncation=8。组合固定为五只各 0.1999998、总仓位0.999999；行业、风险、
+Allocation 和 Exposure 调整均关闭。训练完成后查看 `promotion_criteria.passed`，它比较同仓位的冻结
+v1.17 纯排序基线；最大回撤只作诊断。
 
-v1.19 已消费 2026-06-01～2026-07-29，v1.20 只能将其作为一次性压力诊断，且不会训练模型：
+2026-06-01～2026-07-29（包括 7 月 24 日历史审计）已消费，只能作为 v1.21 的只读压力诊断：
 
 ```bash
-STRESS_EVAL=1 ./train.sh
+KNOWN_STRESS_EVAL=1 ./train.sh
 ```
 
 结果原子写入 `observed_stress_report.json`，仅报告相对 v1.17 的收益、P10 和最大回撤，绝不授权
@@ -87,18 +88,12 @@ LOCKBOX_EVAL=1 ./train.sh
 V17_INCLUDE_LOCKBOX=1 LOCKBOX_ACCEPTED=1 ./train.sh
 ```
 
-最终重训会复用锁箱前冻结的候选策略、LightGBM 中位迭代数和四阶段 epoch，不重新执行 OOF 或策略标定。
+新的未见锁箱通过前，v1.21 会拒绝最终提交重训；当前 v1.17 仍是唯一部署候选。
 `test.sh` 只在具有完整未来五日开盘价时计算官方收益；输出股票名称、逐股收益、严格单股最优和 Top-5
 等权 oracle。7 月 30/31 数据到齐后，先执行一次不可用于调参的历史审计：
 
 ```bash
 HISTORICAL_SCORE_DATE=2026-07-24 ./test.sh
-```
-
-审计完成且 candidate 晋级后，最终提交拟合只能执行一次：
-
-```bash
-FINAL_SUBMISSION_FIT=1 FINAL_SUBMISSION_DATE=2026-07-31 ./train.sh
 ```
 
 成功完成训练

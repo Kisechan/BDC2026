@@ -3402,6 +3402,15 @@ def _module_policy_base(calibration_kwargs):
     }
 
 
+def _runtime_module_fallbacks(calibration_kwargs):
+    """使用当前配置的回退值，避免把旧版 25% 强行写回部署策略。"""
+    base = _module_policy_base(calibration_kwargs)
+    return {
+        module: base.get(field, default)
+        for module, (field, default) in _MODULE_POLICY_FIELDS.items()
+    }
+
+
 def _paired_module_gate(
     candidate_metrics,
     fallback_metrics,
@@ -3951,6 +3960,7 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
     held_out_daily = []
     held_module_pairs = {module: [] for module in _MODULE_POLICY_FIELDS}
     fold_policies = []
+    module_fallbacks = _runtime_module_fallbacks(calibration_kwargs)
     policy_fields = tuple(
         field for field, _ in _MODULE_POLICY_FIELDS.values()
     ) + ('disagreement_gamma',)
@@ -3986,6 +3996,7 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
         held_out_daily.extend(held_metrics['daily'])
         held_module_reports = {}
         for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+            fallback = module_fallbacks[module]
             if policy[field] == fallback:
                 held_module_reports[module] = {
                     'active': False,
@@ -4105,6 +4116,7 @@ def cross_fit_module_gated_policy(ensemble_days, **calibration_kwargs):
     )
     robust_deployment = dict(all_oof_candidate)
     for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+        fallback = module_fallbacks[module]
         if not deployment_eligibility[module]['eligible']:
             robust_deployment[field] = fallback
     robust_deployment['disagreement_gamma'] = 0.0
@@ -4156,6 +4168,7 @@ def forward_fit_module_gated_policy(
     held_out_daily = []
     fold_policies = []
     module_pairs = {module: [] for module in _MODULE_POLICY_FIELDS}
+    module_fallbacks = _runtime_module_fallbacks(calibration_kwargs)
     policy_fields = tuple(
         field for field, _ in _MODULE_POLICY_FIELDS.values()
     ) + ('disagreement_gamma',)
@@ -4207,6 +4220,7 @@ def forward_fit_module_gated_policy(
         held_out_daily.extend(held_metrics['daily'])
         held_module_reports = {}
         for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+            fallback = module_fallbacks[module]
             if policy[field] == fallback:
                 held_module_reports[module] = {
                     'active': False,
@@ -4336,6 +4350,7 @@ def forward_fit_module_gated_policy(
     )
     robust_deployment = dict(all_oof_candidate)
     for module, (field, fallback) in _MODULE_POLICY_FIELDS.items():
+        fallback = module_fallbacks[module]
         if not deployment_eligibility[module]['eligible']:
             robust_deployment[field] = fallback
     robust_deployment['disagreement_gamma'] = 0.0

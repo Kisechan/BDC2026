@@ -13,8 +13,18 @@ SRC_DIR = PROJECT_ROOT / "code" / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from report_metrics import _official_open_window  # noqa: E402
-from train import lgbm_relevance_labels, lockbox_realized_return  # noqa: E402
-from utils import attach_label_end_dates  # noqa: E402
+from train import (  # noqa: E402
+    fixed_equal_top5_policy,
+    lgbm_relevance_labels,
+    lockbox_realized_return,
+    remap_oof_records_to_official_labels,
+    strict_lgbm_inner_split,
+)
+from utils import (  # noqa: E402
+    _runtime_module_fallbacks,
+    attach_label_end_dates,
+    build_ensemble_portfolio,
+)
 
 
 class PolicyRegressionTests(unittest.TestCase):
@@ -38,6 +48,105 @@ class PolicyRegressionTests(unittest.TestCase):
         labels = lgbm_relevance_labels(frame, 'label').to_numpy()
         self.assertEqual(int(labels[2]), int(labels.max()))
         self.assertEqual(int(labels[0]), int(labels.min()))
+
+    def test_top5_binary_relevance_is_stable_for_ties(self):
+        from config import config
+
+        previous_mode = config.get('lgbm_label_mode')
+        previous_top_k = config.get('lgbm_top_k')
+        config['lgbm_label_mode'] = 'top5_binary'
+        config['lgbm_top_k'] = 5
+        try:
+            frame = pd.DataFrame({
+                '日期': ['2026-01-05'] * 8,
+                'instrument': [8, 7, 6, 5, 4, 3, 2, 1],
+                'label': [0.01, 0.01, 0.05, 0.04, 0.03, 0.02, 0.00, -0.01],
+            })
+            labels = lgbm_relevance_labels(frame, 'label').to_numpy()
+        finally:
+            config['lgbm_label_mode'] = previous_mode
+            config['lgbm_top_k'] = previous_top_k
+        self.assertEqual(int(labels.sum()), 5)
+        self.assertEqual(int(labels[0]), 0)  # 0.01 并列时 instrument=6 优先。
+        self.assertEqual(int(labels[1]), 1)
+
+    def test_inner_lgbm_split_has_explicit_purge(self):
+        dates = pd.bdate_range('2026-01-01', periods=12)
+        frame = pd.DataFrame({
+            '日期': np.repeat(dates, 2),
+            'instrument': np.tile([2, 3], len(dates)),
+            'label': 0.01,
+        })
+        inner_train, inner_valid, boundary = strict_lgbm_inner_split(
+            frame, validation_days=3, purge_days=2,
+        )
+        self.assertEqual(boundary['inner_train_end'], str(dates[6].date()))
+        self.assertEqual(boundary['inner_purge_start'], str(dates[7].date()))
+        self.assertEqual(boundary['inner_purge_end'], str(dates[8].date()))
+        self.assertEqual(boundary['inner_val_start'], str(dates[9].date()))
+        self.assertLess(inner_train['日期'].max(), inner_valid['日期'].min())
+
+    def test_fixed_equal_policy_and_runtime_fallback_are_zero_blend(self):
+        policy = fixed_equal_top5_policy()
+        self.assertEqual(policy['allocation_blend'], 0.0)
+        self.assertEqual(policy['exposure_head_blend'], 0.0)
+        self.assertEqual(policy['fixed_exposure_baseline'], 0.999999)
+        fallbacks = _runtime_module_fallbacks({
+            'min_exposure': 0.2,
+            'max_exposure': 0.999999,
+            'allocation_temperature': 1.0,
+            'minimum_allocation_blend': 0.0,
+            'minimum_exposure_blend': 0.0,
+        })
+        self.assertEqual(fallbacks['allocation'], 0.0)
+        self.assertEqual(fallbacks['exposure_head'], 0.0)
+
+    def test_fixed_equal_portfolio_weights_are_exact(self):
+        policy = fixed_equal_top5_policy()
+        portfolio = build_ensemble_portfolio(
+            np.array([[5.0, 4.0, 3.0, 2.0, 1.0, 0.0]]),
+            np.zeros((1, 6)),
+            np.array([0.5]),
+            min_exposure=policy['min_exposure'],
+            max_exposure=policy['max_exposure'],
+            allocation_temperature=policy['allocation_temperature'],
+            allocation_blend=policy['allocation_blend'],
+            disagreement_gamma=0.0,
+            selection_risk_gamma=0.0,
+            risk_score_penalty=0.0,
+            correlation_exposure_gamma=0.0,
+            exposure_head_blend=policy['exposure_head_blend'],
+            fixed_exposure_baseline=policy['fixed_exposure_baseline'],
+            top_k=5,
+        )
+        self.assertTrue(np.allclose(portfolio['positions'], 0.999999 / 5))
+        self.assertTrue(np.isclose(portfolio['positions'].sum(), 0.999999))
+
+    def test_frozen_baseline_scores_are_replayed_with_official_labels(self):
+        date = pd.Timestamp('2026-01-05')
+        instruments = np.arange(2, 7, dtype=np.int64)
+        data = pd.DataFrame({
+            '日期': [date] * len(instruments),
+            'instrument': instruments,
+            'label': np.linspace(-0.02, 0.02, len(instruments)),
+            'risk_1d_target': np.full(len(instruments), 0.5),
+            'risk_3d_target': np.full(len(instruments), 0.5),
+            'tail_5d_target': np.zeros(len(instruments)),
+            'regime_target': np.full(len(instruments), 0.5),
+        })
+        source = {
+            1: [{
+                'prediction_date': '2026-01-05',
+                'label_end_date': '2026-01-12',
+                'stock_indices': instruments,
+                'scores': np.arange(len(instruments), dtype=np.float64),
+                'targets': np.full(len(instruments), 99.0),
+            }]
+        }
+        replayed = remap_oof_records_to_official_labels(source, data)
+        record = replayed[1][0]
+        self.assertTrue(np.allclose(record['scores'], source[1][0]['scores']))
+        self.assertTrue(np.allclose(record['targets'], data['label']))
 
     def test_lockbox_uses_open_to_open_official_return(self):
         raw = pd.DataFrame({

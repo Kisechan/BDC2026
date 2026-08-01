@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'threefold_recent504_rankxendcg_officialraw_v20_1'
+experiment_name = 'threefold_recent504_lambdarank_top5_strict_v21'
 # v1.20 从独立目录训练 RankGLU；仅 v1.17 基线用于三折晋级对照，
 # 不把不同 score head 的 checkpoint、scaler 或 manifest 混用。
 artifact_experiment_name = (
@@ -130,11 +130,21 @@ config = {
     'max_stocks_per_cluster': 2,
     'cluster_max_raw_rank': 10,
     'lgbm_enabled': True,
-    # 主选股固定为近期窗口 rank_xendcg；relevance 直接来自赛事官方
-    # T+1 开盘至 T+5 开盘绝对收益，而非行业中性辅助标签。
+    # v1.21 只重训主选股树模型。Transformer 仅作为冻结的205维特征、
+    # scaler 与推理兼容性来源，不参与训练或选股。
+    'tree_only_lgbm': True,
+    'tree_only_artifact_source_dir': (
+        './model/60_158+39_reduced25_relmarket12_risk15_indresid12_'
+        'threefold_recent504_rankxendcg_officialraw_v20_1_candidate'
+    ),
+    # 主选股严格对齐赛事 Top-5：每日官方 T+1 开盘至 T+5 开盘收益
+    # 前五名为正类，其余为负类。树数只由训练段内层验证决定。
     'lgbm_blend_grid': [1.0],
-    'lgbm_objective': 'rank_xendcg',
-    'lgbm_relevance_levels': 10,
+    'lgbm_objective': 'lambdarank',
+    'lgbm_label_mode': 'top5_binary',
+    'lgbm_top_k': 5,
+    'lgbm_label_gain': [0, 1],
+    'lgbm_truncation_level': 8,
     'lgbm_target_column': 'label',
     'lgbm_learning_rate': 0.03,
     'lgbm_num_leaves': 31,
@@ -147,6 +157,8 @@ config = {
     'lgbm_n_jobs': -1,
     # 只限制树模型的训练日期，Transformer 仍按既有 504 日半衰期使用开发期。
     'lgbm_train_window_days': 504,
+    'lgbm_inner_validation_days': 40,
+    'lgbm_inner_purge_days': 5,
     # 行业约束在 v1.20 OOF 中拖累官方收益；v1.20.1 固定原始 Top-5。
     'industry_cap_enabled': False,
     'max_stocks_per_industry': 2,
@@ -161,6 +173,8 @@ config = {
     'forward_module_max_p10_loss': 0.005,
     'minimum_allocation_deployment_blend': 0.0,
     'minimum_exposure_deployment_blend': 0.0,
+    # 固定策略不走模块标定，避免全量部署策略与逐折等权策略不一致。
+    'fixed_equal_top5_policy': True,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
@@ -238,10 +252,10 @@ config = {
         'threefold_industryresidual_lgbmblend_pathrisk_v17_baseline'
     ),
     'full_deployment_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.20.1_full_history_deployment'
+        f'./model/{sequence_length}_{feature_num}_v1.21_full_history_deployment'
     ),
     'final_submission_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.20.1_submission_2026-07-31'
+        f'./model/{sequence_length}_{feature_num}_v1.21_submission_2026-07-31'
     ),
     # v1.19 已消费这段压力期；它只能做诊断，不能充当 v1.20 新锁箱。
     'known_stress_start': '2026-06-01',
