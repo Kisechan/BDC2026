@@ -308,10 +308,16 @@ def print_cross_validation() -> None:
         for name, candidate in candidates.items():
             metrics = candidate.get('metrics', candidate)
             gate = candidate.get('promotion_criteria')
+            mean_return = metrics.get(
+                'mean_weighted_portfolio_return', metrics.get('mean_return', 0.0),
+            )
+            p10_return = metrics.get(
+                'p10_weighted_portfolio_return', metrics.get('p10_return', 0.0),
+            )
             print(
                 f"  {name}: Allocation={float(candidate.get('allocation_blend', 0.0)):.2f}, "
-                f"动态收益={_pct(float(metrics.get('mean_weighted_portfolio_return', 0.0)))}, "
-                f"P10={_pct(float(metrics.get('p10_weighted_portfolio_return', 0.0)))}, "
+                f"动态收益={_pct(float(mean_return))}, "
+                f"P10={_pct(float(p10_return))}, "
                 f"Rank IC={float(metrics.get('mean_rank_ic', 0.0)):+.4f}, "
                 + (
                     f"晋级={'PASS' if gate.get('passed') else 'FAIL'}"

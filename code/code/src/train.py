@@ -1610,6 +1610,7 @@ def _allocation_policy_summary(metrics):
         'mean_return': float(metrics['mean_weighted_portfolio_return']),
         'p10_return': float(metrics['p10_weighted_portfolio_return']),
         'worst_daily_return': float(metrics['worst_weighted_portfolio_return']),
+        'mean_rank_ic': float(metrics['mean_rank_ic']),
         'fold_returns': {
             str(int(row['fold'])): float(row['mean_weighted_portfolio_return'])
             for row in metrics['folds']
