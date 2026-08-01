@@ -6254,12 +6254,23 @@ if __name__ == "__main__":
     # 多进程保护
     mp.set_start_method('spawn', force=True)
     best_score = main()
-    completion_label = (
-        '策略重放完成'
-        if policy_only_enabled()
-        else '训练完成'
-    )
-    print(
-        f"\n########## {completion_label}！OOF 平均组合收益: "
-        f"{best_score:.6f} ##########"
-    )
+    if lockbox_eval_enabled() or stress_eval_enabled() or known_stress_eval_enabled():
+        completion_label = (
+            '已知压力期诊断完成'
+            if stress_eval_enabled() or known_stress_eval_enabled()
+            else '新锁箱评估完成'
+        )
+        print(
+            f"\n########## {completion_label}！候选平均组合收益: "
+            f"{best_score:.6f} ##########"
+        )
+    else:
+        completion_label = (
+            '策略重放完成'
+            if policy_only_enabled()
+            else '训练完成'
+        )
+        print(
+            f"\n########## {completion_label}！OOF 平均组合收益: "
+            f"{best_score:.6f} ##########"
+        )
