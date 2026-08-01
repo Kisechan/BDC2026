@@ -9,14 +9,17 @@ The active `158+39_reduced25_relmarket12` experiment has 178 inputs after adding
 seven causal cross-sectional percentile features and five causal market-state
 features. The active `158+39_reduced25_relmarket12_risk15` experiment has 193
 inputs after adding seven short-horizon/downside stock percentiles and eight
-market-pressure features. The active strategy experiment is
-`nested_oof_forward_policy_v7_1`. It reuses the model, scaler, stock mapping,
-and OOF artifacts from `nested_oof_diverse_tailregime_v6_decay5y`; its own
-directory contains policy and report artifacts only. Strategy changes are
-calibrated in Ranking, Allocation, and Exposure stages using strictly earlier,
-fully resolved OOF labels. The bounded correlation-cluster option only
-replaces names within the raw Top-10 and falls back to the original Top-5 when
-infeasible.
+market-pressure features. The active model experiment is
+`threefold_industryranking_recovery_v12`. It keeps the 193 continuous inputs
+and does not feed
+industry codes or names into the Transformer. Historical industry snapshots
+are joined as-of for the restored v8 industry-residual ranking objective, two
+Exposure portfolio summaries, and soft Top-10 concentration selection. Its
+tail head predicts a causal five-day holding-path loss event.
+Strategy changes are calibrated in Ranking, Allocation, and Exposure stages
+using at least two strictly earlier folds with fully resolved OOF labels.
+Allocation and Exposure
+heads are mandatory and must not be removed by ablations.
 Keep each experiment's
 model directory separate, because
 checkpoints from different architectures or input dimensions are incompatible.
@@ -39,6 +42,15 @@ checkpoints from different architectures or input dimensions are incompatible.
 - Avoid adding new files unless the change cannot reasonably fit an existing
   module. Prefer extending the closest existing module and document why any new
   file is necessary.
+- Prefer replacing, deleting, or reusing existing logic over adding parallel
+  implementations for the same behavior.
+- Before committing, inspect production-code changes with `git diff --numstat`.
+  If the added/deleted line ratio exceeds 1.5, explain why and make another
+  consolidation and deduplication pass. This is a review trigger, not a reason
+  to compress readable code. Count tests and documentation separately, while
+  still avoiding duplicated implementations.
+- Add a helper only when it removes duplication or makes the main flow
+  materially shorter.
 
 ## Runtime observability
 
