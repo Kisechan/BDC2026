@@ -14,6 +14,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 from report_metrics import _official_open_window  # noqa: E402
 from train import (  # noqa: E402
+    allocation_weight_policy,
     fixed_equal_top5_policy,
     lgbm_relevance_labels,
     lockbox_realized_return,
@@ -121,6 +122,31 @@ class PolicyRegressionTests(unittest.TestCase):
         )
         self.assertTrue(np.allclose(portfolio['positions'], 0.999999 / 5))
         self.assertTrue(np.isclose(portfolio['positions'].sum(), 0.999999))
+
+    def test_allocation_candidates_keep_bounded_full_exposure_weights(self):
+        policy = allocation_weight_policy(0.5)
+        portfolio = build_ensemble_portfolio(
+            np.array([[6.0, 5.0, 4.0, 3.0, 2.0, 1.0]]),
+            np.array([[8.0, 1.0, 0.0, -1.0, -8.0, -10.0]]),
+            np.array([0.1]),
+            min_exposure=policy['min_exposure'],
+            max_exposure=policy['max_exposure'],
+            allocation_temperature=policy['allocation_temperature'],
+            allocation_blend=policy['allocation_blend'],
+            disagreement_gamma=0.0,
+            selection_risk_gamma=0.0,
+            risk_score_penalty=0.0,
+            correlation_exposure_gamma=0.0,
+            exposure_head_blend=policy['exposure_head_blend'],
+            fixed_exposure_baseline=policy['fixed_exposure_baseline'],
+            position_weight_bounds=policy['position_weight_bounds'],
+            top_k=5,
+        )
+        self.assertEqual(policy['weight_candidate'], 'allocation_50')
+        self.assertTrue(np.isclose(portfolio['positions'].sum(), 0.999999))
+        self.assertTrue(np.all(portfolio['relative_weights'] >= 0.05))
+        self.assertTrue(np.all(portfolio['relative_weights'] <= 0.35))
+        self.assertFalse(np.allclose(portfolio['relative_weights'], 0.2))
 
     def test_frozen_baseline_scores_are_replayed_with_official_labels(self):
         date = pd.Timestamp('2026-01-05')

@@ -2139,6 +2139,7 @@ def summarize_ensemble_days(
     fixed_exposure_baseline=0.6231689453125,
     max_stocks_per_industry=None,
     industry_candidate_k=10,
+    position_weight_bounds=None,
     downside_weight=0.5,
     top_k=5,
     include_daily=False,
@@ -2228,6 +2229,7 @@ def summarize_ensemble_days(
             industry_labels=day.get('industry_labels'),
             max_stocks_per_industry=max_stocks_per_industry,
             industry_candidate_k=industry_candidate_k,
+            position_weight_bounds=position_weight_bounds,
             top_k=top_k,
         )
         selected = portfolio['top_indices']
@@ -2312,6 +2314,10 @@ def summarize_ensemble_days(
             'selected_stock_indices': [
                 int(value) for value in day['stock_indices'][selected]
             ],
+            'relative_weights': [
+                float(value) for value in portfolio['relative_weights']
+            ],
+            'positions': [float(value) for value in portfolio['positions']],
             'raw_top5_return': raw_top5_return,
             'diversification_return_contribution': (
                 equal_full_return - raw_top5_return
@@ -2946,6 +2952,7 @@ def evaluate_ensemble_policy(ensemble_days, policy, include_daily=False):
         fixed_exposure_baseline=policy['fixed_exposure_baseline'],
         max_stocks_per_industry=policy.get('max_stocks_per_industry'),
         industry_candidate_k=policy.get('industry_candidate_k', 10),
+        position_weight_bounds=policy.get('position_weight_bounds'),
         downside_weight=policy['downside_weight'],
         top_k=policy['top_k'],
         include_daily=include_daily,

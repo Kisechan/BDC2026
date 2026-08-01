@@ -60,3 +60,8 @@ checkpoints from different architectures or input dimensions are incompatible.
   `未知` only when a mapping is genuinely unavailable.
 - Human-readable diagnostics belong in terminal output or diagnostic/report
   artifacts; they must never alter the competition submission schema.
+- The final deadline requires both reproducible code and `result.csv`. A
+  2026-07-31 holding has no completed future holding-period label: never use
+  its realized return to validate, tune, select weights, or claim backtest
+  performance. Any final allocation decision must use only earlier resolved
+  OOF labels.

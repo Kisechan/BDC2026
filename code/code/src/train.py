@@ -29,7 +29,10 @@ from utils import extract_selection_risk_context
 from utils import align_oof_prediction_records, calibrate_ensemble_policy
 from utils import evaluate_ensemble_policy
 from utils import attach_label_end_dates, forward_fit_module_gated_policy
-from utils import maximum_drawdown, percentile_ranks
+from utils import (
+    _summarize_cross_fitted_daily, build_ensemble_portfolio,
+    maximum_drawdown, percentile_ranks,
+)
 import joblib
 import os
 import json
@@ -1427,6 +1430,279 @@ def fixed_equal_top5_policy():
     ):
         raise AssertionError('v1.21 固定等权近满仓策略配置错误')
     return policy
+
+
+def allocation_weight_policy(allocation_blend):
+    """v1.22 的预注册权重候选：只允许等权与冻结 Allocation Head 混合。"""
+    allocation_blend = float(allocation_blend)
+    if allocation_blend not in {0.0, 0.25, 0.5}:
+        raise ValueError('v1.22 只允许 allocation_blend 为 0 / 0.25 / 0.5')
+    policy = fixed_equal_top5_policy()
+    policy.update({
+        'allocation_blend': allocation_blend,
+        'fixed_equal_top5_policy': False,
+        'position_weight_bounds': [
+            float(config['allocation_weight_floor']),
+            float(config['allocation_weight_cap']),
+        ],
+        'weight_candidate': (
+            'equal' if allocation_blend == 0.0
+            else f'allocation_{int(allocation_blend * 100):02d}'
+        ),
+    })
+    return policy
+
+
+def _allocation_oof_signature(source_dir, source_policy, features, records_by_fold):
+    """将权重缓存绑定到冻结模型、特征和全部外层 OOF 边界。"""
+    digest = hashlib.sha256()
+    digest.update(os.path.abspath(source_dir).encode('utf-8'))
+    for relative_path in source_policy['model_paths']:
+        path = os.path.join(source_dir, relative_path)
+        digest.update(sha256_file(path).encode('utf-8'))
+    for name in ('config.json', 'artifact_manifest.json', 'scaler.pkl', 'stockid2idx.json'):
+        digest.update(sha256_file(os.path.join(source_dir, name)).encode('utf-8'))
+    digest.update('\n'.join(features).encode('utf-8'))
+    for fold_id in sorted(records_by_fold):
+        digest.update(str(int(fold_id)).encode('utf-8'))
+        for record in sorted(records_by_fold[fold_id], key=lambda row: row['prediction_date']):
+            digest.update(record['prediction_date'].encode('utf-8'))
+            digest.update(np.asarray(record['stock_indices'], dtype=np.int64).tobytes())
+    return digest.hexdigest()
+
+
+def attach_frozen_allocation_oof_logits(
+    candidate_records, full_data, features, output_dir,
+):
+    """为 v1.21 外层树排序记录重放冻结 Transformer 的 Allocation Head。
+
+    这只读取 v1.20.1 的最终 checkpoint；每个日期仍由该折 LightGBM
+    选择股票，因此绝不把 Transformer score 回混到 v1.22 的选股信号中。
+    """
+    source_dir = os.path.abspath(config['tree_only_artifact_source_dir'])
+    required = ('config.json', 'ensemble_policy.json', 'artifact_manifest.json',
+                'scaler.pkl', 'stockid2idx.json')
+    missing = [name for name in required if not os.path.isfile(os.path.join(source_dir, name))]
+    if missing:
+        raise FileNotFoundError(f'v1.22 冻结 Allocation 来源缺少工件: {missing}')
+    with open(os.path.join(source_dir, 'config.json'), encoding='utf-8') as handle:
+        source_config = json.load(handle)
+    with open(os.path.join(source_dir, 'ensemble_policy.json'), encoding='utf-8') as handle:
+        source_policy = json.load(handle)
+    with open(os.path.join(source_dir, 'stockid2idx.json'), encoding='utf-8') as handle:
+        source_mapping = {str(key): int(value) for key, value in json.load(handle).items()}
+    if source_config.get('feature_num') != config['feature_num'] or len(features) != 205:
+        raise ValueError('v1.22 Allocation 来源必须是兼容的 205 维工件')
+    if len(source_policy.get('model_paths', [])) != 1:
+        raise ValueError('v1.22 仅允许引用冻结的单模型 Allocation Head')
+    source_model_path = os.path.join(source_dir, source_policy['model_paths'][0])
+    if not os.path.isfile(source_model_path):
+        raise FileNotFoundError(f'v1.22 缺少冻结 Allocation checkpoint: {source_model_path}')
+
+    signature = _allocation_oof_signature(
+        source_dir, source_policy, features, candidate_records,
+    )
+    cache_path = os.path.join(output_dir, 'allocation_oof_scores.joblib')
+    if os.path.isfile(cache_path):
+        payload = joblib.load(cache_path)
+        if payload.get('signature') == signature:
+            cached = payload.get('allocation_logits_by_fold', {})
+            if set(map(int, cached)) == set(map(int, candidate_records)):
+                print('复用冻结 Allocation Head OOF 权重缓存')
+                for fold_id, records in candidate_records.items():
+                    for record in records:
+                        logits = cached[str(fold_id)][record['prediction_date']]
+                        if len(logits) != len(record['stock_indices']):
+                            raise ValueError('Allocation OOF 缓存的股票边界不一致')
+                        record['allocation_logits'] = np.asarray(logits, dtype=np.float64)
+                return {
+                    'cache_path': os.path.basename(cache_path),
+                    'signature': signature,
+                    'source_dir': source_dir,
+                    'reused': True,
+                }
+
+    scaler = joblib.load(os.path.join(source_dir, 'scaler.pkl'))
+    if int(getattr(scaler, 'n_features_in_', len(scaler.mean_))) != len(features):
+        raise ValueError('冻结 Allocation Scaler 与 v1.22 特征维度不一致')
+    expected_instruments = {int(value) for value in source_mapping.values()}
+    available_instruments = set(full_data['instrument'].astype(int).unique())
+    if not expected_instruments.issubset(available_instruments):
+        raise ValueError('v1.22 OOF 股票映射不能覆盖冻结 Allocation Head')
+    grouped = {
+        int(instrument): rows.sort_values('日期', kind='mergesort')
+        for instrument, rows in full_data.groupby('instrument', sort=False)
+    }
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    configure_accelerator(device)
+    model = StockTransformer(
+        input_dim=len(features), config=source_config, num_stocks=len(source_mapping),
+    )
+    model.load_state_dict(torch.load(source_model_path, map_location=device, weights_only=True))
+    model.to(device)
+    model.eval()
+    cache = {str(int(fold)): {} for fold in candidate_records}
+    records = [
+        (int(fold_id), record)
+        for fold_id, fold_records in sorted(candidate_records.items())
+        for record in sorted(fold_records, key=lambda row: row['prediction_date'])
+    ]
+    print('阶段 v1.22：按外层 OOF 日期重放冻结 Allocation Head 权重')
+    with tqdm(records, desc='Allocation Head OOF 重放', unit='日期', dynamic_ncols=True) as progress:
+        with torch.inference_mode():
+            for fold_id, record in progress:
+                prediction_date = pd.Timestamp(record['prediction_date'])
+                instruments = np.asarray(record['stock_indices'], dtype=np.int64)
+                windows = []
+                for instrument in instruments:
+                    history = grouped.get(int(instrument))
+                    if history is None:
+                        raise ValueError(f'Allocation OOF 缺少 instrument={instrument}')
+                    window = history.loc[history['日期'] <= prediction_date].tail(
+                        int(source_config['sequence_length'])
+                    )
+                    if len(window) != int(source_config['sequence_length']):
+                        raise ValueError(
+                            f'Allocation OOF {prediction_date.date()} 缺少完整序列: {instrument}'
+                        )
+                    windows.append(window[features].to_numpy(dtype=np.float32))
+                sequences = np.stack(windows, axis=0)
+                scaled = scaler.transform(sequences.reshape(-1, len(features))).reshape(sequences.shape)
+                sequence_tensor = torch.from_numpy(scaled.astype(np.float32)).unsqueeze(0).to(device)
+                instrument_tensor = torch.from_numpy(instruments).long().unsqueeze(0).to(device)
+                mask = torch.ones_like(instrument_tensor, dtype=torch.float32)
+                with torch.autocast(
+                    device_type=device.type, dtype=torch.float16,
+                    enabled=device.type == 'cuda' and source_config.get('amp_enabled', True),
+                ):
+                    _, _, allocation_output, _, _ = model(
+                        sequence_tensor, instrument_tensor, mask, return_aux=True,
+                    )
+                logits = allocation_output.squeeze(0).float().cpu().numpy()
+                record['allocation_logits'] = logits.astype(np.float64)
+                cache[str(fold_id)][record['prediction_date']] = logits.astype(np.float32)
+    save_joblib_checkpoint({
+        'signature': signature,
+        'source_dir': source_dir,
+        'source_model_sha256': sha256_file(source_model_path),
+        'allocation_logits_by_fold': cache,
+    }, cache_path)
+    print(f'冻结 Allocation Head OOF 权重缓存已原子写入: {cache_path}')
+    return {
+        'cache_path': os.path.basename(cache_path),
+        'signature': signature,
+        'source_dir': source_dir,
+        'reused': False,
+    }
+
+
+def _allocation_policy_summary(metrics):
+    daily = metrics['daily']
+    weights = np.asarray([
+        value for row in daily for value in row.get('positions', [])
+    ], dtype=np.float64)
+    entropy = np.asarray([
+        -np.sum(np.asarray(row.get('relative_weights', []), dtype=np.float64)
+                * np.log(np.clip(row.get('relative_weights', []), 1e-12, 1.0)))
+        for row in daily
+    ], dtype=np.float64)
+    return {
+        'mean_return': float(metrics['mean_weighted_portfolio_return']),
+        'p10_return': float(metrics['p10_weighted_portfolio_return']),
+        'worst_daily_return': float(metrics['worst_weighted_portfolio_return']),
+        'fold_returns': {
+            str(int(row['fold'])): float(row['mean_weighted_portfolio_return'])
+            for row in metrics['folds']
+        },
+        'mean_weight_entropy': float(entropy.mean()) if entropy.size else 0.0,
+        'mean_max_position': float(np.mean([
+            max(row.get('positions', [0.0])) for row in daily
+        ])) if len(weights) else 0.0,
+        'mean_weight_entropy': float(entropy.mean()) if entropy.size else 0.0,
+    }
+
+
+def select_forward_allocation_policy(candidate_days, folds):
+    """严格前向地选择 Allocation Head 混合，最后部署只看 F1/F2。"""
+    policies = {blend: allocation_weight_policy(blend) for blend in config['allocation_blend_grid']}
+    if set(policies) != {0.0, 0.25, 0.5}:
+        raise ValueError('v1.22 Allocation 候选必须精确为 0/0.25/0.5')
+    metrics_by_blend = {
+        blend: evaluate_ensemble_policy(candidate_days, policy, include_daily=True)
+        for blend, policy in policies.items()
+    }
+
+    def choose(calibration_folds):
+        equal_days = [day for day in candidate_days if int(day['fold']) in calibration_folds]
+        equal = evaluate_ensemble_policy(equal_days, policies[0.0], include_daily=True)
+        eligible = []
+        for blend in (0.25, 0.5):
+            candidate = evaluate_ensemble_policy(equal_days, policies[blend], include_daily=True)
+            fold_equal = {int(row['fold']): row for row in equal['folds']}
+            fold_candidate = {int(row['fold']): row for row in candidate['folds']}
+            fold_non_negative = all(
+                fold_candidate[fold]['mean_weighted_portfolio_return']
+                >= fold_equal[fold]['mean_weighted_portfolio_return'] - 1e-12
+                for fold in calibration_folds
+            )
+            passes = bool(
+                candidate['mean_weighted_portfolio_return']
+                >= equal['mean_weighted_portfolio_return']
+                + float(config['allocation_forward_min_mean_gain'])
+                and fold_non_negative
+                and candidate['p10_weighted_portfolio_return']
+                >= equal['p10_weighted_portfolio_return']
+                - float(config['allocation_forward_max_p10_loss'])
+                and candidate['worst_weighted_portfolio_return']
+                >= equal['worst_weighted_portfolio_return']
+                - float(config['allocation_forward_max_worst_day_loss'])
+            )
+            if passes:
+                eligible.append((candidate['mean_weighted_portfolio_return'], blend, candidate))
+        if not eligible:
+            return 0.0, 'fallback_equal_no_non_equal_candidate_passed', equal
+        _, blend, candidate = max(eligible, key=lambda row: (row[0], -row[1]))
+        return blend, 'strict_earlier_folds_passed', candidate
+
+    held_out_daily, fold_policies = [], []
+    for fold in folds:
+        fold_id = int(fold['fold'])
+        held_out_days = [day for day in candidate_days if int(day['fold']) == fold_id]
+        if fold_id == 1:
+            blend, source = 0.0, 'warmup_equal'
+            calibration_folds = []
+        else:
+            calibration_folds = list(range(1, fold_id))
+            blend, source, _ = choose(calibration_folds)
+        held_out_metrics = evaluate_ensemble_policy(
+            held_out_days, policies[blend], include_daily=True,
+        )
+        held_out_daily.extend(held_out_metrics['daily'])
+        fold_policies.append({
+            'held_out_fold': fold_id,
+            'calibration_folds': calibration_folds,
+            'weight_candidate': policies[blend]['weight_candidate'],
+            'allocation_blend': blend,
+            'selection_source': source,
+        })
+    forward_metrics = dict(evaluate_ensemble_policy(
+        candidate_days, policies[0.0], include_daily=True,
+    ))
+    forward_metrics['daily'] = held_out_daily
+    # 汇总必须反映逐折实际使用的权重，不能用等权汇总替代。
+    forward_metrics = _summarize_cross_fitted_daily(
+        held_out_daily, float(policies[0.0]['downside_weight']),
+    )
+    deployment_blend, deployment_source, _ = choose([1, 2])
+    return {
+        'policies': policies,
+        'all_oof_metrics': metrics_by_blend,
+        'cross_fitted_metrics': forward_metrics,
+        'fold_policies': fold_policies,
+        'deployment_blend': deployment_blend,
+        'deployment_source': deployment_source,
+        'deployment_policy': policies[deployment_blend],
+    }
 
 
 def attach_oof_strategy_metadata(ensemble_days, data):
@@ -5597,6 +5873,270 @@ def run_v21_tree_only(full_df, full_data, features, folds, output_dir, lockbox_s
     return float(candidate_metrics['mean_weighted_portfolio_return'])
 
 
+def run_v22_allocation_tree_only(full_df, full_data, features, folds, output_dir, lockbox_start):
+    """v1.22：保持 v1.21 选股，严格前向决定是否使用冻结 Allocation Head。"""
+    print('阶段 v1.22 1/6：加载冻结 v1.17 同仓位纯排序基线')
+    trading_dates = full_df['日期'].dropna().unique()
+    _, _, baseline_records = load_frozen_v17_oof_records(folds, trading_dates)
+    baseline_records = remap_oof_records_to_official_labels(baseline_records, full_data)
+    baseline_days = []
+    for fold in folds:
+        baseline_days.extend(align_oof_prediction_records(
+            [baseline_records[int(fold['fold'])]], int(fold['fold']),
+        ))
+    attach_oof_strategy_metadata(baseline_days, full_data)
+
+    print('阶段 v1.22 2/6：内层早停、外层重训与严格 LightGBM OOF')
+    lgbm_folds, candidate_records = fit_strict_lgbm_oof_records(
+        full_data, features, folds, baseline_records, output_dir,
+    )
+    print('阶段 v1.22 3/6：重放冻结 Transformer Allocation Head（不训练）')
+    allocation_cache = attach_frozen_allocation_oof_logits(
+        candidate_records, full_data, features, output_dir,
+    )
+    candidate_days = []
+    for fold in folds:
+        candidate_days.extend(align_oof_prediction_records(
+            [candidate_records[int(fold['fold'])]], int(fold['fold']),
+        ))
+    attach_oof_strategy_metadata(candidate_days, full_data)
+
+    print('阶段 v1.22 4/6：严格前向选择等权 / Allocation Head 权重')
+    allocation_selection = select_forward_allocation_policy(candidate_days, folds)
+    baseline_policy = allocation_weight_policy(0.0)
+    baseline_metrics = evaluate_ensemble_policy(
+        baseline_days, baseline_policy, include_daily=True,
+    )
+    cross_metrics = allocation_selection['cross_fitted_metrics']
+    promotion_criteria = promotion_against_baseline(cross_metrics, baseline_metrics)
+    deployment_policy = dict(allocation_selection['deployment_policy'])
+    deployment_policy.update({
+        'candidate_name': 'recent504_lambdarank_top5_allocation_strict',
+        'pre_registered': True,
+        'tree_only_lgbm': True,
+        'allocation_strict_policy': True,
+        'policy_role': 'strict_forward_allocation_head_or_equal',
+        'promotion_metric_source': 'cross_fitted_oof_strict_forward_allocation',
+        'ensemble_enabled': False,
+        'ensemble_seeds': [42],
+        'mode': 'tree_only_lgbm',
+        'fixed_equal_top5_policy': False,
+        'lgbm_train_window_days': int(config['lgbm_train_window_days']),
+        'lgbm_training_protocol': 'inner_40d_purge5_outer_refit_no_outer_early_stop',
+        'lgbm_objective': config['lgbm_objective'],
+        'lgbm_label_mode': config['lgbm_label_mode'],
+        'lgbm_label_gain': list(config['lgbm_label_gain']),
+        'lgbm_truncation_level': int(config['lgbm_truncation_level']),
+        'max_stocks_per_industry': None,
+        'promotion_criteria': promotion_criteria,
+        'allocation_forward_selection': {
+            'deployment_source': allocation_selection['deployment_source'],
+            'deployment_calibration_folds': [1, 2],
+            'candidate_blends': sorted(float(value) for value in allocation_selection['policies']),
+            'minimum_mean_gain': float(config['allocation_forward_min_mean_gain']),
+            'maximum_p10_loss': float(config['allocation_forward_max_p10_loss']),
+            'maximum_worst_day_loss': float(config['allocation_forward_max_worst_day_loss']),
+        },
+    })
+    source_dir = os.path.abspath(config['tree_only_artifact_source_dir'])
+    with open(os.path.join(source_dir, 'ensemble_policy.json'), encoding='utf-8') as handle:
+        source_policy = json.load(handle)
+    deployment_policy.update({
+        'artifact_source_dir': os.path.relpath(source_dir, output_dir),
+        'model_paths': source_policy['model_paths'],
+        'scaler_path': source_policy.get('scaler_path', 'scaler.pkl'),
+        'config_path': source_policy.get('config_path', 'config.json'),
+        'manifest_path': source_policy.get('manifest_path', 'artifact_manifest.json'),
+    })
+
+    print('阶段 v1.22 5/6：以三折中位树数重训最终近期 LightGBM')
+    deployment_policy['lgbm_model_path'] = fit_lgbm_final(
+        full_data, features, lgbm_folds, output_dir,
+    )
+    deployment_policy['lgbm_artifact_dir'] = '.'
+    deployment_policy['lgbm_weight'] = 1.0
+    with open(os.path.join(output_dir, 'ensemble_policy.json'), 'w', encoding='utf-8') as handle:
+        json.dump(deployment_policy, handle, indent=2, ensure_ascii=False)
+
+    manifest_path = os.path.join(output_dir, 'artifact_manifest.json')
+    with open(manifest_path, encoding='utf-8') as handle:
+        manifest = json.load(handle)
+    manifest.update({
+        'schema_version': 3,
+        'tree_only_lgbm': True,
+        'allocation_strict_policy': True,
+        'artifact_source_dir': deployment_policy['artifact_source_dir'],
+        'artifact_source_manifest_sha256': sha256_file(
+            os.path.join(source_dir, 'artifact_manifest.json')
+        ),
+        'allocation_oof_cache': allocation_cache,
+        'lgbm': {
+            'objective': config['lgbm_objective'],
+            'label_mode': config['lgbm_label_mode'],
+            'label_gain': list(config['lgbm_label_gain']),
+            'truncation_level': int(config['lgbm_truncation_level']),
+            'train_window_days': int(config['lgbm_train_window_days']),
+            'inner_validation_days': int(config['lgbm_inner_validation_days']),
+            'inner_purge_days': int(config['lgbm_inner_purge_days']),
+            'folds': lgbm_folds,
+        },
+    })
+    atomic_write_json(manifest_path, manifest)
+
+    candidate_reports = {
+        allocation_selection['policies'][blend]['weight_candidate']: {
+            **_allocation_policy_summary(metrics),
+            'allocation_blend': float(blend),
+            'daily': metrics['daily'],
+        }
+        for blend, metrics in allocation_selection['all_oof_metrics'].items()
+    }
+    summary = {
+        'training_mode': 'tree_only_lgbm_strict_inner_early_stopping_with_frozen_allocation_head',
+        'num_folds': len(folds),
+        'evaluation_stride': int(config['evaluation_stride']),
+        'ensemble_seeds': [42],
+        'source_training_folds': [],
+        'folds': lgbm_folds,
+        'lgbm_training': {
+            'protocol': deployment_policy['lgbm_training_protocol'],
+            'folds': lgbm_folds,
+            'final_model_iterations': int(np.median([
+                row['outer_iterations'] for row in lgbm_folds
+            ])),
+        },
+        'allocation_weight_protocol': {
+            'source': 'frozen_v1.20.1_transformer_allocation_head',
+            'outer_selection': 'v1.21_lambdarank_top5',
+            'candidate_reports': candidate_reports,
+            'cross_fitted_fold_policies': allocation_selection['fold_policies'],
+            'deployment_candidate': deployment_policy['weight_candidate'],
+            'deployment_source': allocation_selection['deployment_source'],
+            'deployment_calibration_folds': [1, 2],
+        },
+        'promotion_baseline': 'frozen_v1.17_score_only_equal_top5_full_exposure',
+        'score_only_baseline': baseline_metrics,
+        'ensemble_oof': cross_metrics,
+        'cross_fitted_oof': {
+            'method': 'strict_forward_allocation_head_f1_warmup_f2_from_f1_f3_from_f1_f2',
+            'metrics': cross_metrics,
+            'fold_policies': allocation_selection['fold_policies'],
+        },
+        'deployment_oof': allocation_selection['all_oof_metrics'][
+            allocation_selection['deployment_blend']
+        ],
+        'deployment_policy': deployment_policy,
+        'promotion_criteria': promotion_criteria,
+        'pre_registered_candidates': candidate_reports,
+        'full_training': {
+            'skipped': True,
+            'reason': 'v1.22_only_retrains_lightgbm_and_replays_frozen_allocation_head',
+            'models': [],
+        },
+        'allocation_blend': float(deployment_policy['allocation_blend']),
+        'selection_risk_gamma': 0.0,
+        'risk_score_penalty': 0.0,
+        'correlation_exposure_gamma': 0.0,
+        'exposure_head_blend': 0.0,
+        'mean_top5_return': cross_metrics['mean_top5_return'],
+        'worst_fold_top5_return': cross_metrics['worst_fold_top5_return'],
+        'mean_weighted_portfolio_return': cross_metrics['mean_weighted_portfolio_return'],
+        'worst_fold_weighted_portfolio_return': cross_metrics['worst_fold_weighted_portfolio_return'],
+        'mean_rank_ic': cross_metrics['mean_rank_ic'],
+    }
+    atomic_write_json(os.path.join(output_dir, 'cross_validation_summary.json'), summary)
+    print(
+        'v1.22 严格前向权重选择：'
+        f"{deployment_policy['weight_candidate']} "
+        f"(Allocation={deployment_policy['allocation_blend']:.2f}; "
+        f"{allocation_selection['deployment_source']})"
+    )
+    print('v1.22 晋级：' + ('PASS' if promotion_criteria['passed'] else 'FAIL'))
+    return float(cross_metrics['mean_weighted_portfolio_return'])
+
+
+def require_v22_final_submission():
+    """最终提交只冻结 v1.22 的已完成 OOF 选择，不要求或读取 7 月 31 日未来标签。"""
+    requested = os.environ.get('FINAL_SUBMISSION_DATE', '').strip()
+    if requested != '2026-07-31':
+        raise ValueError('v1.22 最终提交需要 FINAL_SUBMISSION_DATE=2026-07-31')
+    candidate_dir = (
+        f"./model/{config['sequence_length']}_{config['feature_num']}_"
+        f"{config['experiment_name']}_candidate"
+    )
+    policy_path = os.path.join(candidate_dir, 'ensemble_policy.json')
+    summary_path = os.path.join(candidate_dir, 'cross_validation_summary.json')
+    for path, label in ((policy_path, '冻结 v1.22 candidate 策略'), (summary_path, '冻结 v1.22 OOF 报告')):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'最终提交拟合缺少{label}: {path}')
+    with open(policy_path, encoding='utf-8') as handle:
+        policy = json.load(handle)
+    if not policy.get('allocation_strict_policy', False):
+        raise ValueError('最终提交只允许 v1.22 严格前向 Allocation 策略')
+    if not policy.get('promotion_criteria', {}).get('passed', False):
+        raise ValueError('v1.22 candidate 未通过三折晋级，禁止最终提交拟合')
+    if os.path.exists(config['final_submission_output_dir']):
+        raise FileExistsError(f'最终提交目录已存在，拒绝覆盖: {config["final_submission_output_dir"]}')
+    return candidate_dir, policy
+
+
+def run_v22_final_submission(output_dir):
+    """只重训最终树模型；Allocation Head 与前向选权策略均冻结。"""
+    candidate_dir, candidate_policy = require_v22_final_submission()
+    with open(os.path.join(candidate_dir, 'cross_validation_summary.json'), encoding='utf-8') as handle:
+        candidate_summary = json.load(handle)
+    source_dir = os.path.normpath(os.path.join(
+        candidate_dir, candidate_policy['artifact_source_dir'],
+    ))
+    os.makedirs(output_dir, exist_ok=False)
+    with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+    data_file = os.path.join(config['data_path'], 'train.csv')
+    raw = pd.read_csv(data_file, dtype={'股票代码': str})
+    raw['股票代码'] = raw['股票代码'].astype(str).str.zfill(6)
+    raw['日期'] = pd.to_datetime(raw['日期'])
+    if raw['日期'].max() != pd.Timestamp('2026-07-31'):
+        raise ValueError('最终提交要求本地行情数据恰好更新至 2026-07-31')
+    with open(os.path.join(source_dir, 'stockid2idx.json'), encoding='utf-8') as handle:
+        stockid2idx = json.load(handle)
+    if set(raw['股票代码'].unique()) != set(stockid2idx):
+        raise ValueError('最终提交股票池必须与冻结 Allocation Head 映射完全一致')
+    print('阶段 最终提交 v1.22：构建截至 2026-07-31 的特征，仅使用已完整标签训练树模型')
+    full_data, features = preprocess_data(raw, is_train=True, stockid2idx=stockid2idx)
+    full_data['日期'] = pd.to_datetime(full_data['日期'])
+    lgbm_folds = candidate_summary['lgbm_training']['folds']
+    write_v17_manifest(output_dir, features, [], None, len(stockid2idx))
+    lgbm_path = fit_lgbm_final(full_data, features, lgbm_folds, output_dir)
+    final_policy = dict(candidate_policy)
+    final_policy.update({
+        'policy_role': 'v1.22_submission_frozen_forward_allocation_policy',
+        'artifact_source_dir': os.path.relpath(source_dir, output_dir),
+        'lgbm_model_path': lgbm_path,
+        'lgbm_artifact_dir': '.',
+        'final_submission_as_of': '2026-07-31',
+        'final_submission_training_label_end': full_data['日期'].max().strftime('%Y-%m-%d'),
+        'final_submission_recalibrated': False,
+        'final_submission_oof_source_sha256': sha256_file(
+            os.path.join(candidate_dir, 'cross_validation_summary.json')
+        ),
+    })
+    atomic_write_json(os.path.join(output_dir, 'ensemble_policy.json'), final_policy)
+    final_summary = dict(candidate_summary)
+    final_summary.update({
+        'training_mode': 'v1.22_final_submission_lgbm_only_frozen_allocation_policy',
+        'final_submission': {
+            'as_of_date': '2026-07-31',
+            'candidate_dir': os.path.relpath(candidate_dir, output_dir),
+            'artifact_source_dir': os.path.relpath(source_dir, output_dir),
+            'selection_recalibrated': False,
+            'future_2026_07_31_return_used': False,
+        },
+    })
+    atomic_write_json(os.path.join(output_dir, 'cross_validation_summary.json'), final_summary)
+    print(f'v1.22 最终提交树模型已写入独立目录: {output_dir}')
+    return 0.0
+
+
 def main():
     if stress_eval_enabled() or known_stress_eval_enabled():
         if lockbox_eval_enabled():
@@ -5616,7 +6156,11 @@ def main():
     final_submission = os.environ.get('FINAL_SUBMISSION_FIT', '0') == '1'
     if final_deployment and final_submission:
         raise ValueError('最终部署重训与 FINAL_SUBMISSION_FIT 不能同时启用')
-    if final_submission and config.get('tree_only_lgbm', False):
+    if (
+        final_submission
+        and config.get('tree_only_lgbm', False)
+        and not config.get('allocation_strict_policy', False)
+    ):
         raise ValueError(
             'v1.21 没有新的未见两个月 lockbox，禁止最终提交重训；'
             '请保留 v1.17 部署工件。'
@@ -5625,6 +6169,8 @@ def main():
         require_accepted_lockbox_for_deployment()
         return run_frozen_final_deployment(config['output_dir'])
     if final_submission:
+        if config.get('allocation_strict_policy', False):
+            return run_v22_final_submission(config['output_dir'])
         require_final_submission_audit()
         return run_frozen_final_deployment(
             config['output_dir'],
@@ -5699,7 +6245,11 @@ def main():
         output_dir, features, folds, lockbox_start, len(stockid2idx),
     )
     if config.get('tree_only_lgbm', False):
-        print('阶段 v1.21：特征与 manifest 已就绪，进入纯 LightGBM 训练')
+        print('阶段 v1.22：特征与 manifest 已就绪，进入纯 LightGBM 与严格 Allocation 权重重放')
+        if config.get('allocation_strict_policy', False):
+            return run_v22_allocation_tree_only(
+                full_df, full_data, features, folds, output_dir, lockbox_start,
+            )
         return run_v21_tree_only(
             full_df, full_data, features, folds, output_dir, lockbox_start,
         )

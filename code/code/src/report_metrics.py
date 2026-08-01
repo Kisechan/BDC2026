@@ -185,17 +185,22 @@ def print_cross_validation() -> None:
     if cross_fitted.get("fold_policies"):
         print("嵌套 OOF 留出折策略:")
         for row in cross_fitted["fold_policies"]:
-            selected = row["policy"]
+            selected = row.get("policy", row)
             print(
                 f"  Fold {row['held_out_fold']} <- calibration "
                 f"{row['calibration_folds']}: "
                 f"Allocation={float(selected['allocation_blend']):.2f}, "
-                f"Exposure={float(selected['exposure_head_blend']):.2f}, "
-                f"Risk={float(selected['risk_score_penalty']):.2f}, "
-                f"Reversal={float(selected['selection_risk_gamma']):.2f}, "
+                f"Exposure={float(selected.get('exposure_head_blend', 0.0)):.2f}, "
+                f"Risk={float(selected.get('risk_score_penalty', 0.0)):.2f}, "
+                f"Reversal={float(selected.get('selection_risk_gamma', 0.0)):.2f}, "
                 f"CorrExposure="
-                f"{float(selected['correlation_exposure_gamma']):.2f}"
+                f"{float(selected.get('correlation_exposure_gamma', 0.0)):.2f}"
             )
+            if 'weight_candidate' in row:
+                print(
+                    f"    权重候选={row['weight_candidate']}; "
+                    f"来源={row.get('selection_source', '-') }"
+                )
         module_reports = summary.get("module_alternative_reports", {})
         if module_reports:
             print("全量 OOF 模块最佳替代方案（仅诊断，不直接部署）:")
@@ -301,14 +306,17 @@ def print_cross_validation() -> None:
     if candidates:
         print('预注册策略候选（不做事后融合）:')
         for name, candidate in candidates.items():
-            metrics = candidate.get('metrics', {})
-            gate = candidate.get('promotion_criteria', {})
+            metrics = candidate.get('metrics', candidate)
+            gate = candidate.get('promotion_criteria')
             print(
-                f"  {name}: LGBM权重={float(candidate.get('lgbm_weight', 0.0)):.2f}, "
+                f"  {name}: Allocation={float(candidate.get('allocation_blend', 0.0)):.2f}, "
                 f"动态收益={_pct(float(metrics.get('mean_weighted_portfolio_return', 0.0)))}, "
                 f"P10={_pct(float(metrics.get('p10_weighted_portfolio_return', 0.0)))}, "
                 f"Rank IC={float(metrics.get('mean_rank_ic', 0.0)):+.4f}, "
-                f"晋级={'PASS' if gate.get('passed') else 'FAIL'}"
+                + (
+                    f"晋级={'PASS' if gate.get('passed') else 'FAIL'}"
+                    if gate is not None else '前向权重候选（非独立模型晋级）'
+                )
             )
     score_only_baseline = summary.get('score_only_baseline')
     if score_only_baseline:
@@ -462,12 +470,25 @@ def print_prediction_diagnostics() -> None:
         print(f"{day.get('date', '-')}: {', '.join(stock_ids) or '-'}")
         if stock_ids:
             print('  持仓—代码 / 名称 / 权重:')
+            learned = diagnostics.get('ensemble', {}).get('learned_relative_weights', [])
+            final_relative = diagnostics.get('ensemble', {}).get('final_relative_weights', [])
+            weight_source = diagnostics.get('policy', {}).get('weight_candidate', 'legacy')
+            print(f'    权重来源: {weight_source}')
             for stock_id in stock_ids:
                 weight = holding_weights.get(stock_id)
                 weight_text = _pct(float(weight)) if pd.notna(weight) else '-'
+                index = stock_ids.index(stock_id)
+                raw_text = (
+                    _pct(float(learned[index]))
+                    if index < len(learned) else '-'
+                )
+                final_text = (
+                    _pct(float(final_relative[index]))
+                    if index < len(final_relative) else '-'
+                )
                 print(
                     f"    {stock_id} / {stock_names.get(stock_id, '未知')} / "
-                    f"{weight_text}"
+                    f"提交 {weight_text} / Allocation原始 {raw_text} / 混合后 {final_text}"
                 )
         print(
             "  状态—"

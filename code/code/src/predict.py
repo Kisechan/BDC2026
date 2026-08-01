@@ -553,6 +553,33 @@ def compare_runtime_configs(saved_config, live_config):
 	}
 
 
+def resolve_market_data_file(trained_config):
+	"""优先读取赛事挂载的 stock_data.csv，兼容本地训练的 train.csv。"""
+	candidates = []
+	for root in (
+		os.environ.get('DATA_PATH'),
+		os.environ.get('COMPETITION_DATA_PATH'),
+		trained_config.get('data_path'),
+		'./data',
+		'./data_5y',
+	):
+		if not root:
+			continue
+		root = os.path.abspath(root)
+		if os.path.isfile(root):
+			candidates.append(root)
+		else:
+			candidates.extend([
+				os.path.join(root, 'stock_data.csv'),
+				os.path.join(root, 'train.csv'),
+			])
+	for path in candidates:
+		if os.path.isfile(path):
+			return path
+	raised = ', '.join(dict.fromkeys(candidates))
+	raise FileNotFoundError(f'未找到行情输入（stock_data.csv 或 train.csv）: {raised}')
+
+
 def main():
 	# 锁箱回放通过环境变量固定 as-of 日期与临时输出，默认行为仍是当前目录最新日推理。
 	output_dir = os.environ.get('MODEL_OUTPUT_DIR', config['output_dir'])
@@ -658,7 +685,8 @@ def main():
 		if not os.path.exists(model_path):
 			raise FileNotFoundError(f'未找到 ensemble 模型: {model_path}')
 
-	data_file = os.path.join(trained_config['data_path'], 'train.csv')
+	data_file = resolve_market_data_file(trained_config)
+	print(f'推理行情输入: {data_file}')
 	raw_df = pd.read_csv(data_file, dtype={'股票代码': str})
 	raw_df['股票代码'] = raw_df['股票代码'].astype(str).str.zfill(6)
 	raw_df['日期'] = pd.to_datetime(raw_df['日期'])
@@ -1106,6 +1134,7 @@ def main():
 			if industry_labels is not None else None
 		),
 		industry_candidate_k=int(policy.get('industry_candidate_k', 10)),
+		position_weight_bounds=policy.get('position_weight_bounds'),
 		top_k=int(policy.get('top_k', 5)),
 	)
 	top_indices = portfolio['top_indices']
@@ -1155,6 +1184,7 @@ def main():
 		'promotion_criteria': policy.get('promotion_criteria', {}),
 		'daily': [prediction_day],
 		'policy': {
+			'weight_candidate': policy.get('weight_candidate', 'legacy'),
 			'allocation_blend': float(policy['allocation_blend']),
 			'disagreement_gamma': float(policy['disagreement_gamma']),
 			'selection_risk_gamma': float(policy.get(
@@ -1258,6 +1288,12 @@ def main():
 				for selected_rank, index in enumerate(top_indices, start=1)
 			],
 			'weights': [float(weight) for weight in position_weights],
+			'learned_relative_weights': [
+				float(weight) for weight in portfolio['learned_weights']
+			],
+			'final_relative_weights': [
+				float(weight) for weight in portfolio['relative_weights']
+			],
 			'ensemble_scores': [
 				float(portfolio['ensemble_scores'][index])
 				for index in top_indices

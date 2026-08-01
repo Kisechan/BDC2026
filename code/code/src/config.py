@@ -2,7 +2,7 @@
 sequence_length = 60
 feature_num = '158+39_reduced25_relmarket12_risk15_indresid12'
 patience_num = 12
-experiment_name = 'threefold_recent504_lambdarank_top5_strict_v21'
+experiment_name = 'threefold_recent504_lambdarank_top5_allocation_strict_v22'
 # v1.20 从独立目录训练 RankGLU；仅 v1.17 基线用于三折晋级对照，
 # 不把不同 score head 的 checkpoint、scaler 或 manifest 混用。
 artifact_experiment_name = (
@@ -113,7 +113,9 @@ config = {
     'exposure_risk_penalty_init': 0.25,
     'min_exposure': 0.20,
     'max_exposure': 0.999999,
-    'allocation_blend_grid': [0.0],
+    # v1.22 仅比较已经预注册的等权与 Allocation Head 混合；绝不在
+    # 7 月 31 日持仓的未知收益上继续搜索权重。
+    'allocation_blend_grid': [0.0, 0.25, 0.50],
     'allocation_weight_floor': 0.05,
     'allocation_weight_cap': 0.35,
     'disagreement_gamma_grid': [0.0],
@@ -133,6 +135,7 @@ config = {
     # v1.21 只重训主选股树模型。Transformer 仅作为冻结的205维特征、
     # scaler 与推理兼容性来源，不参与训练或选股。
     'tree_only_lgbm': True,
+    'allocation_strict_policy': True,
     'tree_only_artifact_source_dir': (
         './model/60_158+39_reduced25_relmarket12_risk15_indresid12_'
         'threefold_recent504_rankxendcg_officialraw_v20_1_candidate'
@@ -173,8 +176,11 @@ config = {
     'forward_module_max_p10_loss': 0.005,
     'minimum_allocation_deployment_blend': 0.0,
     'minimum_exposure_deployment_blend': 0.0,
-    # 固定策略不走模块标定，避免全量部署策略与逐折等权策略不一致。
-    'fixed_equal_top5_policy': True,
+    # v1.22 只做严格前向的 Allocation Head 权重选择；其余模块保持关闭。
+    'fixed_equal_top5_policy': False,
+    'allocation_forward_min_mean_gain': 0.001,
+    'allocation_forward_max_p10_loss': 0.001,
+    'allocation_forward_max_worst_day_loss': 0.001,
     'listwise_temperature': 0.2,
     'listwise_weight': 0.2,
     'ic_weight': 0.15,
@@ -252,10 +258,10 @@ config = {
         'threefold_industryresidual_lgbmblend_pathrisk_v17_baseline'
     ),
     'full_deployment_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.21_full_history_deployment'
+        f'./model/{sequence_length}_{feature_num}_v1.22_full_history_deployment'
     ),
     'final_submission_output_dir': (
-        f'./model/{sequence_length}_{feature_num}_v1.21_submission_2026-07-31'
+        f'./model/{sequence_length}_{feature_num}_v1.22_submission_2026-07-31'
     ),
     # v1.19 已消费这段压力期；它只能做诊断，不能充当 v1.20 新锁箱。
     'known_stress_start': '2026-06-01',
