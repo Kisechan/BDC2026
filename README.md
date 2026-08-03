@@ -1,5 +1,8 @@
 # BDC2026 — 沪深300 排序学习选股方案
 
+> [!NOTE]
+> 本 README 文档大部分内容由 AI 编写。
+
 [第十一届「中国高校计算机大赛—大数据挑战赛」(BDC2026)](https://www.heywhale.com/org/r9xi8/competition/area/69c0dfa34f302f8f0122e1bb/content) 参赛项目，在 [THU-BDC2026](https://github.com/Sherlock1956/THU-BDC2026) 官方基线（`StockTransformer` 排序选股）上迭代改进，最终以 **LightGBM LambdaRank 严格 Top-5 选股** 方案参赛。
 
 - **赛题**：基于沪深300成分股历史日线行情，预测未来一周收益最大的 ≤5 只股票组合（T+1 开盘买入、T+5 开盘卖出），权重累加和 ≤ 1，按组合收益率 `R_total = Σ wᵢ × (P_open,T+5 − P_open,T+1) / P_open,T+1` 排名。
