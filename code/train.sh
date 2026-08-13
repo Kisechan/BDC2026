@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
 start_time=$(date +%s)
-uv run --locked python code/src/train.py
+python code/src/train.py
 elapsed_seconds=$(( $(date +%s) - start_time ))
 
 printf '训练总耗时: %02d:%02d:%02d\n' \

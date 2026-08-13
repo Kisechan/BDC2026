@@ -32,8 +32,19 @@ COPY pyproject.toml uv.lock ./
 # Install dependencies
 RUN uv sync --frozen
 
-# Copy the application code
-COPY . .
+# 仅打包本次提交的复现闭包：运行代码、最终 v1.22 工件、其冻结 v1.20.1
+# Transformer/Scaler 来源，以及对应的五年赛事行情和行业历史快照。历史试验、日志和
+# 开发用数据均不进入镜像，避免无关文件影响镜像体积或人工复核。
+COPY code ./code
+COPY data_5y ./data_5y
+COPY model/60_158+39_reduced25_relmarket12_risk15_indresid12_v1.22_submission_2026-07-31 \
+     ./model/60_158+39_reduced25_relmarket12_risk15_indresid12_v1.22_submission_2026-07-31
+COPY model/60_158+39_reduced25_relmarket12_risk15_indresid12_threefold_recent504_rankxendcg_officialraw_v20_1_candidate \
+     ./model/60_158+39_reduced25_relmarket12_risk15_indresid12_threefold_recent504_rankxendcg_officialraw_v20_1_candidate
+COPY init.sh train.sh test.sh README.md ./
+
+RUN chmod 755 /app/init.sh /app/train.sh /app/test.sh && \
+    mkdir -p /app/data /app/output /app/temp
 
 # Set environment to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
