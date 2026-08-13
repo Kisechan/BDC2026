@@ -1,4 +1,8 @@
-set -eu
+#!/usr/bin/env bash
+# 赛事推理入口。依赖已在镜像构建阶段安装，运行时禁止联网和依赖同步。
+set -euo pipefail
+
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 # 最终提交工件存在时，默认验证它；开发期 candidate 仍可通过
 # MODEL_OUTPUT_DIR 显式指定。这样容器的 data/run.sh 直接执行 test.sh
@@ -15,5 +19,5 @@ if [ -n "${HISTORICAL_SCORE_DATE:-}" ]; then
   echo "阶段 历史官方评分：${HISTORICAL_SCORE_DATE} as-of 推理，输出 ${PREDICTION_OUTPUT_DIR}"
 fi
 
-uv run --locked python code/src/predict.py
-uv run --locked python code/src/report_metrics.py
+python code/src/predict.py
+python code/src/report_metrics.py

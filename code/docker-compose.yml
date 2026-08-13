@@ -3,12 +3,12 @@ services:
     image: bdc2026:latest
     pull_policy: never
     volumes:
-      - ./data:/app/data
-      - ./test/output:/app/output
+      # 最终提交使用五年行情与行业 as-of 快照；只读挂载，避免容器改写源数据。
+      - ./data_5y:/app/data_5y:ro
+      - ./output:/app/output
       - ./temp:/app/temp
     working_dir: /app
-    # 先临时替换命令，验证GPU是否能访问
-    command: /bin/bash /app/data/run.sh
+    command: /bin/bash -lc '/app/init.sh && /app/test.sh'
     # 核心配置：指定NVIDIA运行时+暴露GPU
     runtime: nvidia
     environment:
