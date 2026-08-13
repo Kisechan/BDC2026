@@ -1,5 +1,27 @@
 # THU-BigDataCompetition-2026-baseline
 
+## Docker 复现与提交（B 阶段）
+
+镜像构建上下文为本目录，镜像标签固定为 `bdc2026:latest`。镜像中包含全部代码、
+最终模型和 Python 依赖；`/app/data`、`/app/output`、`/app/temp` 由主办方的
+`docker-compose.yml` 挂载。运行期间不下载数据、模型或依赖。
+
+推理入口为 `/app/test.sh`，先运行 `/app/init.sh` 后从挂载的
+`/app/data/stock_data.csv`（或兼容的 `train.csv`）读取行情，并将最终文件写入
+`/app/output/result.csv`。该文件严格只有 `stock_id,weight` 两列；持仓代码、名称和
+权重仅输出至终端诊断。训练入口为 `/app/train.sh`，从训练开始执行可复现训练。
+
+构建并导出：
+
+```bash
+docker build -t bdc2026:latest .
+docker save -o '抹香鲸zh45的团队.tar' bdc2026:latest
+```
+
+提交前应以 `docker load -i '抹香鲸zh45的团队.tar'` 重新加载镜像，并在断网状态下
+使用主办方下发的 `docker-compose.yml` 执行复现。不要压缩 `.tar`，不要将调试输出
+或竞争提交以外的字段写入 `result.csv`。
+
 本项目是一个面向沪深300成分股的**排序学习选股**方案：
 - 输入：每只股票过去60个交易日的量价特征序列，以及独立的股票 ID；
 - 模型：`StockTransformer`，使用受门控约束的股票 ID Embedding、时序编码和股票间注意力；
